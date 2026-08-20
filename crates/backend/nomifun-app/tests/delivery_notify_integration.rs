@@ -29,8 +29,9 @@ use nomifun_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
 use nomifun_db::models::{NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow};
 use nomifun_db::{
     CreateProviderParams, IChannelRepository, IConversationRepository, IProviderRepository,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteChannelRepository,
-    SqliteConversationRepository, SqliteProviderRepository, init_database_memory,
+    NewProviderModel, NewProviderModelCapability,
+    SqliteAgentMetadataRepository, SqliteChannelRepository, SqliteConversationRepository,
+    SqliteProviderRepository, init_database_memory,
 };
 use nomifun_realtime::UserEventSink;
 use tokio::sync::broadcast;
@@ -160,9 +161,6 @@ impl AgentRuntimeRegistry for ScriptedRegistry {
     fn active_runtime_count(&self) -> usize {
         self.agents.lock().unwrap().len()
     }
-    fn collect_idle_runtimes(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
-        Vec::new()
-    }
 }
 
 struct MessageRecorder {
@@ -231,23 +229,42 @@ async fn build_stack(pool: nomifun_db::SqlitePool) -> Stack {
     let owner = nomifun_db::installation_owner_id(&pool).await.unwrap();
 
     let providers = SqliteProviderRepository::new(pool.clone());
+    let capabilities = [NewProviderModelCapability {
+        task: "chat",
+        traits: "[]",
+        protocol: "openai.chat_text",
+        connection_role: "default",
+        provider_params: "{}",
+        ..Default::default()
+    }];
+    let initial_model = NewProviderModel {
+        model: "m",
+        enabled: true,
+        sort_order: 0,
+        description: None,
+        capabilities: &capabilities,
+    };
+    let credentials_encrypted = nomifun_common::encrypt_string(
+        r#"{"api_keys":["test-only"]}"#,
+        &[0x42; 32],
+    )
+    .unwrap();
     providers
-        .create(CreateProviderParams {
-            provider_id: Some(PROVIDER),
-            platform: "openai",
-            name: "Delivery notify provider",
-            base_url: "https://example.invalid/v1",
-            api_key_encrypted: "test-only",
-            models: r#"["m"]"#,
-            enabled: true,
-            model_context_limits: None,
-            model_protocols: None,
-            model_descriptions: None,
-            model_enabled: None,
-            bedrock_config: None,
-            is_full_url: false,
-            sort_order: None,
-        })
+        .create(
+            CreateProviderParams {
+                provider_id: Some(PROVIDER),
+                platform: "openai",
+                name: "Delivery notify provider",
+                base_url: "https://example.invalid/v1",
+                auth_scheme: "bearer",
+                credentials_encrypted: &credentials_encrypted,
+                enabled: true,
+                bedrock_config: None,
+                sort_order: None,
+            },
+            &initial_model,
+            &[],
+        )
         .await
         .unwrap();
 
@@ -261,7 +278,6 @@ async fn build_stack(pool: nomifun_db::SqlitePool) -> Stack {
         Arc::clone(&runtime_registry),
         conv_repo.clone(),
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
-        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
         Arc::new(nomifun_conversation::NoExecutionConversationBoundary),
     );
 
@@ -333,6 +349,7 @@ async fn bind_channel_session(stack: &Stack, conversation_id: &str) {
             companion_id: None,
             bot_key: Some("notify".to_owned()),
             owner_domain: "companion".into(),
+            group_access_mode: "allowlist".into(),
             created_at: now,
             updated_at: now,
         })
@@ -345,6 +362,7 @@ async fn bind_channel_session(stack: &Stack, conversation_id: &str) {
             platform_type: "telegram".to_owned(),
             channel_plugin_id: Some(plugin.channel_plugin_id.clone()),
             display_name: Some("Notify".to_owned()),
+            authorization_kind: "approved".to_owned(),
             authorized_at: now,
             last_active: None,
         })
@@ -364,6 +382,7 @@ async fn bind_channel_session(stack: &Stack, conversation_id: &str) {
                 workspace: None,
                 chat_id: Some("chat-notify".to_owned()),
                 channel_plugin_id: Some(plugin.channel_plugin_id.clone()),
+                chat_kind: "direct".to_owned(),
                 created_at: now,
                 last_activity: now,
             },

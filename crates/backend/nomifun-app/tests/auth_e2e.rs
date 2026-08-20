@@ -474,9 +474,7 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
     for suffix in [
         "mode",
         "model",
-        "usage",
         "slash-commands",
-        "openclaw/runtime",
         "workspace?path=/",
     ] {
         let response = app
@@ -564,19 +562,6 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
         );
     }
 
-    // A secondary principal cannot select a process-backed Agent at all.
-    let forbidden_agent = app
-        .clone()
-        .oneshot(post_json_with_csrf(
-            "/api/conversations",
-            r#"{"type":"acp","extra":{"workspace":"/"}}"#,
-            &secondary_token,
-            &secondary_csrf,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(forbidden_agent.status(), StatusCode::FORBIDDEN);
-
     // Nomi remains available as model-only conversation functionality, while
     // every forged host/collaboration field is replaced by server-owned safe
     // state before persistence.
@@ -628,22 +613,38 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
     // Secondary users retain useful model-only scheduling. The service keeps
     // provider/model selection but strips every process/path/preset field, and
     // the skill subresource remains installation-owner only.
+    let credentials_encrypted = nomifun_common::encrypt_string(
+        r#"{"api_keys":["test-only"]}"#,
+        &[0x42; 32],
+    )
+    .unwrap();
     sqlx::query(
         "INSERT INTO providers (\
-            provider_id, platform, name, base_url, api_key_encrypted, enabled, \
+            provider_id, platform, name, base_url, auth_scheme, credentials_encrypted, enabled, \
             created_at, updated_at\
          ) VALUES (?, 'openai', 'model-only-safe', \
-                   'https://example.invalid', 'encrypted', \
+                   'https://example.invalid', 'bearer', ?, \
                    1, 1, 1)",
+    )
+    .bind("0190f5fe-7c00-7a00-8000-000000000015")
+    .bind(&credentials_encrypted)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models \
+         (provider_id, model, enabled, sort_order, description, created_at, updated_at) \
+         VALUES (?, 'model-safe', 1, 0, NULL, 1, 1)",
     )
     .bind("0190f5fe-7c00-7a00-8000-000000000015")
     .execute(services.database.pool())
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO provider_models \
-         (provider_id, model, enabled, sort_order, tasks, traits, params, source, created_at, updated_at) \
-         VALUES (?, 'model-safe', 1, 0, '[]', '[]', '{}', 'inferred', 1, 1)",
+        "INSERT INTO provider_model_capabilities \
+         (provider_id, model, task, traits, protocol, connection_role, \
+          allow_cross_origin_credentials, provider_params, created_at, updated_at) \
+         VALUES (?, 'model-safe', 'chat', '[]', 'openai.chat_text', 'default', 0, '{}', 1, 1)",
     )
     .bind("0190f5fe-7c00-7a00-8000-000000000015")
     .execute(services.database.pool())

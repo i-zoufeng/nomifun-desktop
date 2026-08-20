@@ -18,12 +18,8 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import useSWR from 'swr';
 import { emitter } from '../../../utils/emitter';
-import AcpChat from '../platforms/acp/AcpChat';
 import ChatLayout, { type ChatLayoutProps } from './ChatLayout';
 import ChatSlider from './ChatSlider.tsx';
-import NanobotChat from '../platforms/nanobot/NanobotChat';
-import OpenClawChat from '../platforms/openclaw/OpenClawChat';
-import RemoteChat from '../platforms/remote/RemoteChat';
 import { saveNomiDefaultModel } from '@/renderer/pages/guid/hooks/agentSelectionUtils';
 import { configService } from '@/common/config/configService';
 import { useModelsForTask } from '@/renderer/hooks/agent/useModelsForTask';
@@ -46,7 +42,6 @@ import type { TExecutionModelPool, TExecutionModelRef } from '@/common/types/age
 import { ExecutionProvider } from '../execution/ExecutionContext';
 import ExecutionConversationLayout from '../execution/ExecutionConversationLayout';
 import ReadOnlyConversationView from '../execution/ReadOnlyConversationView';
-import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 import SshHostStatusPill from './SshHostStatusPill';
 import { useWorkspaceExtraTabs } from '../hooks/useWorkspaceExtraTabs';
 import { useExecutionModelPool } from '../execution/useExecutionModelPool';
@@ -151,6 +146,9 @@ const _AddNewConversation: React.FC<{ conversation: TChatConversation }> = ({ co
               custom_workspace: _sourceCustomWorkspace,
               is_temporary_workspace: _sourceTemporaryWorkspace,
               temp_workspace_id: _sourceTempWorkspaceId,
+              // Retired-engine resume keys. Rows persisted before the engine
+              // collapse may still carry them, and a clone must never inherit
+              // another conversation's session identity.
               acp_session_id: _sourceAcpSessionId,
               acp_session_conversation_id: _sourceAcpSessionConversationId,
               acp_session_updated_at: _sourceAcpSessionUpdatedAt,
@@ -426,8 +424,8 @@ const NomiConversationPanel: React.FC<{
     />
   );
 
-  // Heal against the unified chat catalog (backend resolve, no heuristics).
-  // On resolve failure/loading `chatGroups` is empty ⇒ resolveHealModel is a
+  // Heal against exact enabled Chat capabilities, with no name heuristics.
+  // While capability data is unavailable/loading `chatGroups` is empty, so resolveHealModel is a
   // no-op, so a transient error can never trigger a destructive model swap.
   const { groups: healGroups } = useModelsForTask('chat');
   const healPool = useMemo(
@@ -536,80 +534,6 @@ const ChatConversation: React.FC<{
   const { t } = useTranslation();
   const workspaceEnabled = Boolean(conversation?.extra?.workspace);
 
-  const isNomiConversation = conversation?.type === 'nomi';
-
-  // Use the shared hook for preset snapshot information in ACP/Codex
-  // conversations.
-  const acpConversation = isNomiConversation ? undefined : conversation;
-  const { info: presetPresetInfo, isLoading: isLoadingPreset } = usePresetInfo(acpConversation);
-
-  const conversationAgentName = (conversation?.extra as { agent_name?: string } | undefined)?.agent_name;
-  const presetDisplayName = presetPresetInfo?.name || conversationAgentName;
-
-  const conversationNode = useMemo(() => {
-    if (!conversation || isNomiConversation) return null;
-    switch (conversation.type) {
-      case 'acp': {
-        const extra = conversation.extra as {
-          backend?: string;
-          current_model_id?: string;
-        };
-        return (
-          <AcpChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace}
-            backend={extra.backend || 'claude'}
-            initialModelId={extra.current_model_id}
-            session_mode={conversation.extra?.session_mode}
-            agent_name={presetDisplayName}
-            cron_job_id={conversation.cron_job_id}
-            hideSendBox={hideSendBox}
-            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-            loadedMcpStatuses={
-              (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
-            }
-          ></AcpChat>
-        );
-      }
-      case 'openclaw-gateway':
-        return (
-          <OpenClawChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace ?? ''}
-            cron_job_id={conversation.cron_job_id}
-            hideSendBox={hideSendBox}
-            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-          />
-        );
-      case 'nanobot':
-        return (
-          <NanobotChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace ?? ''}
-            cron_job_id={conversation.cron_job_id}
-            hideSendBox={hideSendBox}
-            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-          />
-        );
-      case 'remote':
-        return (
-          <RemoteChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace ?? ''}
-            cron_job_id={conversation.cron_job_id}
-            hideSendBox={hideSendBox}
-            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-          />
-        );
-      default:
-        return null;
-    }
-  }, [conversation, isNomiConversation, presetDisplayName, hideSendBox]);
-
   const sliderTitle = useMemo(() => {
     return (
       <div className='flex items-center justify-between'>
@@ -678,84 +602,16 @@ const ChatConversation: React.FC<{
     );
   }
 
-  // If preset snapshot info exists, use its logo/name. While loading, avoid
-  // falling back prematurely; otherwise use the backend logo.
-  const chatLayoutProps = presetPresetInfo
-    ? {
-        preset: presetPresetInfo,
-      }
-    : isLoadingPreset
-      ? {} // Still loading custom agents; avoid showing the backend logo prematurely.
-      : {
-          backend:
-            conversation?.type === 'acp'
-              ? conversation?.extra?.backend
-              : // `nomi` conversations are handled by the early return above and can
-                // never reach this branch, so the chain starts at non-ACP types.
-                conversation?.type === 'openclaw-gateway'
-                  ? 'openclaw-gateway'
-                  : conversation?.type === 'nanobot'
-                    ? 'nanobot'
-                    : conversation?.type === 'remote'
-                      ? 'remote'
-                      : undefined,
-          agent_name: conversationAgentName,
-        };
-
-  const headerExtraNode = (
-    <div className='flex items-center gap-8px'>
-      {conversation?.type === 'openclaw-gateway' && (
-        <div className='shrink-0'>
-          <StarOfficeMonitorCard conversation_id={conversation.id} />
-        </div>
-      )}
-      {conversation && (
-        <div className='shrink-0'>
-          <CronJobManager
-            conversation_id={conversation.id}
-            cron_job_id={conversation.cron_job_id}
-            hasCronSkill={hasLoadedSkill(conversation, 'cron')}
-          />
-        </div>
-      )}
-    </div>
-  );
-
-  const layout = (
-    <ExecutionConversationLayout
-      title={conversation?.name}
-      {...chatLayoutProps}
-      headerExtra={headerExtraNode}
+  // Every conversation type is handled by an early return above (`nomi`, or a
+  // retained Attempt transcript), so only the not-yet-loaded shell remains.
+  return (
+    <ChatLayout
+      title={undefined}
       siderTitle={sliderTitle}
-      sider={<ChatSlider conversation={conversation} extraTabs={workspaceExtraTabs} />}
+      sider={<ChatSlider conversation={undefined} />}
       workspaceEnabled={workspaceEnabled}
-      workspacePath={conversation?.extra?.workspace}
-      isTemporaryWorkspace={
-        (conversation?.extra as { is_temporary_workspace?: boolean } | undefined)?.is_temporary_workspace
-      }
-      conversation_id={conversation?.id}
-      workspaceExtraTabs={workspaceExtraTabs}
-    >
-      {conversationNode}
-    </ExecutionConversationLayout>
+    />
   );
-
-  if (!conversation) {
-    return (
-      <ChatLayout
-        title={undefined}
-        {...chatLayoutProps}
-        headerExtra={headerExtraNode}
-        siderTitle={sliderTitle}
-        sider={<ChatSlider conversation={undefined} />}
-        workspaceEnabled={workspaceEnabled}
-      >
-        {conversationNode}
-      </ChatLayout>
-    );
-  }
-
-  return <ExecutionProvider conversation={conversation}>{layout}</ExecutionProvider>;
 };
 
 export default ChatConversation;

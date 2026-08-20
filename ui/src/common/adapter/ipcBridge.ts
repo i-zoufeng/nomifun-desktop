@@ -36,6 +36,13 @@ import {
   tauriWebuiGetStatus,
   tauriWebuiStart,
   tauriWebuiStop,
+  tauriRelayPairingBootstrap,
+  tauriRelayPairingDisconnect,
+  tauriRelayPairingGetStatus,
+  tauriRelayPairingRestart,
+  tauriRelayPairingStop,
+  type TauriRelayPairingBootstrapRequest,
+  type TauriRelayPairingStatus,
   tauriWindowClose,
   tauriWindowIsMaximized,
   tauriWindowMaximize,
@@ -57,7 +64,6 @@ import type {
   IMcpServer,
   IProvider,
   ISessionMcpServer,
-  ModelProfile,
   TChatConversation,
   TProviderWithModel,
 } from '../config/storage';
@@ -81,7 +87,6 @@ import {
 } from '../types/agent/presetTypes';
 import type { PreviewHistoryTarget, PreviewSnapshotInfo, PreviewUrlResponse } from '../types/office/preview';
 import { parsePresetTagId, parsePreviewSnapshotId } from '../types/ids';
-import type { AcpModelInfo } from '../types/platform/acpTypes';
 import {
   fromProviderResponse,
   toCreateProviderRequest,
@@ -89,15 +94,20 @@ import {
   type CreateProviderInput,
   type FetchModelsAnonymousRequest,
   type FetchModelsResponse,
-  type ModelProfileKeyRequest,
-  type ModelProfileUpsertRequest,
   type ProviderResponse,
   type ProviderHealthCheckRequest,
   type ProviderHealthCheckResponse,
-  type ResolveModelsRequest,
-  type ResolveModelsResponse,
   type UpdateProviderRequest,
 } from '../types/provider/providerApi';
+import type {
+  ProbeProviderConnectionAnonymousRequest,
+  ProbeProviderConnectionRequest,
+  ProbeProviderConnectionResponse,
+} from '../types/provider/providerProbe';
+import type {
+  ModelProtocolManifestRequest,
+  ModelProtocolManifestResponse,
+} from '../types/provider/modelProtocolManifest';
 import type {
   CheckManagedModelHealthRequest,
   ManagedModel,
@@ -108,15 +118,15 @@ import type {
   SetManagedModelServiceEnabledRequest,
 } from '../types/provider/managedModelService';
 import type {
-  CreateProviderModelRequest,
   ProviderModelKeyRequest,
   ProviderModelResponse,
-  UpdateProviderModelRequest,
+  SaveProviderModelRequest,
 } from '../types/provider/providerModel';
 import type {
   ProviderConnectionResponse,
-  UpsertProviderConnectionRequest,
+  SaveProviderConnectionRequest,
 } from '../types/provider/providerConnection';
+import type { KnowledgeRetrievalConfig as ApiKnowledgeRetrievalConfig } from '../protocolBindings/KnowledgeRetrievalConfig';
 import type {
   TAdoptExecutionStepOutput,
   TAdjustAgentExecution,
@@ -164,7 +174,6 @@ import type {
   UpdateDownloadResult,
   UpdateReleaseInfo,
 } from '../update/updateTypes';
-import type { ProtocolDetectionRequest, ProtocolDetectionResponse } from '../utils/protocolDetector';
 import {
   fromApiConversation,
   fromApiPaginatedConversations,
@@ -203,13 +212,13 @@ import {
   parseCsMessageId,
   parseCsNoteId,
   parseRequirementId,
-  parseRemoteAgentId,
   parseMiniAppId,
   parseSshHostId,
   parseSkillPatternId,
   parseTerminalId,
   parseUserId,
   parseWebhookId,
+  type AgentId,
   type AttachmentId,
   type ChannelPluginId,
   type ConversationId,
@@ -237,7 +246,6 @@ import {
   type ChannelUserId,
   type KnowledgeBaseId,
   type RequirementId,
-  type RemoteAgentId,
   type SshHostId,
   type SkillPatternId,
   type TerminalId,
@@ -470,6 +478,8 @@ const fromApiResponseMessage = (message: IResponseMessage): IResponseMessage => 
   ...message,
   msg_id: parseMessageId(message.msg_id),
   turn_id: message.turn_id == null ? undefined : parseMessageId(message.turn_id),
+  final_text_msg_id:
+    message.final_text_msg_id == null ? undefined : parseMessageId(message.final_text_msg_id),
   conversation_id: parseConversationId(message.conversation_id),
   companion_id:
     message.companion_id == null ? message.companion_id : parseCompanionId(message.companion_id),
@@ -642,7 +652,19 @@ export const conversation = {
   // 注意：不要往 body 里加任何 UpdateConversationRequest 之外的字段——该 DTO 是
   // `deny_unknown_fields`，多一个键整条 PATCH 直接 400。`extra` 恒为合并语义
   // （见 nomifun-conversation/src/service.rs 的 update），无需任何开关字段。
-  update: httpPatch<boolean, { conversation_id: ConversationId; updates: Partial<TChatConversation> & { pinned?: boolean } }>(
+  //
+  // `extra` 单独放宽为 Partial：它是合并语义，调用方本就只传要改的键，而
+  // `Partial<TChatConversation>` 作用在联合类型上时仍要求 `extra` 整体符合某一
+  // 分支。此前有一个全可选的分支意外充当了逃逸口，该分支随引擎删除后消失。
+  update: httpPatch<
+    boolean,
+    {
+      conversation_id: ConversationId;
+      updates: (Partial<TChatConversation> | { extra: Partial<TChatConversation['extra']> }) & {
+        pinned?: boolean;
+      };
+    }
+  >(
     (p) => `/api/conversations/${p.conversation_id}`,
     (p) => {
       const updates = p.updates as Record<string, unknown>;
@@ -1309,11 +1331,6 @@ export const fileSnapshot = {
 // Mode (Provider management) — routed to /api/providers/*
 // ---------------------------------------------------------------------------
 
-const normalizeModelProfile = (profile: ModelProfile): ModelProfile => ({
-  ...profile,
-  provider_id: parseProviderId(profile.provider_id),
-});
-
 const normalizeManagedModelStatus = (
   status: ManagedModelServiceStatus
 ): ManagedModelServiceStatus => ({
@@ -1333,7 +1350,7 @@ export const mode = {
     (p) => `/api/providers/${p.provider_id}`,
     // Call sites may derive this object from a whole renderer record or form.
     // Serialize only the strict UpdateProviderRequest contract: response-only
-    // (`models_detail`) and form-only (`model`, Bedrock helper) fields must not
+    // (nested models) and form-only fields must not
     // reach the backend's deny_unknown_fields DTO.
     toUpdateProviderRequest
   ), fromProviderResponse),
@@ -1361,11 +1378,25 @@ export const mode = {
   /**
    * Pre-create form preview — anonymous fetch-models (T1b).
    * Takes credentials in the body, no provider row required. Used by
-   * AddPlatformModal / EditModeModal / ApiKeyEditorModal while the
-   * dropdown is still being populated.
+   * AddPlatformModal / EditModeModal while the dropdown is still being
+   * populated.
    */
   fetchModelList: httpPost<FetchModelsResponse, FetchModelsAnonymousRequest>('/api/providers/fetch-models'),
-  detectProtocol: httpPost<ProtocolDetectionResponse, ProtocolDetectionRequest>('/api/providers/detect-protocol'),
+  /**
+   * Reachability test for a saved provider's connection root. Needs no model or
+   * capability row, so it can answer before anything is configured on top.
+   */
+  probeProviderConnection: httpPost<
+    ProbeProviderConnectionResponse,
+    { provider_id: ProviderId } & ProbeProviderConnectionRequest
+  >(
+    (p) => `/api/providers/${p.provider_id}/probe-connection`,
+    (p) => ({ protocol: p.protocol, task: p.task, probe_candidates: p.probe_candidates })
+  ),
+  /** The same test for a proposed connection, before the provider is saved. */
+  probeConnection: httpPost<ProbeProviderConnectionResponse, ProbeProviderConnectionAnonymousRequest>(
+    '/api/providers/probe-connection'
+  ),
 };
 
 // ---------------------------------------------------------------------------
@@ -1406,27 +1437,16 @@ export const managedModelService = {
 };
 
 // ---------------------------------------------------------------------------
-// Model profiles (multimodal model hub) — routed to /api/model-profiles/*
+// Model protocol capability manifest — server-owned operational defaults
 // ---------------------------------------------------------------------------
 
-export const modelProfile = {
-  list: withResponseMap(httpGet<ModelProfile[], void>('/api/model-profiles'), (profiles) =>
-    profiles.map(normalizeModelProfile)
-  ),
-  upsert: withResponseMap(
-    httpPost<ModelProfile, ModelProfileUpsertRequest>('/api/model-profiles'),
-    normalizeModelProfile
-  ),
-  remove: httpPost<void, ModelProfileKeyRequest>('/api/model-profiles/delete'),
-  resolve: withResponseMap(
-    httpPost<ResolveModelsResponse, ResolveModelsRequest>('/api/model-profiles/resolve'),
-    (response) => ({
-      ...response,
-      models: response.models.map((model) => ({
-        ...model,
-        provider_id: parseProviderId(model.provider_id),
-      })),
-    })
+export const modelProtocol = {
+  list: httpGet<ModelProtocolManifestResponse, ModelProtocolManifestRequest>(
+    (p) => {
+      const query = new URLSearchParams({ preset: p.preset, task: p.task });
+      if (p.base_url) query.set('base_url', p.base_url);
+      return `/api/model-protocols?${query.toString()}`;
+    }
   ),
 };
 
@@ -1449,15 +1469,15 @@ export const providerModel = {
     ),
     (rows) => rows.map(normalizeProviderModel)
   ),
-  create: withResponseMap(
-    httpPost<ProviderModelResponse, CreateProviderModelRequest>('/api/provider-models'),
+  /** Full upsert: one request replaces the model's complete capability set. */
+  save: withResponseMap(
+    httpPut<ProviderModelResponse, SaveProviderModelRequest>('/api/provider-models'),
     normalizeProviderModel
   ),
-  update: withResponseMap(
-    httpPost<ProviderModelResponse, UpdateProviderModelRequest>('/api/provider-models/update'),
-    normalizeProviderModel
+  remove: httpDelete<void, ProviderModelKeyRequest>(
+    ({ provider_id, model }) =>
+      `/api/provider-models?provider_id=${encodeURIComponent(provider_id)}&model=${encodeURIComponent(model)}`
   ),
-  remove: httpPost<void, ProviderModelKeyRequest>('/api/provider-models/delete'),
 };
 
 // ---------------------------------------------------------------------------
@@ -1479,16 +1499,13 @@ export const providerConnection = {
     ),
     (connections) => connections.map(normalizeProviderConnection)
   ),
-  upsert: withResponseMap(
-    httpPost<
+  save: withResponseMap(
+    httpPut<
       ProviderConnectionResponse,
-      { provider_id: ProviderId } & UpsertProviderConnectionRequest
+      { provider_id: ProviderId; connection: SaveProviderConnectionRequest }
     >(
       (p) => `/api/providers/${p.provider_id}/connections`,
-      (p) => {
-        const { provider_id: _providerId, ...body } = p;
-        return body;
-      }
+      (p) => p.connection
     ),
     normalizeProviderConnection
   ),
@@ -1498,10 +1515,10 @@ export const providerConnection = {
 };
 
 // ---------------------------------------------------------------------------
-// ACP Conversation — routed to /api/agents/* + conversation routes
+// Agent Conversation — routed to /api/agents/* + conversation routes
 // ---------------------------------------------------------------------------
 
-export const acpConversation = {
+export const agentConversation = {
   sendMessage: conversation.sendMessage,
   responseStream: conversation.responseStream,
   getAvailableAgents: withResponseMap(
@@ -1509,68 +1526,6 @@ export const acpConversation = {
     (agents) => agents.map(fromApiAgentMetadata)
   ),
   refreshCustomAgents: httpPost<void, void>('/api/agents/refresh'),
-  testCustomAgent: httpPost<
-    { step: 'success' } | { step: 'fail_cli'; error: string } | { step: 'fail_acp'; error: string },
-    { command: string; acp_args?: string[]; env?: Record<string, string> }
-  >('/api/agents/custom/try-connect'),
-  createCustomAgent: withResponseMap(
-    httpPost<
-      AgentMetadata,
-      {
-        name: string;
-        command: string;
-        icon?: string;
-        args?: string[];
-        env?: Array<{ name: string; value: string; description?: string }>;
-        advanced?: {
-          yolo_id?: string;
-          native_skills_dirs?: string[];
-          behavior_policy?: { supports_side_question?: boolean };
-          description?: string;
-        };
-      }
-    >('/api/agents/custom'),
-    fromApiAgentMetadata
-  ),
-  updateCustomAgent: withResponseMap(
-    httpPut<
-      AgentMetadata,
-      {
-        agent_id: AgentMetadata['agent_id'];
-        name: string;
-        command: string;
-        icon?: string;
-        args?: string[];
-        env?: Array<{ name: string; value: string; description?: string }>;
-        advanced?: {
-          yolo_id?: string;
-          native_skills_dirs?: string[];
-          behavior_policy?: { supports_side_question?: boolean };
-          description?: string;
-        };
-      }
-    >(
-      (p) => `/api/agents/custom/${p.agent_id}`,
-      (p) => {
-        const { agent_id: _agentId, ...rest } = p;
-        return rest;
-      }
-    ),
-    fromApiAgentMetadata
-  ),
-  deleteCustomAgent: httpDelete<{ deleted: boolean }, { agent_id: AgentMetadata['agent_id'] }>(
-    (p) => `/api/agents/custom/${p.agent_id}`
-  ),
-  setAgentEnabled: withResponseMap(
-    httpPatch<AgentMetadata, { agent_id: AgentMetadata['agent_id']; enabled: boolean }>(
-      (p) => `/api/agents/${p.agent_id}/enabled`,
-      (p) => ({ enabled: p.enabled })
-    ),
-    fromApiAgentMetadata
-  ),
-  checkAgentHealth: httpPost<{ available: boolean; latency?: number; error?: string }, { backend: string }>(
-    '/api/agents/health-check'
-  ),
   checkProviderHealth: withResponseMap(
     httpPost<ProviderHealthCheckResponse, ProviderHealthCheckRequest>(
       '/api/agents/provider-health-check'
@@ -1582,25 +1537,15 @@ export const acpConversation = {
     (p) => ({ mode: p.mode })
   ),
   // 404 is the expected pre-warmup response from `/api/conversations/:id/mode`
-  // and `/api/conversations/:id/model` — the agent has not attached yet, so
-  // we have nothing to read. AcpModeSelector / AcpModelSelector both fall back
-  // to handshake metadata in that case. Silence the bridge log so this
-  // ordinary state doesn't pollute Sentry breadcrumbs (ELECTRON-1BT).
+  // — the agent has not attached yet, so we have nothing to read.
+  // AgentModeSelector falls back to handshake metadata in that case. Silence
+  // the bridge log so this ordinary state doesn't pollute Sentry breadcrumbs
+  // (ELECTRON-1BT).
   getMode: httpGet<{ mode: string; initialized: boolean }, { conversation_id: ConversationId }>(
     (p) => `/api/conversations/${p.conversation_id}/mode`,
     {
       silentStatuses: [404],
     }
-  ),
-  getModel: httpGet<{ model_info: AcpModelInfo | null }, { conversation_id: ConversationId }>(
-    (p) => `/api/conversations/${p.conversation_id}/model`,
-    {
-      silentStatuses: [404],
-    }
-  ),
-  setModel: httpPut<void, { conversation_id: ConversationId; model: string }>(
-    (p) => `/api/conversations/${p.conversation_id}/model`,
-    (p) => ({ model: p.model })
   ),
 };
 
@@ -1728,92 +1673,6 @@ export const mcpService = {
   loginMcpOAuth: httpPost<{ success: boolean; error?: string }, { server_url: string }>('/api/mcp/oauth/login'),
   logoutMcpOAuth: httpPost<void, { server_url: string }>('/api/mcp/oauth/logout'),
   getAuthenticatedServers: httpGet<string[], void>('/api/mcp/oauth/authenticated'),
-};
-
-export const openclawConversation = {
-  sendMessage: conversation.sendMessage,
-  responseStream: conversation.responseStream,
-  getRuntime: httpGet<
-    {
-      conversation_id: ConversationId;
-      runtime: {
-        workspace?: string;
-        backend?: string;
-        agent_name?: string;
-        cli_path?: string;
-        model?: string;
-        session_key?: string | null;
-        is_connected?: boolean;
-        has_active_session?: boolean;
-        identity_hash?: string | null;
-      };
-      expected?: {
-        expected_workspace?: string;
-        expected_backend?: string;
-        expected_agent_name?: string;
-        expected_cli_path?: string;
-        expected_model?: string;
-        expected_identity_hash?: string | null;
-        switched_at?: number;
-      };
-    },
-    { conversation_id: ConversationId }
-  >((p) => `/api/conversations/${p.conversation_id}/openclaw/runtime`),
-};
-
-// ---------------------------------------------------------------------------
-// Remote Agent — routed to /api/remote-agents/*
-// ---------------------------------------------------------------------------
-
-const fromApiRemoteAgent = (
-  value: import('@/common/types/agent/remoteAgentTypes').RemoteAgentConfig
-): import('@/common/types/agent/remoteAgentTypes').RemoteAgentConfig => ({
-  ...value,
-  remote_agent_id: parseRemoteAgentId(value.remote_agent_id),
-});
-
-export const remoteAgent = {
-  list: withResponseMap(
-    httpGet<import('@/common/types/agent/remoteAgentTypes').RemoteAgentConfig[], void>('/api/remote-agents'),
-    (items) => items.map(fromApiRemoteAgent)
-  ),
-  get: withResponseMap(
-    httpGet<
-      import('@/common/types/agent/remoteAgentTypes').RemoteAgentConfig | null,
-      { remote_agent_id: RemoteAgentId }
-    >((p) => `/api/remote-agents/${p.remote_agent_id}`),
-    (item) => item == null ? null : fromApiRemoteAgent(item)
-  ),
-  create: withResponseMap(
-    httpPost<
-      import('@/common/types/agent/remoteAgentTypes').RemoteAgentConfig,
-      import('@/common/types/agent/remoteAgentTypes').RemoteAgentInput
-    >('/api/remote-agents'),
-    fromApiRemoteAgent
-  ),
-  update: withResponseMap(
-    httpPut<
-      import('@/common/types/agent/remoteAgentTypes').RemoteAgentConfig,
-      {
-        remote_agent_id: RemoteAgentId;
-        updates: Partial<import('@/common/types/agent/remoteAgentTypes').RemoteAgentInput>;
-      }
-    >(
-      (p) => `/api/remote-agents/${p.remote_agent_id}`,
-      (p) => p.updates
-    ),
-    fromApiRemoteAgent
-  ),
-  delete: httpDelete<void, { remote_agent_id: RemoteAgentId }>(
-    (p) => `/api/remote-agents/${p.remote_agent_id}`
-  ),
-  testConnection: httpPost<void, { url: string; auth_type: string; auth_token?: string; allow_insecure?: boolean }>(
-    '/api/remote-agents/test-connection'
-  ),
-  handshake: httpPost<
-    { status: 'ok' | 'pending_approval' | 'error'; error?: string },
-    { remote_agent_id: RemoteAgentId }
-  >((p) => `/api/remote-agents/${p.remote_agent_id}/handshake`),
 };
 
 // ---------------------------------------------------------------------------
@@ -2783,6 +2642,32 @@ export const webui = {
   },
 };
 
+export type IRelayPairingStatus = TauriRelayPairingStatus;
+export type IRelayPairingBootstrapRequest = TauriRelayPairingBootstrapRequest;
+
+export const relayPairing = {
+  bootstrap: shellProvider<IRelayPairingStatus, IRelayPairingBootstrapRequest>(
+    (request) => tauriRelayPairingBootstrap(request),
+    { state: 'disconnected' }
+  ),
+  getStatus: shellProvider<IRelayPairingStatus, void>(
+    () => tauriRelayPairingGetStatus(),
+    { state: 'disconnected' }
+  ),
+  stop: shellProvider<IRelayPairingStatus, void>(
+    () => tauriRelayPairingStop(),
+    { state: 'disconnected' }
+  ),
+  restart: shellProvider<IRelayPairingStatus, void>(
+    () => tauriRelayPairingRestart(),
+    { state: 'disconnected' }
+  ),
+  disconnect: shellProvider<IRelayPairingStatus, void>(
+    () => tauriRelayPairingDisconnect(),
+    { state: 'disconnected' }
+  ),
+};
+
 // ---------------------------------------------------------------------------
 // Cron — routed to /api/cron/*
 // ---------------------------------------------------------------------------
@@ -2804,6 +2689,18 @@ function fromApiCronJob(job: ICronJob): ICronJob {
         : {
             agent_config: {
               ...job.metadata.agent_config,
+              custom_agent_id:
+                job.metadata.agent_config.custom_agent_id == null
+                  ? undefined
+                  : parseAgentId(job.metadata.agent_config.custom_agent_id),
+              preset_id:
+                job.metadata.agent_config.preset_id == null
+                  ? undefined
+                  : parsePresetReference(job.metadata.agent_config.preset_id),
+              preset_snapshot:
+                job.metadata.agent_config.preset_snapshot == null
+                  ? undefined
+                  : fromApiResolvedPresetSnapshot(job.metadata.agent_config.preset_snapshot),
               provider_id:
                 job.metadata.agent_config.provider_id == null
                   ? undefined
@@ -2930,11 +2827,16 @@ export interface ICronJobRun {
 }
 
 export interface ICronAgentConfig {
-  /** ACP/agent backend only; absent for Nomi jobs. */
+  /** Agent backend label; absent for jobs without one. */
   backend?: string;
   name: string;
   cli_path?: string;
+  /** Stable AgentRegistry identity required for every non-Nomi new conversation. */
+  custom_agent_id?: AgentId;
   preset_id?: PresetReference;
+  /** Frozen server-owned preset lineage returned by the API. */
+  preset_revision?: number;
+  preset_snapshot?: ResolvedPresetSnapshot;
   mode?: string;
   model?: string;
   /** Nomi logical reference to the provider business entity. */
@@ -3215,7 +3117,7 @@ export interface IConfirmMessageParams {
 }
 
 export interface ICreateConversationParams {
-  type: 'acp' | 'codex' | 'openclaw-gateway' | 'nanobot' | 'remote' | 'nomi';
+  type: 'nomi';
   name?: string;
   model: TProviderWithModel;
   /** Backend-resolved reusable launch configuration. */
@@ -3261,7 +3163,6 @@ export interface ICreateConversationParams {
     session_mode?: string;
     codex_model?: string;
     current_model_id?: string;
-    cached_config_options?: import('../types/platform/acpTypes').AcpSessionConfigOption[];
     pending_config_options?: Record<string, string>;
     runtime_validation?: {
       expected_workspace?: string;
@@ -3274,7 +3175,6 @@ export interface ICreateConversationParams {
     };
     /** Legacy marker for pre-provider-probe health-check conversations. */
     is_health_check?: boolean;
-    remote_agent_id?: import('../types/ids').RemoteAgentId;
     /** Binds a nomi conversation to a saved SSH host: the remote tool family
      *  operates that host. Optional companion `ssh_remote_cwd` sets the shell's
      *  starting directory (defaults to the remote $HOME). */
@@ -3321,6 +3221,12 @@ export interface IResponseMessage {
   /** Stable owning turn identity. It is distinct from msg_id for first-class
    * terminal/error rows and continuation message segments. */
   turn_id?: MessageId;
+  /** For a terminal frame, the durable visible text segment that owns the
+   * backend's final text rewrite. This may differ from the terminal msg_id. */
+  final_text_msg_id?: MessageId;
+  /** Present only when the terminal was emitted after backend final-text
+   * middleware and persistence completed. Legacy terminals omit this marker. */
+  final_text_authoritative?: boolean;
   /** Canonical owning conversation entity ID. */
   conversation_id: ConversationId;
   created_at?: number;
@@ -3607,7 +3513,6 @@ export const extensions = {
   getLoadedExtensions: httpGet<IExtensionInfo[], void>('/api/extensions'),
   getPresets: httpGet<Record<string, unknown>[], void>('/api/extensions/presets'),
   getAgents: httpGet<Record<string, unknown>[], void>('/api/extensions/agents'),
-  getAcpAdapters: httpGet<Record<string, unknown>[], void>('/api/extensions/acp-adapters'),
   getMcpServers: httpGet<IExtensionMcpServerContribution[], void>('/api/extensions/mcp-servers'),
   getSkills: httpGet<Array<{ name: string; description: string; location: string }>, void>('/api/extensions/skills'),
   getSettingsTabs: httpGet<IExtensionSettingsTab[], void>('/api/extensions/settings-tabs'),
@@ -3631,7 +3536,9 @@ import type {
   IChannelPluginStatus,
   IChannelSession,
   IChannelUser,
+  SetGroupAccessRequest,
 } from '@/common/types/channel/channel';
+import { normalizeGroupAccessMode } from '@/common/types/channel/channel';
 
 type RawPluginStatus = Record<string, unknown>;
 type RawPairing = Record<string, unknown>;
@@ -3666,6 +3573,8 @@ function toPluginStatus(raw: RawPluginStatus): IChannelPluginStatus {
     status: raw.status as string | undefined,
     last_connected: raw.last_connected as number | undefined,
     activeUsers: (raw.active_users ?? 0) as number,
+    // Fail closed while talking to an older backend or receiving a future value.
+    groupAccessMode: normalizeGroupAccessMode(raw.group_access_mode),
     botUsername: raw.bot_username as string | undefined,
     hasToken: (raw.has_token ?? false) as boolean,
     // 所有权分域：缺省（过渡期后端未透出）按 companion 处理，与 DB DEFAULT 一致。
@@ -3775,6 +3684,8 @@ export const channel = {
   revokeUser: httpPost<void, { channel_user_id: import('../types/ids').ChannelUserId }>(
     '/api/channel/users/revoke'
   ),
+  /** Update one bot row's group-chat policy; direct-message pairing is unchanged. */
+  setGroupAccess: httpPost<void, SetGroupAccessRequest>('/api/channel/settings/group-access'),
   getActiveSessions: withResponseMap(httpGet<RawSession[], void>('/api/channel/sessions'), (raw) =>
     raw.map(toChannelSession)
   ),
@@ -4373,14 +4284,13 @@ export interface IModelFailoverConfig {
   queue: IModelFailoverCandidate[];
   /** Per-turn cap on switches (also bounded by `queue.length`); default 4. */
   max_switches: number;
-  /** Stamp the failed model `Unhealthy` on switch; default true. */
-  stamp_unhealthy: boolean;
 }
 
 const fromApiModelFailoverConfig = (config: IModelFailoverConfig): IModelFailoverConfig => ({
-  ...config,
+  enabled: config.enabled,
+  max_switches: config.max_switches,
   queue: config.queue.map((candidate) => ({
-    ...candidate,
+    model: candidate.model,
     provider_id: parseProviderId(candidate.provider_id),
   })),
 });
@@ -5957,6 +5867,16 @@ export interface IKnowledgeSearchHit {
   score: number;
 }
 
+type WithProviderEntityId<T> = T extends { provider_id: string }
+  ? Omit<T, 'provider_id'> & { provider_id: ProviderId }
+  : T;
+
+/** Install-wide, task-exact retrieval pipeline returned by the knowledge API. */
+export type IKnowledgeRetrievalConfig = {
+  embedding: WithProviderEntityId<ApiKnowledgeRetrievalConfig['embedding']>;
+  rerank: WithProviderEntityId<ApiKnowledgeRetrievalConfig['rerank']>;
+};
+
 export interface IKnowledgeFileEntry {
   rel_path: string;
   size: number;
@@ -6083,6 +6003,13 @@ export interface ICsNote {
   cs_agent_id: CsAgentId | null;
   kind: string;
   content: string;
+  /**
+   * Alternate phrasings visitors use for this question, newline separated.
+   *
+   * Keyword search cannot bridge a paraphrase that shares no words with the
+   * note, so these are the operator's way to make such phrasings findable.
+   */
+  aliases: string;
   enabled: boolean;
   created_at: number;
   updated_at: number;
@@ -6219,15 +6146,15 @@ export const customerService = {
     (notes) => notes.map(fromApiCsNote)
   ),
   createNote: withResponseMap(
-    httpPost<ICsNote, { cs_agent_id?: CsAgentId | null; kind?: string; content: string; enabled?: boolean }>(
+    httpPost<ICsNote, { cs_agent_id?: CsAgentId | null; kind?: string; content: string; aliases?: string; enabled?: boolean }>(
       '/api/customer-service/notes'
     ),
     fromApiCsNote
   ),
   patchNote: withResponseMap(
-    httpPatch<ICsNote, { cs_note_id: CsNoteId; kind?: string; content?: string; enabled?: boolean }>(
+    httpPatch<ICsNote, { cs_note_id: CsNoteId; kind?: string; content?: string; aliases?: string; enabled?: boolean }>(
       (p) => `/api/customer-service/notes/${p.cs_note_id}`,
-      (p) => ({ kind: p.kind, content: p.content, enabled: p.enabled })
+      (p) => ({ kind: p.kind, content: p.content, aliases: p.aliases, enabled: p.enabled })
     ),
     fromApiCsNote
   ),
@@ -6263,6 +6190,20 @@ const KB_READ_TIMEOUT_MS = 30_000;
 const fromApiKnowledgeBase = (base: IKnowledgeBase): IKnowledgeBase => ({
   ...base,
   knowledge_base_id: parseKnowledgeBaseId(base.knowledge_base_id),
+});
+
+const fromApiKnowledgeRetrievalStage = <T extends { mode: string }>(
+  stage: T
+): WithProviderEntityId<T> =>
+  (stage.mode === 'remote'
+    ? { ...stage, provider_id: parseProviderId((stage as T & { provider_id: unknown }).provider_id) }
+    : stage) as WithProviderEntityId<T>;
+
+const fromApiKnowledgeRetrievalConfig = (
+  config: ApiKnowledgeRetrievalConfig
+): IKnowledgeRetrievalConfig => ({
+  embedding: fromApiKnowledgeRetrievalStage(config.embedding),
+  rerank: fromApiKnowledgeRetrievalStage(config.rerank),
 });
 
 const fromApiKnowledgeBinding = (binding: IKnowledgeBinding): IKnowledgeBinding => ({
@@ -6322,6 +6263,14 @@ export const knowledge = {
     (p) => `/api/knowledge/bases/${p.knowledge_base_id}`,
     (p) => ({ name: p.name, description: p.description, tags: p.tags })
   ), fromApiKnowledgeBase),
+  getRetrievalConfig: withResponseMap(
+    httpGet<ApiKnowledgeRetrievalConfig, void>('/api/knowledge/retrieval'),
+    fromApiKnowledgeRetrievalConfig
+  ),
+  setRetrievalConfig: withResponseMap(
+    httpPut<ApiKnowledgeRetrievalConfig, IKnowledgeRetrievalConfig>('/api/knowledge/retrieval'),
+    fromApiKnowledgeRetrievalConfig
+  ),
   /** AI overview generation (description + README.md). Slow (LLM round-trip, 30s+); 409 when no AI provider is configured. */
   autogenBase: withResponseMap(httpPost<IKnowledgeAutogenOutcome, { knowledge_base_id: KnowledgeBaseId; overwrite_readme?: boolean; provider_id?: ProviderId; model?: string }>(
     (p) => `/api/knowledge/bases/${p.knowledge_base_id}/autogen`,

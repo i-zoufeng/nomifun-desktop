@@ -202,10 +202,6 @@
         "title": "Agent 握手超时",
         "body": "所选 Agent 未在预期时间内完成启动握手。首次启动可能需要下载运行组件（数十 MB），请确认网络/代理可用后重试；重试会自动清理未完成的下载。"
       },
-      "USER_AGENT_ACP_INIT_FAILED": {
-        "title": "Agent 协议初始化失败",
-        "body": "应用无法和该 Agent 初始化 Agent Client Protocol 会话。请检查 Agent 版本并重新连接。"
-      },
       "USER_AGENT_PROTOCOL_MISMATCH": {
         "title": "Agent 协议版本不兼容",
         "body": "所选 Agent 使用的协议版本不兼容。请升级 Agent，或切换到兼容的 Agent。"
@@ -396,7 +392,8 @@
   "chat": {
     "noModelSelected": "当前会话未选择模型，无法发送消息",
     "modelHealedToDefault": "已回退到默认模型 {{model}}",
-    "visionModelHint": "当前模型 {{model}} 可能不支持图片输入，图片附件可能被忽略或导致报错。",
+    "visionModelBlocked": "当前模型 {{model}} 的对话能力未声明图片输入。请选择带“视觉输入”能力的对话模型，或移除图片后再发送。",
+    "visionCapabilityUnavailable": "暂时无法核验模型能力。请等待模型列表加载后重试，或移除图片后发送。",
     "sendMessageTo": "发送消息到 {{model}}",
     "processing": "正在处理中……",
     "quotaExceededTitle": "模型额度已用尽",
@@ -538,7 +535,7 @@
   "notFound": "会话不存在或已被删除",
   "steer": {
     "button": "立刻发送（插入正在生成的回复）",
-    "fallbackQueued": "该引擎不支持回复中插话，已改为加入队列。"
+    "fallbackQueued": "未能插入正在生成的回复，已连同附件改为排队。"
   },
   "stop": {
     "failed": "停止当前任务失败，请重试。"

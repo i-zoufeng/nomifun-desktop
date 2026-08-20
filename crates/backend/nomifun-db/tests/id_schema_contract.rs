@@ -32,7 +32,6 @@ const UNCONDITIONAL_UUIDV7_BUSINESS_IDS: &[(&str, &str)] = &[
     ("knowledge_bases", "knowledge_base_id"),
     ("knowledge_bindings", "knowledge_binding_id"),
     ("attachments", "attachment_id"),
-    ("remote_agents", "remote_agent_id"),
     ("workshop_canvases", "canvas_id"),
     ("workshop_assets", "asset_id"),
     ("channel_plugins", "channel_plugin_id"),
@@ -112,8 +111,13 @@ async fn initialized_database_satisfies_the_v3_id_schema_contract() {
 /// only that the number moved, and it fires before the per-table invariant
 /// loop, so a newly added table can silently skip the row-key contract
 /// entirely. Migration 024 added `ssh_hosts` and did exactly that.
+///
+/// `cs_notes_fts*` are the FTS5 virtual table and the four shadow tables
+/// SQLite materializes for it (migration 035). They are listed here so this
+/// set stays an exact equality check, but [`is_sqlite_owned_table`] exempts
+/// them from the per-table row-key invariants below: SQLite, not this
+/// repository, owns their shape.
 const EXPECTED_PRODUCT_TABLES: &[&str] = &[
-    "acp_session",
     "agent_execution_attempts",
     "agent_execution_events",
     "agent_execution_participants",
@@ -152,6 +156,11 @@ const EXPECTED_PRODUCT_TABLES: &[&str] = &[
     "cs_dialogues",
     "cs_messages",
     "cs_notes",
+    "cs_notes_fts",
+    "cs_notes_fts_config",
+    "cs_notes_fts_data",
+    "cs_notes_fts_docsize",
+    "cs_notes_fts_idx",
     "idmm_action_reservations",
     "idmm_interventions",
     "installation_identity",
@@ -177,9 +186,9 @@ const EXPECTED_PRODUCT_TABLES: &[&str] = &[
     "preset_user_state",
     "presets",
     "provider_connections",
+    "provider_model_capabilities",
     "provider_models",
     "providers",
-    "remote_agents",
     "requirement_display_sequence",
     "requirement_pre_effect_abandon_guards",
     "requirement_tags",
@@ -196,6 +205,19 @@ const EXPECTED_PRODUCT_TABLES: &[&str] = &[
     "workshop_assets",
     "workshop_canvases",
 ];
+
+/// True for the FTS5 virtual table and its shadow tables, whose physical shape
+/// SQLite defines and this repository must not assert on.
+///
+/// Concretely: `cs_notes_fts` has no primary key, `_config` keys on `k` and is
+/// WITHOUT ROWID, `_data`/`_docsize` declare `id INTEGER PRIMARY KEY` without
+/// AUTOINCREMENT, and `_idx` uses a composite `(segid, term)` key. Four of the
+/// five violate the row-key contract that every real product table must obey,
+/// so the per-table loops below skip them while the set-equality assertion
+/// above still pins their presence.
+fn is_sqlite_owned_table(table: &str) -> bool {
+    table == "cs_notes_fts" || table.starts_with("cs_notes_fts_")
+}
 
 #[tokio::test]
 async fn every_product_table_has_one_integer_autoincrement_row_primary_key() {
@@ -224,6 +246,9 @@ async fn every_product_table_has_one_integer_autoincrement_row_primary_key() {
             .collect::<Vec<_>>(),
     );
     for table in tables {
+        if is_sqlite_owned_table(&table) {
+            continue;
+        }
         let columns = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
             .fetch_all(pool)
             .await
@@ -337,6 +362,9 @@ async fn all_nontechnical_id_columns_are_text_and_only_id_is_a_technical_key() {
     .expect("tables");
 
     for table in tables {
+        if is_sqlite_owned_table(&table) {
+            continue;
+        }
         let columns = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
             .fetch_all(pool)
             .await
@@ -626,8 +654,8 @@ async fn remaining_product_business_ids_reject_duplicates_and_non_uuid_values() 
     let provider_id = nomifun_common::generate_id();
     sqlx::query(
         "INSERT INTO providers \
-         (provider_id, platform, name, base_url, api_key_encrypted, created_at, updated_at) \
-         VALUES (?, 'contract', 'contract provider', 'https://example.invalid', '', 1, 1)",
+         (provider_id, platform, name, base_url, auth_scheme, credentials_encrypted, created_at, updated_at) \
+         VALUES (?, 'contract', 'contract provider', 'https://example.invalid', 'bearer', '', 1, 1)",
     )
     .bind(&provider_id)
     .execute(pool)
@@ -988,8 +1016,8 @@ async fn remaining_uuid_logical_links_and_json_registry_enforce_text_values() {
     let provider_id = nomifun_common::generate_id();
     sqlx::query(
         "INSERT INTO providers \
-         (provider_id, platform, name, base_url, api_key_encrypted, created_at, updated_at) \
-         VALUES (?, 'contract', 'link provider', 'https://example.invalid', '', 1, 1)",
+         (provider_id, platform, name, base_url, auth_scheme, credentials_encrypted, created_at, updated_at) \
+         VALUES (?, 'contract', 'link provider', 'https://example.invalid', 'bearer', '', 1, 1)",
     )
     .bind(&provider_id)
     .execute(pool)

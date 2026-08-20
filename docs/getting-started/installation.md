@@ -84,7 +84,7 @@ console — that is the embedded backend. The renderer reads
 `window.__backendPort` (injected by the Tauri shell as an init script) so the
 SPA always knows where to call `/api`.
 
-![nomifun-desktop running in dev with the embedded backend](../images/gs-02-desktop-dev.png)
+![NomiFun desktop workspace](../images/getting-started/en/desktop-home.png)
 
 ### Build a release binary
 
@@ -168,7 +168,7 @@ Open `http://127.0.0.1:8787` in a browser. On the very first visit you will
 be sent to a setup screen — the username and password you type **become the
 initial admin account**. After that, login is required for everyone.
 
-![First-run admin setup in the browser](../images/gs-03-web-first-run-setup.png)
+![Current WebUI authentication screen](../images/gs-03-web-first-run-setup.png)
 
 ### Common flags
 
@@ -207,9 +207,9 @@ The official Docker Hub image is
 [`nomifun/nomifun-web`](https://hub.docker.com/repository/docker/nomifun/nomifun-web).
 It is a **headless** (no GUI) image: SPA + `nomifun-web` + `bun` on
 `debian:bookworm-slim`. The repository also ships a multi-stage `Dockerfile`
-and a `docker-compose.yml` for local source builds. The examples below use the
-published `v0.3.4` tag; replace it with a newer Docker Hub tag when one is
-available.
+and a `docker-compose.yml` for local source builds. The examples below use
+`latest`, the stable rolling tag published on Docker Hub. For reproducible
+deployments, pin an explicit version or image digest.
 
 ### Quick start with the official image
 
@@ -219,7 +219,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8787:8787 \
   -v nomifun-data:/data \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 # then open http://<server-ip>:8787
 ```
 
@@ -234,7 +234,7 @@ docker run -d \
   -v nomifun-data:/data \
   -e NOMIFUN_ADMIN_USERNAME=admin \
   -e NOMIFUN_ADMIN_PASSWORD='change-me-to-something-strong' \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 ```
 
 ### Build locally with Compose

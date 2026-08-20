@@ -7,14 +7,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, test } from 'bun:test';
 
-const sendBoxFiles = [
-  './acp/AcpSendBox.tsx',
-  './nomi/NomiSendBox.tsx',
-  './BasicRuntimeSendBox.tsx',
-  './remote/RemoteSendBox.tsx',
-  './nanobot/NanobotSendBox.tsx',
-  './openclaw/OpenClawSendBox.tsx',
-];
+const sendBoxFiles = ['./nomi/NomiSendBox.tsx'];
 
 describe('conversation sendbox processing indicator', () => {
   test('does not render the legacy bottom ThoughtDisplay processing bar', () => {

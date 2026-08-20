@@ -41,14 +41,13 @@ use nomifun_common::{
     ConversationStatus, CronJobId, DecisionPolicy, DelegationPolicy, ErrorChain, ExecutionAuthority, MessageId, MessageType, OnConversationDelete, PaginatedResult, ProviderId, ProviderWithModel,
     generate_id, now_ms, validate_uuidv7, workspace_path_has_edge_whitespace_segment,
 };
-use nomifun_db::models::{AgentMetadataRow, ConversationRow, MessageRow};
+use nomifun_db::models::{ConversationRow, MessageRow};
 use nomifun_db::{
-    AgentExecutionTurnAuthority, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, IMcpServerRepository, MessageDayBucket, SaveRuntimeStateParams,
+    AgentExecutionTurnAuthority, ConversationFilters, ConversationRowUpdate,
+    IAgentMetadataRepository, IConversationRepository, IMcpServerRepository, MessageDayBucket,
     ConversationTurnAdmissionState, RequirementConversationTurnAuthority, SortOrder,
     TurnLifecycleTransition, TurnReceiptCompletion,
 };
-use nomifun_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use nomifun_realtime::UserEventSink;
 use nomifun_runtime::resolve_command_path;
 use std::collections::{HashMap, HashSet};
@@ -67,6 +66,7 @@ use crate::convert::{
     row_to_artifact_response, row_to_message_response, row_to_message_response_compact,
     row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
+use crate::failover_seam::FailoverAuthoritySnapshot;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::compute_initial_skills;
 use crate::stream_relay::{
@@ -849,99 +849,6 @@ fn reconcile_preset_conversation_model_pool(
     Ok(Some(reconciled))
 }
 
-fn required_trimmed_extra_string<'a>(
-    extra: &'a serde_json::Value,
-    key: &str,
-    context: &str,
-) -> Result<&'a str, AppError> {
-    let value = extra
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| AppError::BadRequest(format!("{context} requires extra.{key}")))?;
-    if value.is_empty() || value.trim() != value {
-        return Err(AppError::BadRequest(format!(
-            "{context} extra.{key} must be a non-empty trimmed string"
-        )));
-    }
-    Ok(value)
-}
-
-fn optional_trimmed_extra_string<'a>(
-    extra: &'a serde_json::Value,
-    key: &str,
-    context: &str,
-) -> Result<Option<&'a str>, AppError> {
-    match extra.get(key) {
-        None => Ok(None),
-        Some(serde_json::Value::String(value))
-            if !value.is_empty() && value.trim() == value =>
-        {
-            Ok(Some(value))
-        }
-        Some(_) => Err(AppError::BadRequest(format!(
-            "{context} extra.{key} must be a non-empty trimmed string"
-        ))),
-    }
-}
-
-fn validate_acp_agent_metadata_row(
-    row: &AgentMetadataRow,
-    extra: &serde_json::Value,
-) -> Result<(), AppError> {
-    if row.agent_type != AgentType::Acp.serde_name() {
-        return Err(AppError::BadRequest(format!(
-            "ACP extra.agent_id '{}' resolves to agent type '{}'",
-            row.agent_id, row.agent_type
-        )));
-    }
-    if !row.enabled {
-        return Err(AppError::BadRequest(format!(
-            "ACP extra.agent_id '{}' is disabled",
-            row.agent_id
-        )));
-    }
-    if !matches!(row.agent_source.as_str(), "builtin" | "extension" | "custom") {
-        return Err(AppError::BadRequest(format!(
-            "ACP extra.agent_id '{}' has unsupported agent_source '{}'",
-            row.agent_id, row.agent_source
-        )));
-    }
-    if let Some(backend) = optional_trimmed_extra_string(extra, "backend", "ACP conversation")?
-        && row.backend.as_deref() != Some(backend)
-    {
-        return Err(AppError::BadRequest(format!(
-            "ACP extra.backend '{backend}' does not match agent '{}'",
-            row.agent_id
-        )));
-    }
-    if let Some(agent_source) =
-        optional_trimmed_extra_string(extra, "agent_source", "ACP conversation")?
-        && row.agent_source != agent_source
-    {
-        return Err(AppError::BadRequest(format!(
-            "ACP extra.agent_source '{agent_source}' does not match agent '{}'",
-            row.agent_id
-        )));
-    }
-    Ok(())
-}
-
-fn reject_acp_identity_patch(extra: &serde_json::Value) -> Result<(), AppError> {
-    let Some(object) = extra.as_object() else {
-        return Ok(());
-    };
-    const IDENTITY_KEYS: [&str; 3] = ["agent_id", "backend", "agent_source"];
-    if let Some(key) = IDENTITY_KEYS
-        .into_iter()
-        .find(|key| object.contains_key(*key))
-    {
-        return Err(AppError::BadRequest(format!(
-            "ACP extra.{key} is immutable after creation; create a new conversation to change the agent"
-        )));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy)]
 struct McpSupportPolicy {
     stdio: bool,
@@ -957,15 +864,6 @@ impl McpSupportPolicy {
         sse: true,
         streamable_http: true,
     };
-
-    fn from_acp_capabilities(capabilities: AcpMcpCapabilities) -> Self {
-        Self {
-            stdio: capabilities.stdio,
-            http: capabilities.http,
-            sse: capabilities.sse,
-            streamable_http: capabilities.http,
-        }
-    }
 
     fn supports_row_transport(self, transport_type: &str) -> bool {
         match transport_type {
@@ -1075,10 +973,9 @@ pub struct ConversationService {
     public_admission_cutpoint:
         Arc<std::sync::Mutex<Option<PublicAdmissionCutpointControl>>>,
 
-    // Repos for conversation, acp_session and agent_metadata access.
+    // Repos for conversation and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-    acp_session_repo: Arc<dyn IAcpSessionRepository>,
     /// Optional IDMM arm hook (post-construction registration, same slot pattern
     /// as `cron_service`). Wired by `nomifun-app` so a desktop turn arms 智能决策
     /// supervision; `None` in contexts that don't run IDMM (tests, webui-only).
@@ -1096,6 +993,8 @@ pub struct ConversationService {
     failover_provider_repo: Arc<RwLock<Option<Arc<dyn nomifun_db::IProviderRepository>>>>,
     failover_provider_model_repo:
         Arc<RwLock<Option<Arc<dyn nomifun_db::IProviderModelRepository>>>>,
+    failover_provider_model_capability_repo:
+        Arc<RwLock<Option<Arc<dyn nomifun_db::IProviderModelCapabilityRepository>>>>,
     failover_client_prefs: Arc<RwLock<Option<Arc<dyn nomifun_db::IClientPreferenceRepository>>>>,
     /// Mandatory read-side for the explicit Conversation↔Execution relation.
     /// Production assembly shares one repository-backed instance across every
@@ -2201,7 +2100,6 @@ impl ConversationService {
 
         conversation_repo: Arc<dyn IConversationRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-        acp_session_repo: Arc<dyn IAcpSessionRepository>,
         execution_conversation_boundary: Arc<dyn ExecutionConversationBoundary>,
     ) -> Self {
         Self {
@@ -2224,11 +2122,11 @@ impl ConversationService {
 
             conversation_repo,
             agent_metadata_repo,
-            acp_session_repo,
             supervision_hook: Arc::new(RwLock::new(None)),
             turn_completion_observer: Arc::new(RwLock::new(None)),
             failover_provider_repo: Arc::new(RwLock::new(None)),
             failover_provider_model_repo: Arc::new(RwLock::new(None)),
+            failover_provider_model_capability_repo: Arc::new(RwLock::new(None)),
             failover_client_prefs: Arc::new(RwLock::new(None)),
             execution_conversation_boundary,
             terminal_proof_provider: Arc::new(RwLock::new(None)),
@@ -2405,6 +2303,7 @@ impl ConversationService {
         &self,
         provider_repo: Arc<dyn nomifun_db::IProviderRepository>,
         provider_model_repo: Arc<dyn nomifun_db::IProviderModelRepository>,
+        provider_model_capability_repo: Arc<dyn nomifun_db::IProviderModelCapabilityRepository>,
         client_prefs: Arc<dyn nomifun_db::IClientPreferenceRepository>,
     ) {
         if let Ok(mut guard) = self.failover_provider_repo.write() {
@@ -2412,6 +2311,9 @@ impl ConversationService {
         }
         if let Ok(mut guard) = self.failover_provider_model_repo.write() {
             *guard = Some(provider_model_repo);
+        }
+        if let Ok(mut guard) = self.failover_provider_model_capability_repo.write() {
+            *guard = Some(provider_model_capability_repo);
         }
         if let Ok(mut guard) = self.failover_client_prefs.write() {
             *guard = Some(client_prefs);
@@ -2447,10 +2349,6 @@ impl ConversationService {
         &self.conversation_repo
     }
 
-    pub(crate) fn acp_session_repo(&self) -> &Arc<dyn IAcpSessionRepository> {
-        &self.acp_session_repo
-    }
-
     /// Snapshot of the registered failover deps (`None` until
     /// [`Self::with_failover_deps`] is called). Both must be present for the
     /// seam to run; either missing → failover disabled (fail-safe).
@@ -2459,12 +2357,23 @@ impl ConversationService {
     ) -> Option<(
         Arc<dyn nomifun_db::IProviderRepository>,
         Arc<dyn nomifun_db::IProviderModelRepository>,
+        Arc<dyn nomifun_db::IProviderModelCapabilityRepository>,
         Arc<dyn nomifun_db::IClientPreferenceRepository>,
     )> {
         let provider_repo = self.failover_provider_repo.read().ok()?.clone()?;
         let provider_model_repo = self.failover_provider_model_repo.read().ok()?.clone()?;
+        let provider_model_capability_repo = self
+            .failover_provider_model_capability_repo
+            .read()
+            .ok()?
+            .clone()?;
         let client_prefs = self.failover_client_prefs.read().ok()?.clone()?;
-        Some((provider_repo, provider_model_repo, client_prefs))
+        Some((
+            provider_repo,
+            provider_model_repo,
+            provider_model_capability_repo,
+            client_prefs,
+        ))
     }
 
     /// Resolve the model for one knowledge write-back. A valid explicit
@@ -2476,7 +2385,9 @@ impl ConversationService {
         session_model: Option<&ProviderWithModel>,
     ) -> Result<Option<ProviderWithModel>, String> {
         let fallback = session_model.cloned();
-        let Some((provider_repo, provider_model_repo, client_prefs)) = self.failover_deps() else {
+        let Some((provider_repo, provider_model_repo, provider_model_capability_repo, client_prefs)) =
+            self.failover_deps()
+        else {
             return Ok(fallback);
         };
         let preferences = match client_prefs
@@ -2564,7 +2475,25 @@ impl ConversationService {
                 );
             }
         };
-        if !provider.enabled || !model_row.is_some_and(|row| row.enabled) {
+        let has_chat_capability = match provider_model_capability_repo
+            .get(&selected.provider_id, &selected.model, "chat")
+            .await
+        {
+            Ok(capability) => capability.is_some(),
+            Err(error) => {
+                warn!(
+                    provider_id = %selected.provider_id,
+                    model = %selected.model,
+                    error = %ErrorChain(&error),
+                    "Failed to validate explicit knowledge write-back model capability"
+                );
+                return Err(
+                    "Could not validate the configured knowledge write-back model; retry"
+                        .to_owned(),
+                );
+            }
+        };
+        if !provider.enabled || !model_row.is_some_and(|row| row.enabled) || !has_chat_capability {
             warn!(
                 provider_id = %selected.provider_id,
                 model = %selected.model,
@@ -2817,19 +2746,6 @@ impl ConversationService {
         };
 
         if aggregate_deleted {
-            // SQLite's Conversation repository owns this logical child
-            // cleanup. Keep the explicit repository call for alternate
-            // repository implementations and tests; deleting a missing row is
-            // intentionally a no-op.
-            if let Err(error) = self.acp_session_repo.delete(conversation_id).await {
-                warn!(
-                    conversation_id,
-                    error = %ErrorChain(&error),
-                    "conversation rollback committed, but ACP session cleanup failed; session row may be orphaned"
-                );
-                cleanup_errors.push(format!("ACP session cleanup failed: {error}"));
-            }
-
             if let Some(path) = managed_workspace
                 && path.exists()
                 && let Err(error) = std::fs::remove_dir_all(path)
@@ -3308,15 +3224,6 @@ impl ConversationService {
             RunningOrphanDisposition::LocalContainedAuthority => {
                 OrphanProofRequirement::LocalContainedAuthority
             }
-            RunningOrphanDisposition::RegisteredLocalProcessTree => {
-                OrphanProofRequirement::RegisteredLocalProcessTree
-            }
-            RunningOrphanDisposition::RegisteredGatewayAuthorityRequired => {
-                OrphanProofRequirement::RegisteredGatewayAuthority
-            }
-            // Work may continue outside this machine; no local provider can
-            // vouch for it.
-            RunningOrphanDisposition::ExternalTerminalProofRequired => return Ok(false),
         };
         let decision = provider
             .prove_orphan_generation_terminal(
@@ -4216,47 +4123,6 @@ impl ConversationService {
             ));
         }
 
-        // V3 ACP identity is row-scoped and explicit. A backend label is
-        // descriptive metadata, never a lookup key or a substitute for the
-        // catalog business ID. Validate the logical parent before creating the
-        // Conversation row so an invalid agent cannot leave a half-created
-        // aggregate behind.
-        let acp_agent = if req.r#type == AgentType::Acp {
-            let agent_id =
-                required_trimmed_extra_string(&extra, "agent_id", "ACP conversation")?;
-            let agent = self
-                .agent_metadata_repo
-                .get(agent_id)
-                .await
-                .map_err(|error| AppError::Internal(format!("agent_metadata lookup: {error}")))?
-                .ok_or_else(|| {
-                    AppError::BadRequest(format!(
-                        "ACP extra.agent_id '{agent_id}' does not exist"
-                    ))
-                })?;
-            validate_acp_agent_metadata_row(&agent, &extra)?;
-            if let Some(object) = extra.as_object_mut() {
-                match agent.backend.as_ref() {
-                    Some(backend) => {
-                        object.insert(
-                            "backend".to_owned(),
-                            serde_json::Value::String(backend.clone()),
-                        );
-                    }
-                    None => {
-                        object.remove("backend");
-                    }
-                }
-                object.insert(
-                    "agent_source".to_owned(),
-                    serde_json::Value::String(agent.agent_source.clone()),
-                );
-            }
-            Some(agent)
-        } else {
-            None
-        };
-
         // Determine whether the user chose this workspace ("custom") or we
         // auto-provision one under `{work_dir}/conversations/{uuidv7}/`.
         // `is_custom_workspace` is the authoritative signal consumed later to
@@ -4355,7 +4221,9 @@ impl ConversationService {
             None => None,
         };
 
-        let mcp_support = self.resolve_mcp_support_policy(&req.r#type, &extra).await?;
+        // Nomi supports every MCP transport, so no selection can be narrowed
+        // by an agent-capability filter.
+        let mcp_support = McpSupportPolicy::NOMI;
         let mut resolved_mcp_server_ids: Vec<String> = Vec::new();
         let mut selected_mcp_names: Vec<String> = Vec::new();
         let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
@@ -4583,8 +4451,7 @@ impl ConversationService {
 
                 if !is_custom_workspace
                     && !skills_for_links.is_empty()
-                    && let Some(rel_dirs) =
-                        native_skills_dirs(&req.r#type, acp_agent.as_ref())
+                    && let Some(rel_dirs) = native_skills_dirs(&req.r#type)
                 {
                     let resolved = self.skill_resolver.resolve_skills(&skills_for_links).await;
                     if !resolved.is_empty() {
@@ -4625,11 +4492,6 @@ impl ConversationService {
                 self.conversation_repo
                     .set_mcp_server_ids(&new_id, &resolved_mcp_server_ids)
                     .await?;
-            }
-
-            // ACP conversations own one logical 1:1 acp_session child.
-            if let Some(agent) = acp_agent.as_ref() {
-                self.create_acp_session_row(&new_id, &extra, agent).await?;
             }
 
             // Build the response before the final cross-domain binding write
@@ -4720,56 +4582,6 @@ impl ConversationService {
         log_conversation_created(&response, &extra);
 
         Ok(response)
-    }
-
-    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    async fn create_acp_session_row(
-        &self,
-        conversation_id: &str,
-        extra: &serde_json::Value,
-        agent: &AgentMetadataRow,
-    ) -> Result<(), AppError> {
-        debug!("Creating acp_session row");
-
-        let conv_id = parse_conv_id(conversation_id)?;
-        validate_acp_agent_metadata_row(agent, extra)?;
-
-        let params = CreateAcpSessionParams {
-            conversation_id: conv_id,
-            agent_backend: agent.backend.as_deref().unwrap_or_default(),
-            agent_source: &agent.agent_source,
-            agent_id: &agent.agent_id,
-        };
-        self.acp_session_repo
-            .create(&params)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create acp_session row: {e}")))?;
-
-        // Seed optional runtime state from create payload. Empty strings are
-        // treated as absent, matching the "send key only when value present"
-        // contract on the wire. Mode/model take effect on the first
-        // reconcile right after session/new.
-        let mode = extra
-            .get("current_mode_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        let model = extra
-            .get("current_model_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        if mode.is_some() || model.is_some() {
-            let params = SaveRuntimeStateParams {
-                current_mode_id: mode.map(Some),
-                current_model_id: model.map(Some),
-                config_selections_json: None,
-                context_usage_json: None,
-            };
-            self.acp_session_repo
-                .save_runtime_state(conv_id, &params)
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to seed acp_session runtime state: {e}")))?;
-        }
-        Ok(())
     }
 
     /// Get a single conversation by ID.
@@ -4913,9 +4725,10 @@ impl ConversationService {
         mut req: UpdateConversationRequest,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
     ) -> Result<ConversationResponse, AppError> {
-        let existing = self
+        let conversation_id = parse_conv_id(id)?;
+        let mut existing = self
             .conversation_repo
-            .get(parse_conv_id(id)?)
+            .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
@@ -4939,6 +4752,39 @@ impl ConversationService {
             req.decision_policy = Some(DecisionPolicy::default());
             req.execution_template_id = Some(None);
         }
+
+        // Runtime-affecting PATCHes and fields rewritten by failover share the
+        // same per-Conversation preparation gate. `execution_model_pool` and
+        // `execution_template_id` are turn-planning authority rather than
+        // runtime-factory inputs, so they need serialization against failover
+        // but do not by themselves recycle the cached runtime. Pure
+        // presentation changes (name/pin and non-runtime extra) stay outside.
+        let failover_authority_update_requested = req.model.is_some()
+            || req.delegation_policy.is_some()
+            || req.execution_model_pool.is_some()
+            || req.execution_template_id.is_some()
+            || req
+                .extra
+                .as_ref()
+                .is_some_and(|extra| extra.get("workspace").is_some());
+        let failover_authority_fence = if failover_authority_update_requested {
+            let lease = self.begin_public_runtime_preparation(conversation_id, user_id)?;
+            let cancellation = lease.cancellation_token();
+            let guard = self
+                .runtime_state
+                .acquire_preparation_gate(conversation_id, &cancellation)
+                .await?;
+            lease.ensure_active()?;
+            existing = self
+                .conversation_repo
+                .get(conversation_id)
+                .await?
+                .filter(|row| row.user_id == user_id)
+                .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+            Some((lease, guard))
+        } else {
+            None
+        };
 
         // Public PATCH cannot mutate or recycle the runtime snapshot owned by
         // an Execution Attempt. Backend-only metadata seams such as
@@ -4988,14 +4834,6 @@ impl ConversationService {
                 "top-level `model` is only accepted for nomi conversations; pass model via `extra` for {}",
                 existing.r#type
             )));
-        }
-        if existing_type == AgentType::Acp
-            && let Some(incoming) = req.extra.as_ref()
-        {
-            // The conversation row and its 1:1 acp_session row must always
-            // point at the same logical agent parent. Agent replacement is an
-            // aggregate replacement, not a JSON patch.
-            reject_acp_identity_patch(incoming)?;
         }
 
         let now = now_ms();
@@ -5159,14 +4997,15 @@ impl ConversationService {
             updated_at: Some(now),
         };
 
-        self.conversation_repo.update(parse_conv_id(id)?, &updates).await?;
-
         if model_changed || workspace_changed || delegation_policy_changed {
+            if let Some((lease, _)) = failover_authority_fence.as_ref() {
+                lease.ensure_active()?;
+            }
             info!(
                 model_changed,
                 workspace_changed,
                 delegation_policy_changed,
-                "Conversation updated, terminating Agent runtime so the change takes effect on the next message"
+                "Conversation configuration update awaiting old runtime teardown before persistence"
             );
             Self::terminate_runtime_with_proof(
                 runtime_registry,
@@ -5175,12 +5014,20 @@ impl ConversationService {
                 "conversation configuration update",
             )
             .await?;
+            if let Some((lease, _)) = failover_authority_fence.as_ref() {
+                lease.ensure_active()?;
+            }
         }
+
+        if let Some((lease, _)) = failover_authority_fence.as_ref() {
+            lease.ensure_active()?;
+        }
+        self.conversation_repo.update(conversation_id, &updates).await?;
 
         // Re-fetch to return the updated version
         let updated = self
             .conversation_repo
-            .get(parse_conv_id(id)?)
+            .get(conversation_id)
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished after update".into()))?;
 
@@ -5210,9 +5057,6 @@ impl ConversationService {
             .get(parse_conv_id(conversation_id)?)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
-        if string_to_enum::<AgentType>(&existing.r#type)? == AgentType::Acp {
-            reject_acp_identity_patch(&patch)?;
-        }
 
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).map_err(|error| {
@@ -5463,24 +5307,6 @@ impl ConversationService {
                 Some(error) => Err(AppError::Internal(error)),
                 None => Ok(()),
             });
-
-            match tokio::time::timeout(
-                DELETE_CLEANUP_ITEM_GRACE,
-                service.acp_session_repo.delete(&conversation_id),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => warn!(
-                    conversation_id,
-                    error = %ErrorChain(&err),
-                    "Failed to delete acp_session row on conversation delete"
-                ),
-                Err(_) => warn!(
-                    conversation_id,
-                    "Timed out deleting acp_session row on conversation delete"
-                ),
-            }
 
             let deleted_cron_job_ids: Arc<[String]> = delete_cleanup.into();
             for hook in hooks {
@@ -6017,6 +5843,17 @@ impl ConversationService {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Message {message_id} not found")))?;
 
+        // `turn_root` is an internal relationship anchor, not a public chat
+        // message. Internal repository callers need exact access for
+        // idempotent root preflight/reconciliation, but exposing it through
+        // the public message endpoint would fail enum projection and surface
+        // a misleading 500. Keep the boundary intentionally opaque.
+        if row.r#type == "turn_root" {
+            return Err(AppError::NotFound(format!(
+                "Message {message_id} not found"
+            )));
+        }
+
         let content_bytes = row.content.len();
         let mut responses = self
             .project_history_artifact_integrity(
@@ -6304,14 +6141,16 @@ impl ConversationService {
         preparation_lease.ensure_active()?;
         let (companion, _companion_id, channel_platform) =
             companion_context_from_extra(&conversation.extra)?;
-        let agent_type = string_to_enum(&conversation.r#type)?;
+        // The persisted agent type is still validated here: an unparseable row
+        // must not reach the write-back path even though the surface no longer
+        // varies by engine.
+        let _: AgentType = string_to_enum(&conversation.r#type)?;
         let (knowledge_service, mut request) = self
             .build_turn_writeback_request(
                 &runtime_options.extra,
                 &assistant.message_id,
                 &user_text,
                 None,
-                agent_type,
                 companion,
                 channel_platform.as_deref(),
             )
@@ -8522,6 +8361,13 @@ impl ConversationService {
         // mid-turn, and `perform_model_failover` re-fetches the row for the
         // freshly-written model when it rebuilds.
         let failover_extra_json = row.extra.clone();
+        let initial_failover_authority = runtime_options.model.clone().map(|model| {
+            FailoverAuthoritySnapshot {
+                model,
+                execution_model_pool: row.execution_model_pool.clone(),
+                execution_template_id: row.execution_template_id.clone(),
+            }
+        });
 
         // Send message to the agent in a background task.
         // prompt() blocks until the PromptResponse arrives (turn completed),
@@ -8556,7 +8402,10 @@ impl ConversationService {
             let build_started_at = now_ms();
             info!(conversation_id = %conv_id, "Agent runtime build started");
             let knowledge_extra = runtime_options.extra.clone();
-            let mut successful_turn_model = runtime_options.model.clone();
+            let mut successful_turn_model = initial_failover_authority
+                .as_ref()
+                .map(|authority| authority.model.clone());
+            let mut failover_authority = initial_failover_authority;
             let mut agent = match runtime_registry
                 .get_or_create_runtime_for_turn(
                     &conv_id,
@@ -8808,6 +8657,11 @@ impl ConversationService {
                 Option<String>,
                 Option<(String, bool)>,
             )> = None;
+            // A logical turn can span provider failover or system
+            // continuations. Preserve only evidence that crossed the relay's
+            // atomic artifact commit barrier; provisional tool output never
+            // contributes to delivery success.
+            let mut committed_artifact_count = 0usize;
             // Phase 3 (review #1/#5): resolve the effective failover config ONCE
             // (it does not change mid-turn). Used to build the relay's error
             // suppressor so a pre-response provider fault that WILL be failed over
@@ -8898,31 +8752,50 @@ impl ConversationService {
                     }
                 }
 
-                let rx = agent.subscribe();
-                let send_agent = agent.clone();
-                let conv_id_send = conv_id.clone();
-                let send_cancellation = turn_token.clone();
                 // Phase 3: keep a copy of this turn's send so a pre-response
                 // provider fault can resend the SAME content to the next model.
                 let resend_payload = current_send.clone();
-                let (send_error_tx, send_error_rx) = oneshot::channel();
-                // 1. Send the message to the agent and concurrently run the relay to stream events.
-                tokio::spawn(async move {
-                    if send_cancellation.is_cancelled() {
-                        let _ = send_error_tx.send(Ok(()));
-                        return;
-                    }
-                    let send_result = send_agent.send_message(current_send).await;
-                    if let Err(e) = send_result.as_ref() {
-                        error!(conversation_id = %conv_id_send, error = %ErrorChain(e), "Agent send_message failed");
-                    }
-                    // Explicit success matters: a dropped sender now denotes
-                    // panic/abort and is converted by StreamRelay into a
-                    // terminal Error instead of waiting forever.
-                    let _ = send_error_tx.send(send_result);
-                });
-                // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
-                let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+                // The hidden structural root is a prerequisite for every
+                // root-scoped status/tool/artifact row. Establish it before
+                // provider work starts so a database failure cannot race (or
+                // bill) a native image generation that can never be committed.
+                let root_ready = relay.ensure_turn_root_persisted().await;
+                let outcome = if let Err(root_error) = root_ready {
+                    error!(
+                        conversation_id = %conv_id,
+                        root_turn_id = %stable_turn_id,
+                        error = %ErrorChain(&root_error),
+                        "Logical turn root preflight failed before agent send"
+                    );
+                    // Do not retry the preflight inside `consume`: a transient
+                    // second-attempt success would leave this receiver waiting
+                    // forever because provider work was deliberately not
+                    // started. Surface one terminal failure directly.
+                    relay.into_turn_root_failure_outcome(root_error)
+                } else {
+                    let rx = agent.subscribe();
+                    let send_agent = agent.clone();
+                    let conv_id_send = conv_id.clone();
+                    let send_cancellation = turn_token.clone();
+                    let (send_error_tx, send_error_rx) = oneshot::channel();
+                    // Send the message and concurrently relay its event stream.
+                    tokio::spawn(async move {
+                        if send_cancellation.is_cancelled() {
+                            let _ = send_error_tx.send(Ok(()));
+                            return;
+                        }
+                        let send_result = send_agent.send_message(current_send).await;
+                        if let Err(e) = send_result.as_ref() {
+                            error!(conversation_id = %conv_id_send, error = %ErrorChain(e), "Agent send_message failed");
+                        }
+                        // Explicit success matters: a dropped sender denotes
+                        // panic/abort and becomes a terminal Error.
+                        let _ = send_error_tx.send(send_result);
+                    });
+                    relay.consume_with_send_error(rx, send_error_rx).await
+                };
+                committed_artifact_count = committed_artifact_count
+                    .saturating_add(outcome.committed_artifact_count);
 
                 if turn_token.is_cancelled() || outcome.stop_reason == Some(TurnStopReason::Cancelled) {
                     durable_completion = Some((
@@ -8954,19 +8827,16 @@ impl ConversationService {
                         false,
                         outcome.final_text.clone(),
                         Some("Agent event stream integrity was lost".to_owned()),
-                        relay_error_code::map_turn_failure(&outcome.terminal, None),
+                        relay_error_code::map_turn_failure(
+                            &outcome.terminal,
+                            None,
+                            committed_artifact_count,
+                        ),
                     ));
                     final_turn_writeback = None;
                     break;
                 }
 
-                if let Some(session_key) = agent.get_session_key() {
-                    // This future may own an SQLite commit. Never cancel it on
-                    // an elapsed wall-clock budget: an unknown commit result
-                    // would let exact turn authority release while a late write
-                    // from this generation can still land.
-                    persist_session_key(&repo, &conv_id, &session_key).await;
-                }
                 if turn_token.is_cancelled() {
                     durable_completion = Some((
                         false,
@@ -8983,26 +8853,31 @@ impl ConversationService {
                 // On a usable next model we swap `agent` to the rebuilt task and
                 // resend the SAME content with a fresh msg_id; on None (queue
                 // exhausted / disabled / not eligible) we fall through to the
-                // ACP-eviction + error-surfacing path unchanged. This runs BEFORE
-                // `evict_acp_task_after_terminal_error` (which only acts on ACP),
-                // so a successful nomi failover short-circuits via `continue`.
+                // error-surfacing path unchanged.
                 // This path can terminate and replace a process. It must not be
                 // wrapped in the cancellable post-terminal side-effect budget:
                 // dropping it after quarantine would let the durable Running
                 // turn finalize while the old process might still execute.
-                let failover_switch = service
-                    .maybe_failover_in_send_loop(
-                        &conv_id,
-                        agent.agent_type(),
-                        &outcome,
-                        failover_switches_done,
-                        &failover_tried,
-                        &failover_extra_json,
-                        &runtime_registry,
-                        turn_cancellation.turn_id(),
-                        &turn_token,
-                    )
-                    .await;
+                let failover_switch = if let Some(failed_turn_authority) =
+                    failover_authority.as_ref()
+                {
+                    service
+                        .maybe_failover_in_send_loop(
+                            &conv_id,
+                            agent.agent_type(),
+                            &outcome,
+                            failover_switches_done,
+                            &failover_tried,
+                            failed_turn_authority,
+                            &failover_extra_json,
+                            &runtime_registry,
+                            turn_cancellation.turn_id(),
+                            &turn_token,
+                        )
+                        .await
+                } else {
+                    None
+                };
                 if turn_token.is_cancelled() {
                     // Any runtime constructed by failover belongs to the same
                     // still-blocked generation; the stop worker has already
@@ -9019,7 +8894,12 @@ impl ConversationService {
                 if let Some(switch) = failover_switch {
                     failover_switches_done += 1;
                     failover_tried.push(switch.picked.clone());
+                    let failed_model = successful_turn_model
+                        .as_ref()
+                        .map(|m| m.model.clone())
+                        .unwrap_or_else(|| "未知模型".to_owned());
                     successful_turn_model = Some(switch.picked.clone());
+                    failover_authority = Some(switch.authority.clone());
                     info!(
                         conversation_id = %conv_id,
                         switch = failover_switches_done,
@@ -9027,6 +8907,31 @@ impl ConversationService {
                         model = %switch.picked.model,
                         "Model failover succeeded; resending turn to next model"
                     );
+                    // Audit receipt: the provider fault is suppressed once
+                    // recovery succeeds, so without this row the transcript
+                    // cannot show that a different model produced the answer.
+                    // The reason is the classified error code, never raw
+                    // provider text, which can carry credentials.
+                    let reason = outcome
+                        .terminal
+                        .code()
+                        .and_then(|code| {
+                            serde_json::to_value(code)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                        })
+                        .unwrap_or_else(|| "PROVIDER_FAULT".to_owned());
+                    service
+                        .persist_and_broadcast_model_failover_receipt(
+                            &user_id_owned,
+                            &conv_id,
+                            &failed_model,
+                            &switch.picked.model,
+                            &reason,
+                            failover_switches_done as usize,
+                            Some(&stable_turn_id),
+                        )
+                        .await;
                     agent = switch.agent;
                     let resend_msg_id = Self::mint_msg_id();
                     pending_send = Some((
@@ -9134,11 +9039,11 @@ impl ConversationService {
                         .await;
                 }
 
-                let result_ok = matches!(outcome.terminal, RelayTerminal::Finish)
-                    && outcome
-                        .final_text
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty());
+                let result_ok = relay_error_code::turn_succeeded(
+                    &outcome.terminal,
+                    outcome.final_text.as_deref(),
+                    committed_artifact_count,
+                );
                 durable_completion = Some((
                     result_ok,
                     outcome.final_text.clone(),
@@ -9147,22 +9052,10 @@ impl ConversationService {
                     relay_error_code::map_turn_failure(
                         &outcome.terminal,
                         outcome.final_text.as_deref(),
+                        committed_artifact_count,
                     ),
                 ));
 
-                let acp_evicted = service
-                    .evict_acp_task_after_terminal_error(
-                        &conv_id,
-                        agent.agent_type(),
-                        &outcome,
-                        &runtime_registry,
-                        turn_cancellation.turn_id(),
-                        &turn_token,
-                    )
-                    .await;
-                if acp_evicted {
-                    break;
-                }
                 if turn_token.is_cancelled() {
                     durable_completion = Some((
                         false,
@@ -9183,7 +9076,6 @@ impl ConversationService {
                             &turn_msg_id,
                             &turn_user_text,
                             turn_origin.as_deref(),
-                            agent.agent_type(),
                             companion,
                             channel_platform.as_deref(),
                     )
@@ -10488,6 +10380,133 @@ impl ConversationService {
         );
     }
 
+    pub(crate) async fn persist_and_broadcast_model_failover_teardown_tip(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: Option<&str>,
+    ) -> Option<MessageRow> {
+        let Some(row) = self
+            .persist_model_failover_teardown_tip(conversation_id, turn_id)
+            .await
+        else {
+            return None;
+        };
+
+        let msg_id = row
+            .msg_id
+            .clone()
+            .unwrap_or_else(|| row.message_id.clone());
+        let content_value: serde_json::Value = serde_json::from_str(&row.content)
+            .unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
+        self.user_events.send_to_user(
+            user_id,
+            WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": row.conversation_id,
+                    "turn_id": turn_id,
+                    "msg_id": msg_id,
+                    "type": row.r#type,
+                    "data": content_value,
+                    "position": row.position,
+                    "status": row.status,
+                    "hidden": row.hidden,
+                    "replace": false,
+                }),
+            ),
+        );
+        Some(row)
+    }
+
+    /// Persist and broadcast the audit receipt for a committed model switch.
+    /// Mirrors the teardown tip so a receipt arriving mid-turn renders live and
+    /// remains visible after reconnect.
+    pub(crate) async fn persist_and_broadcast_model_failover_receipt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        failed_model: &str,
+        next_model: &str,
+        reason: &str,
+        switch: usize,
+        turn_id: Option<&str>,
+    ) -> Option<MessageRow> {
+        let row = self
+            .persist_model_failover_receipt(
+                conversation_id,
+                failed_model,
+                next_model,
+                reason,
+                switch,
+                turn_id,
+            )
+            .await?;
+
+        let msg_id = row
+            .msg_id
+            .clone()
+            .unwrap_or_else(|| row.message_id.clone());
+        let content_value: serde_json::Value = serde_json::from_str(&row.content)
+            .unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
+        self.user_events.send_to_user(
+            user_id,
+            WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": row.conversation_id,
+                    "turn_id": turn_id,
+                    "msg_id": msg_id,
+                    "type": row.r#type,
+                    "data": content_value,
+                    "position": row.position,
+                    "status": row.status,
+                    "hidden": row.hidden,
+                    "replace": false,
+                }),
+            ),
+        );
+        Some(row)
+    }
+
+    pub(crate) async fn resolve_and_broadcast_model_failover_teardown_tip(
+        &self,
+        user_id: &str,
+        row: &mut MessageRow,
+        turn_id: Option<&str>,
+    ) -> bool {
+        if !self
+            .resolve_model_failover_teardown_tip(row, turn_id)
+            .await
+        {
+            return false;
+        }
+        let msg_id = row
+            .msg_id
+            .clone()
+            .unwrap_or_else(|| row.message_id.clone());
+        let content_value: serde_json::Value = serde_json::from_str(&row.content)
+            .unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
+        self.user_events.send_to_user(
+            user_id,
+            WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": row.conversation_id,
+                    "turn_id": turn_id,
+                    "msg_id": msg_id,
+                    "type": row.r#type,
+                    "data": content_value,
+                    "position": row.position,
+                    "status": row.status,
+                    "hidden": row.hidden,
+                    "replace": true,
+                }),
+            ),
+        );
+        true
+    }
+
     /// Durable at-most-once edit/rewind/truncate/resubmit workflow.
     ///
     /// The receipt is claimed before the first destructive step. Every
@@ -10625,46 +10644,37 @@ impl ConversationService {
         // runtime recovery all legitimately leave this registry cold. Restore
         // through the same execution preparation path as a normal send, while
         // still outside the durable destructive receipt/fence.
-        let agent = if let Some(agent) = runtime_registry.get_runtime(conv_id) {
-            agent
-        } else {
-            let (runtime_options, knowledge_signature) = self
-                .prepare_runtime_options_for_execution(
-                    &row,
-                    runtime_registry,
-                    Some(&preparation_token),
-                )
-                .await?;
-            runtime_build_lease.ensure_active()?;
-            let stored_workspace = runtime_options.workspace.clone();
-            let agent = runtime_registry
-                .get_or_create_runtime_for_preparation(
-                    conv_id,
-                    preparation_token.clone(),
-                    runtime_options,
-                )
-                .await?;
-            if runtime_build_lease.is_cancelled() {
-                Self::terminate_runtime_until_confirmed(
-                    runtime_registry,
-                    conv_id,
-                    AgentKillReason::UserCancelled,
-                    "cancelled edit/resubmit runtime preparation",
-                )
-                .await;
-                return Err(AppError::Conflict(format!(
-                    "conversation {conversation_id} runtime preparation was cancelled"
-                )));
-            }
-            self.maybe_persist_workspace(
-                conv_id,
-                &stored_workspace,
-                agent.workspace(),
+        let (runtime_options, knowledge_signature) = self
+            .prepare_runtime_options_for_execution(
+                &row,
+                runtime_registry,
+                Some(&preparation_token),
             )
             .await?;
-            self.commit_runtime_knowledge_signature(conv_id, knowledge_signature);
-            agent
-        };
+        runtime_build_lease.ensure_active()?;
+        let stored_workspace = runtime_options.workspace.clone();
+        let agent = runtime_registry
+            .get_or_create_runtime_for_preparation(
+                conv_id,
+                preparation_token.clone(),
+                runtime_options,
+            )
+            .await?;
+        if runtime_build_lease.is_cancelled() {
+            Self::terminate_runtime_until_confirmed(
+                runtime_registry,
+                conv_id,
+                AgentKillReason::UserCancelled,
+                "cancelled edit/resubmit runtime preparation",
+            )
+            .await;
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} runtime preparation was cancelled"
+            )));
+        }
+        self.maybe_persist_workspace(conv_id, &stored_workspace, agent.workspace())
+            .await?;
+        self.commit_runtime_knowledge_signature(conv_id, knowledge_signature);
         runtime_build_lease.ensure_active()?;
 
         // Legacy/compacted sessions do not contain enough information to infer
@@ -11711,11 +11721,6 @@ impl ConversationService {
                 .await?;
         }
 
-        // ACP session clearing is durable authority, not best effort. Returning
-        // success while the old resume id survives would make the next cold
-        // runtime silently recover the supposedly archived context.
-        self.acp_session_repo.clear_session_id(conv_id).await?;
-
         drop(reset_guard);
         drop(preparation_guard);
         info!("Conversation context cleared");
@@ -12082,13 +12087,6 @@ fn project_preset_runtime_context(
             object.insert("preset_rules".to_owned(), context);
             object.remove("preset_context");
         }
-        AgentType::Acp
-        | AgentType::OpenclawGateway
-        | AgentType::Nanobot
-        | AgentType::Remote => {
-            object.insert("preset_context".to_owned(), context);
-            object.remove("preset_rules");
-        }
     }
     debug!(
         conversation_id = %row.conversation_id,
@@ -12266,20 +12264,7 @@ impl ConversationService {
             return Ok(());
         }
 
-        let acp_agent = if runtime_options.agent_type == AgentType::Acp {
-            Some(
-                resolve_acp_agent_metadata(
-                    &self.agent_metadata_repo,
-                    &runtime_options.extra,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let Some(rel_dirs) =
-            native_skills_dirs(&runtime_options.agent_type, acp_agent.as_ref())
-        else {
+        let Some(rel_dirs) = native_skills_dirs(&runtime_options.agent_type) else {
             return Ok(());
         };
         if rel_dirs.is_empty() {
@@ -12515,7 +12500,6 @@ impl ConversationService {
         _msg_id: &str,
         user_text: &str,
         origin: Option<&str>,
-        agent_type: AgentType,
         companion: bool,
         channel_platform: Option<&str>,
     ) -> Option<(
@@ -12566,8 +12550,6 @@ impl ConversationService {
             nomifun_knowledge::WriteSurface::Companion
         } else if channel_platform.map(str::trim).filter(|s| !s.is_empty()).is_some() {
             nomifun_knowledge::WriteSurface::ExternalChannel
-        } else if agent_type == AgentType::Acp {
-            nomifun_knowledge::WriteSurface::TerminalAcp
         } else {
             nomifun_knowledge::WriteSurface::RegularChat
         };
@@ -12924,72 +12906,16 @@ fn rebase_managed_workspace_in_row(
     Ok(())
 }
 
-/// Resolve the native skills directory list for an agent by looking it
-/// up in the `agent_metadata` catalog (ACP vendors) or the bundled
-/// `AgentType` table (non-ACP built-ins).
+/// Resolve the native skills directory list for an agent from the bundled
+/// `AgentType` table.
 ///
 /// Returns `None` when the agent does not support native skill
 /// discovery — callers should then skip the workspace-symlink step and
 /// rely on prompt injection instead.
-fn native_skills_dirs(
-    agent_type: &AgentType,
-    acp_agent: Option<&AgentMetadataRow>,
-) -> Option<Vec<String>> {
-    if *agent_type == AgentType::Acp {
-        let row = acp_agent?;
-        let raw = row.native_skills_dirs.as_deref()?;
-        return serde_json::from_str::<Vec<String>>(raw).ok();
-    }
+fn native_skills_dirs(agent_type: &AgentType) -> Option<Vec<String>> {
     agent_type
         .native_skills_dirs()
         .map(|dirs| dirs.iter().map(|s| (*s).to_owned()).collect())
-}
-
-impl ConversationService {
-    async fn resolve_mcp_support_policy(
-        &self,
-        agent_type: &AgentType,
-        extra: &serde_json::Value,
-    ) -> Result<McpSupportPolicy, AppError> {
-        match agent_type {
-            AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, extra).await,
-            AgentType::Nomi => Ok(McpSupportPolicy::NOMI),
-            _ => Ok(McpSupportPolicy::NOMI),
-        }
-    }
-}
-
-async fn resolve_acp_mcp_support_policy(
-    repo: &Arc<dyn IAgentMetadataRepository>,
-    extra: &serde_json::Value,
-) -> Result<McpSupportPolicy, AppError> {
-    let row = resolve_acp_agent_metadata(repo, extra).await?;
-    let capabilities = Some(&row)
-        .and_then(|row| row.agent_capabilities.as_deref())
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .map(|value| parse_acp_mcp_capabilities(&value))
-        .unwrap_or_default();
-
-    Ok(McpSupportPolicy::from_acp_capabilities(capabilities))
-}
-
-async fn resolve_acp_agent_metadata(
-    repo: &Arc<dyn IAgentMetadataRepository>,
-    extra: &serde_json::Value,
-) -> Result<AgentMetadataRow, AppError> {
-    let agent_id =
-        required_trimmed_extra_string(extra, "agent_id", "ACP conversation")?;
-    let row = repo
-        .get(agent_id)
-        .await
-        .map_err(|error| AppError::Internal(format!("agent_metadata lookup: {error}")))?
-        .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "ACP extra.agent_id '{agent_id}' does not exist"
-            ))
-        })?;
-    validate_acp_agent_metadata_row(&row, extra)?;
-    Ok(row)
 }
 
 fn upsert_conversation_mcp_status(
@@ -13134,7 +13060,7 @@ fn validate_url_field(transport: &str, url: Option<&str>) -> Result<(), String> 
 
 /// Serialize a serde-compatible enum to its JSON string form for DB storage.
 ///
-/// e.g. `AgentType::Acp` → `"acp"`
+/// e.g. `AgentType::Nomi` → `"nomi"`
 fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, AppError> {
     let json_val =
         serde_json::to_value(val).map_err(|e| AppError::Internal(format!("Enum serialization failed: {e}")))?;
@@ -13505,7 +13431,7 @@ fn log_conversation_created(response: &ConversationResponse, extra: &serde_json:
 fn is_tool_message_type(message_type: MessageType) -> bool {
     matches!(
         message_type,
-        MessageType::ToolCall | MessageType::ToolGroup | MessageType::AcpToolCall
+        MessageType::ToolCall | MessageType::ToolGroup
     )
 }
 
@@ -13619,20 +13545,6 @@ mod tests {
     }
 
     #[test]
-    fn frozen_snapshot_projects_to_non_nomi_runtime_context() {
-        let row = row_with_runtime_preset(json!({}));
-        let mut extra = json!({});
-
-        project_preset_runtime_context(&row, &AgentType::Acp, &mut extra).unwrap();
-
-        assert!(extra["preset_context"]
-            .as_str()
-            .unwrap()
-            .contains("Name: 文案版"));
-        assert!(extra.get("preset_rules").is_none());
-    }
-
-    #[test]
     fn incomplete_or_mismatched_preset_lineage_fails_closed() {
         let mut incomplete = row_with_runtime_preset(json!({}));
         incomplete.preset_snapshot = None;
@@ -13660,9 +13572,7 @@ mod tests {
     #[test]
     fn enum_to_db_agent_type() {
         use nomifun_common::AgentType;
-        assert_eq!(enum_to_db(&AgentType::Acp).unwrap(), "acp");
-        assert_eq!(enum_to_db(&AgentType::Nanobot).unwrap(), "nanobot");
-        assert_eq!(enum_to_db(&AgentType::OpenclawGateway).unwrap(), "openclaw-gateway");
+        assert_eq!(enum_to_db(&AgentType::Nomi).unwrap(), "nomi");
     }
 
     #[test]
@@ -14105,9 +14015,9 @@ mod tests {
     }
 
     #[test]
-    fn preset_lineage_extracts_acp_builtin_fields() {
+    fn preset_lineage_extracts_agent_identity_fields() {
         use nomifun_common::AgentType;
-        let response = response_with_type(AgentType::Acp);
+        let response = response_with_type(AgentType::Nomi);
         let extra = json!({
             "agent_id": "0190f5fe-7c00-7a00-8000-000000000101",
             "agent_name": "Claude Code",
@@ -14116,7 +14026,7 @@ mod tests {
             "session_mode": "default",
         });
         let lineage = PresetLineage::from_response_and_extra(&response, &extra);
-        assert_eq!(lineage.agent_type, "acp");
+        assert_eq!(lineage.agent_type, "nomi");
         assert_eq!(
             lineage.agent_id,
             "0190f5fe-7c00-7a00-8000-000000000101"
@@ -14142,15 +14052,15 @@ mod tests {
     }
 
     #[test]
-    fn preset_lineage_extracts_acp_custom_agent_id() {
+    fn preset_lineage_extracts_custom_agent_id() {
         use nomifun_common::AgentType;
-        let response = response_with_type(AgentType::Acp);
+        let response = response_with_type(AgentType::Nomi);
         let extra = json!({
             "custom_agent_id": "custom-1",
             "backend": "openrouter",
         });
         let lineage = PresetLineage::from_response_and_extra(&response, &extra);
-        assert_eq!(lineage.agent_type, "acp");
+        assert_eq!(lineage.agent_type, "nomi");
         assert_eq!(lineage.custom_agent_id, "custom-1");
         assert_eq!(lineage.backend, "openrouter");
         assert!(lineage.has_any_identity());
@@ -14159,17 +14069,17 @@ mod tests {
     #[test]
     fn preset_lineage_no_identity_when_extra_lacks_assistant_fields() {
         use nomifun_common::AgentType;
-        let response = response_with_type(AgentType::Acp);
+        let response = response_with_type(AgentType::Nomi);
         let extra = json!({ "workspace": "/project" });
         let lineage = PresetLineage::from_response_and_extra(&response, &extra);
-        assert_eq!(lineage.agent_type, "acp");
+        assert_eq!(lineage.agent_type, "nomi");
         assert!(!lineage.has_any_identity());
     }
 
     #[test]
     fn preset_lineage_treats_non_string_fields_as_missing() {
         use nomifun_common::AgentType;
-        let response = response_with_type(AgentType::Acp);
+        let response = response_with_type(AgentType::Nomi);
         let extra = json!({
             "agent_id": 42,
             "agent_name": null,

@@ -27,11 +27,11 @@ use crate::repository::conversation::{
 /// keeps this day key identical to the companion domain's `session_day`.
 const LOCAL_DAY_EXPR: &str = "strftime('%Y%m%d', created_at / 1000, 'unixepoch', 'localtime')";
 
-/// The rows a human can actually read back: the two synthetic types the whole
+/// The rows a human can actually read back: synthetic protocol types the whole
 /// message API already hides, minus hidden engine plumbing. Shared by the day
 /// index and the day read so a day never renders rows its index did not count.
 const VISIBLE_MESSAGE_PREDICATE: &str =
-    "type NOT IN ('cron_trigger', 'skill_suggest') AND hidden = 0";
+    "type NOT IN ('cron_trigger', 'skill_suggest', 'turn_root') AND hidden = 0";
 
 /// SQLite-backed implementation of [`IConversationRepository`].
 #[derive(Clone, Debug)]
@@ -359,13 +359,6 @@ fn artifact_tool_call_identity(message_type: &str, content: &serde_json::Value) 
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned),
-        "acp_tool_call" => content
-            .get("update")
-            .and_then(|update| update.get("tool_call_id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned),
         _ => None,
     }
 }
@@ -380,7 +373,7 @@ fn validate_turn_artifact_message_commit(
             message.message_id
         ))
     })?;
-    if !matches!(message.message_type.as_str(), "tool_call" | "acp_tool_call") {
+    if message.message_type != "tool_call" {
         return Err(artifact_commit_conflict(format!(
             "message '{}' has unsupported type '{}'",
             message.message_id, message.message_type
@@ -432,23 +425,6 @@ fn validate_turn_artifact_message_commit(
                     .and_then(serde_json::Value::as_array)
                     .is_some_and(|artifacts| !artifacts.is_empty() && artifacts.iter().all(serde_json::Value::is_object))
         }
-        "acp_tool_call" => object
-            .get("update")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|update| {
-                update.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-                    && update
-                        .get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|items| {
-                            items.iter().any(|item| {
-                                matches!(
-                                    item.get("type").and_then(serde_json::Value::as_str),
-                                    Some("artifact" | "resource_link")
-                                )
-                            })
-                        })
-            }),
         _ => false,
     };
     if !has_delivery {
@@ -1991,47 +1967,6 @@ impl IConversationRepository for SqliteConversationRepository {
         }
         let reset_extra = strip_runtime_resume_extra(&existing_extra)?;
 
-        // ACP resume identity and cached context usage belong to the same
-        // aggregate reset. Keep user mode/model/config preferences, but clear
-        // the session identity under this transaction's write lock so a later
-        // status-write failure cannot leave history intact with context gone.
-        let acp_session_config: Option<String> =
-            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
-                .bind(conversation_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(raw_config) = acp_session_config {
-            let mut session_config: serde_json::Value =
-                serde_json::from_str(&raw_config).map_err(|error| {
-                    DbError::Conflict(format!(
-                        "ACP session config is not valid JSON during Conversation reset: {error}"
-                    ))
-                })?;
-            if let Some(runtime) = session_config
-                .as_object_mut()
-                .and_then(|object| object.get_mut("runtime"))
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                runtime.remove("context_usage");
-            }
-            let session_config = serde_json::to_string(&session_config).map_err(|error| {
-                DbError::Conflict(format!(
-                    "ACP session config could not be serialized during Conversation reset: {error}"
-                ))
-            })?;
-            sqlx::query(
-                "UPDATE acp_session \
-                 SET acp_session_id = NULL, session_status = 'idle', \
-                     session_config = ?, last_active_at = ? \
-                 WHERE conversation_id = ?",
-            )
-            .bind(session_config)
-            .bind(updated_at)
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
         clear_conversation_transcript_aggregate(
             &mut tx,
             user_id,
@@ -2108,42 +2043,6 @@ impl IConversationRepository for SqliteConversationRepository {
         }
         let cleared_extra = strip_runtime_resume_extra(&existing_extra)?;
 
-        let acp_session_config: Option<String> =
-            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
-                .bind(conversation_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(raw_config) = acp_session_config {
-            let mut session_config: serde_json::Value =
-                serde_json::from_str(&raw_config).map_err(|error| {
-                    DbError::Conflict(format!(
-                        "ACP session config is not valid JSON during transcript clear: {error}"
-                    ))
-                })?;
-            if let Some(runtime) = session_config
-                .as_object_mut()
-                .and_then(|object| object.get_mut("runtime"))
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                runtime.remove("context_usage");
-            }
-            let session_config = serde_json::to_string(&session_config).map_err(|error| {
-                DbError::Conflict(format!(
-                    "ACP session config could not be serialized during transcript clear: {error}"
-                ))
-            })?;
-            sqlx::query(
-                "UPDATE acp_session \
-                 SET acp_session_id = NULL, session_status = 'idle', \
-                     session_config = ?, last_active_at = ? \
-                 WHERE conversation_id = ?",
-            )
-            .bind(session_config)
-            .bind(updated_at)
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        }
 
         clear_conversation_transcript_aggregate(
             &mut tx,
@@ -4164,10 +4063,6 @@ impl IConversationRepository for SqliteConversationRepository {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM acp_session WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query("DELETE FROM idmm_action_reservations WHERE conversation_id = ?")
             .bind(conversation_id)
             .execute(&mut *tx)
@@ -4401,7 +4296,7 @@ impl IConversationRepository for SqliteConversationRepository {
         let count_row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM messages \
                  WHERE conversation_id = ? \
-                   AND type NOT IN ('cron_trigger', 'skill_suggest')",
+                   AND type NOT IN ('cron_trigger', 'skill_suggest', 'turn_root')",
         )
         .bind(conversation_id)
         .fetch_one(&self.pool)
@@ -4411,7 +4306,7 @@ impl IConversationRepository for SqliteConversationRepository {
         let sql = format!(
             "SELECT * FROM messages \
              WHERE conversation_id = ? \
-               AND type NOT IN ('cron_trigger', 'skill_suggest') \
+               AND type NOT IN ('cron_trigger', 'skill_suggest', 'turn_root') \
              ORDER BY created_at {}, message_id {} \
              LIMIT ? OFFSET ?",
             order.as_sql(),
@@ -4452,7 +4347,7 @@ impl IConversationRepository for SqliteConversationRepository {
             sqlx::query_as::<_, MessageRow>(
                 "SELECT * FROM messages \
                  WHERE conversation_id = ? \
-                   AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                   AND type NOT IN ('cron_trigger', 'skill_suggest', 'turn_root') \
                    AND (created_at < ? OR (created_at = ? AND message_id < ?)) \
                  ORDER BY created_at DESC, message_id DESC \
                  LIMIT ?",
@@ -4468,7 +4363,7 @@ impl IConversationRepository for SqliteConversationRepository {
             sqlx::query_as::<_, MessageRow>(
                 "SELECT * FROM messages \
                  WHERE conversation_id = ? \
-                   AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                   AND type NOT IN ('cron_trigger', 'skill_suggest', 'turn_root') \
                  ORDER BY created_at DESC, message_id DESC \
                  LIMIT ?",
             )
@@ -5158,7 +5053,8 @@ impl IConversationRepository for SqliteConversationRepository {
         let count_row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM messages m \
              INNER JOIN conversations c ON m.conversation_id = c.conversation_id \
-             WHERE c.user_id = ? AND m.content LIKE ?",
+             WHERE c.user_id = ? AND m.content LIKE ? \
+               AND m.type <> 'turn_root'",
         )
         .bind(user_id)
         .bind(&like_pattern)
@@ -5191,6 +5087,7 @@ impl IConversationRepository for SqliteConversationRepository {
              FROM messages m \
              INNER JOIN conversations c ON m.conversation_id = c.conversation_id \
              WHERE c.user_id = ? AND m.content LIKE ? \
+               AND m.type <> 'turn_root' \
              ORDER BY m.created_at DESC \
              LIMIT ? OFFSET ?",
         )
@@ -5611,10 +5508,10 @@ mod tests {
     async fn insert_fixture_provider(pool: &SqlitePool, provider_id: &str) {
         sqlx::query(
             "INSERT INTO providers (\
-                provider_id, platform, name, base_url, api_key_encrypted, enabled, \
+                provider_id, platform, name, base_url, auth_scheme, credentials_encrypted, enabled, \
                 created_at, updated_at\
              ) VALUES (?, 'openai', ?, 'https://example.invalid', \
-                       'encrypted', 1, 0, 0)",
+                       'bearer', '', 1, 0, 0)",
         )
         .bind(provider_id)
         .bind(provider_id)
@@ -6352,15 +6249,6 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO acp_session \
-                (conversation_id, agent_backend, agent_source) \
-             VALUES (?, 'claude', 'custom')",
-        )
-        .bind(&conv.conversation_id)
-        .execute(db.pool())
-        .await
-        .unwrap();
 
         let deleted_cron_job_ids = repo
             .delete_with_cleanup(&conv.conversation_id)
@@ -6427,12 +6315,6 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        let acp_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM acp_session WHERE conversation_id = ?")
-                .bind(&conv.conversation_id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
 
         assert!(session_conversation.is_none());
         assert_eq!(deleted_cron_job_ids, vec![cron_job_id]);
@@ -6468,7 +6350,6 @@ mod tests {
         );
         assert_eq!(binding_count, 0);
         assert_eq!(binding_base_count, 0);
-        assert_eq!(acp_count, 0);
     }
 
     #[tokio::test]

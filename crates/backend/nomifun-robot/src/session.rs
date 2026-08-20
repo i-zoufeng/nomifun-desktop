@@ -719,7 +719,12 @@ pub async fn run_session(link: AcceptedLink, deps: SessionDeps) {
             };
             if transcript.trim().is_empty() {
                 // An empty round: hand the device straight back to listening
-                // without spending a model turn on noise.
+                // without spending a model turn on noise. This is the normal
+                // outcome for VAD-triggered noise, so it must stay quiet on the
+                // device — but log it, because a misconfigured ASR that always
+                // answers 200-with-no-text is indistinguishable from silence
+                // here and otherwise leaves no trace at all.
+                tracing::debug!(%robot_id, "robot: ASR returned an empty transcript");
                 writer
                     .send_json(&ServerMessage::TtsStart {
                         session_id: sid.clone(),
@@ -923,6 +928,30 @@ mod tests {
                 Frame::Binary(_) => None,
             })
             .collect()
+    }
+
+    /// Poll until a written frame satisfies `predicate`, or fail loudly.
+    ///
+    /// Preferred over sleeping a fixed duration: the wait then scales with how
+    /// busy the machine is instead of assuming a bound that a loaded CI box or a
+    /// parallel workspace run will exceed.
+    async fn await_frame(
+        frames: &Arc<Mutex<Vec<Frame>>>,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + LIMIT;
+        loop {
+            if let Some(found) = texts(frames).into_iter().find(&predicate) {
+                return found;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no frame matched within {LIMIT:?}; frames so far: {:?}",
+                texts(frames)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Encode `ms` of 16 kHz audio into 60 ms uplink packets, as the device
@@ -1173,8 +1202,14 @@ mod tests {
         send_audio(&tx, 300, true).await;
         send_audio(&tx, 900, false).await; // trailing silence ends the utterance
 
-        // Give the turn time to run, then close the link.
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // Wait for the turn's terminal frame rather than for a fixed duration.
+        // A wall-clock sleep raced the pipeline: under a saturated CPU (the full
+        // workspace test run) 600ms elapsed before `tts:stop` was written and
+        // the assertions below saw a half-finished turn.
+        await_frame(&written, |frame| {
+            frame["type"] == "tts" && frame["state"] == "stop"
+        })
+        .await;
         drop(tx);
         task.await.unwrap();
 
@@ -1247,7 +1282,9 @@ mod tests {
         .unwrap();
         send_audio(&tx, 300, true).await;
         send_audio(&tx, 900, false).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Wait for the reply's terminal frame, not a fixed duration: a
+        // wall-clock bound races the pipeline whenever the machine is busy.
+        await_frame(&written, |frame| frame["state"] == "stop").await;
         drop(tx);
         task.await.unwrap();
 

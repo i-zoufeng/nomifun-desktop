@@ -11,19 +11,17 @@ pub mod browser_fetcher;
 pub mod capability;
 pub mod cc_switch;
 pub mod factory;
-pub(crate) mod idle_scanner;
+pub mod image_generation;
 pub mod knowledge_completer;
 pub mod knowledge_retrieval;
 pub mod knowledge_writeback;
 pub mod manager;
 pub mod nomi_session_persistence;
 pub mod one_shot;
-pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
 pub mod routes;
 pub(crate) mod services;
-pub mod session;
 pub mod runtime_registry;
 pub mod terminal_title_completer;
 pub mod types;
@@ -53,9 +51,6 @@ pub use runtime_handle::MockAgentRuntime;
 pub use runtime_handle::{
     AgentRuntimeControl, AgentRuntimeHandle, SystemResourceNoticeDelivery,
 };
-pub use capability::skill_manager::{
-    AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, prepare_first_message_with_skills_index,
-};
 pub use factory::provider_config::{
     one_shot_completion, resolve_provider_config, streaming_completion,
     streaming_completion_text_or_reasoning, user_message, DeltaKind,
@@ -63,14 +58,13 @@ pub use factory::provider_config::{
 pub use one_shot::{OneShotDeps, OneShotTool, OneShotTurnRequest, one_shot_handler, run_one_shot_turn};
 pub use factory::{
     AgentFactoryDeps, CompanionPromptProvider, CompanionSummonProvider,
-    build_agent_factory,
+    build_agent_factory, build_agent_model_config_resolver,
 };
 #[cfg(feature = "browser-use")]
 pub use factory::browser_lane::{
     BrowserLaneBinding, BrowserLaneClientProvider, BrowserLaneClientProviderSlot,
     BrowserOwnerLeaseGuard, TrustedBrowserRuntimeContext,
 };
-pub use idle_scanner::start_idle_scanner;
 #[cfg(feature = "browser-use")]
 pub use browser_fetcher::BrowserFetcher;
 pub use knowledge_completer::LiveKnowledgeCompleter;
@@ -79,17 +73,15 @@ pub use knowledge_retrieval::LiveKnowledgeRetrievalSink;
 pub use knowledge_writeback::LiveKnowledgeWritebackSink;
 pub use nomi_session_persistence::{NomiSessionPersistence, NomiSessionResetOutcome};
 pub use terminal_title_completer::LiveTerminalTitleCompleter;
-pub use nomifun_api_types::{
-    AcpBuildExtra, AcpModelInfo, NomiBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra,
-    SlashCommandItem,
-};
-pub use persistence::AcpSessionSyncService;
+pub use nomifun_api_types::{NomiBuildExtra, SlashCommandItem};
 pub use protocol::events::{
-    AcpPermissionEventData, AcpPermissionOptionKind, AcpToolCallKind, AgentStreamEvent, FinishEventData, TurnStopReason,
+    AgentStreamEvent, FinishEventData, PermissionEventData, TurnStopReason,
 };
 pub use protocol::send_error::AgentSendError;
 pub use registry::{AgentRegistry, UnavailableReason};
-pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_agent_routes};
+pub use routes::{AgentRouterState, agent_routes};
 pub use services::AgentService;
-pub use services::RemoteAgentService;
-pub use runtime_registry::{AgentRuntimeRegistry, InMemoryAgentRuntimeRegistry};
+pub use runtime_registry::{
+    AgentRuntimeModelConfigResolver, AgentRuntimeRegistry, InMemoryAgentRuntimeRegistry,
+    RuntimeModelConfigBinding,
+};

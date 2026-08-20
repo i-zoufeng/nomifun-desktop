@@ -24,22 +24,6 @@ pub(crate) enum RunningOrphanDisposition {
     /// a fully-reaped durable process registry with no surviving entry for
     /// this Conversation.
     LocalContainedAuthority,
-    /// The backend's effect-bearing child process is durably registered at
-    /// spawn and unregistered only on proven tree exit.  Terminal proof =
-    /// verified boot reaping of every registry entry for this Conversation;
-    /// absence of entries is itself proof (the child never spawned, exited
-    /// with proof, or died under the same containment authorities as above).
-    RegisteredLocalProcessTree,
-    /// The backend registers a gateway process only when it self-spawned one;
-    /// external or port-attached gateways host work this process never owned,
-    /// so registry absence is ambiguous.  Terminal proof requires that entries
-    /// existed for this Conversation and every one was reaped with
-    /// exact-identity verification.
-    RegisteredGatewayAuthorityRequired,
-    /// Work may still be executing outside this application process or
-    /// machine.  A protocol-specific external terminal proof is required
-    /// before durable finalization; no local evidence source can supply it.
-    ExternalTerminalProofRequired,
 }
 
 pub(crate) fn running_orphan_disposition(
@@ -56,18 +40,6 @@ pub(crate) fn running_orphan_disposition(
         value if value == AgentType::Nomi.serde_name() => {
             RunningOrphanDisposition::LocalContainedAuthority
         }
-        value
-            if value == AgentType::Acp.serde_name()
-                || value == AgentType::Nanobot.serde_name() =>
-        {
-            RunningOrphanDisposition::RegisteredLocalProcessTree
-        }
-        value if value == AgentType::OpenclawGateway.serde_name() => {
-            RunningOrphanDisposition::RegisteredGatewayAuthorityRequired
-        }
-        value if value == AgentType::Remote.serde_name() => {
-            RunningOrphanDisposition::ExternalTerminalProofRequired
-        }
         unknown => {
             return Err(AppError::Conflict(format!(
                 "Conversation uses unknown Agent backend '{unknown}'; refusing to finalize an unproven running turn"
@@ -83,28 +55,10 @@ mod tests {
 
     #[test]
     fn every_current_backend_requires_proof_after_restart() {
-        for (backend, disposition) in [
-            (
-                AgentType::Nomi.serde_name(),
-                RunningOrphanDisposition::LocalContainedAuthority,
-            ),
-            (
-                AgentType::Acp.serde_name(),
-                RunningOrphanDisposition::RegisteredLocalProcessTree,
-            ),
-            (
-                AgentType::Nanobot.serde_name(),
-                RunningOrphanDisposition::RegisteredLocalProcessTree,
-            ),
-            (
-                AgentType::Remote.serde_name(),
-                RunningOrphanDisposition::ExternalTerminalProofRequired,
-            ),
-            (
-                AgentType::OpenclawGateway.serde_name(),
-                RunningOrphanDisposition::RegisteredGatewayAuthorityRequired,
-            ),
-        ] {
+        for (backend, disposition) in [(
+            AgentType::Nomi.serde_name(),
+            RunningOrphanDisposition::LocalContainedAuthority,
+        )] {
             assert_eq!(running_orphan_disposition(backend).unwrap(), disposition);
         }
     }

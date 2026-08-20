@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    AgentError, MAX_PROVIDER_TURN_TOOL_CALLS, SYSTEM_RESOURCE_CONTEXT_HEADER,
-    USER_IMAGE_HISTORY_PLACEHOLDER,
+    AgentError, MAX_PROVIDER_TURN_TOOL_CALLS, REQUEST_SCOPED_TOOL_AUTHORITY_HEADER,
+    REQUEST_SCOPED_TOOL_AUTHORITY_RULE, SYSTEM_RESOURCE_CONTEXT_HEADER, USER_IMAGE_HISTORY_PLACEHOLDER,
 };
 use nomi_protocol::events::ToolCategory;
 use nomi_providers::{LlmProvider, ProviderError};
@@ -542,6 +542,103 @@ struct ConstantErrorTool {
 
 struct DiagnosticImageErrorTool;
 
+struct SuccessfulImageTool;
+
+#[derive(Default)]
+struct DeliveredMediaOutput;
+
+#[derive(Default)]
+struct FailedMediaOutput;
+
+impl OutputSink for DeliveredMediaOutput {
+    fn emit_text_delta(&self, _: &str, _: &str) {}
+    fn emit_thinking(&self, _: &str, _: &str) {}
+    fn emit_tool_call(&self, _: &str, _: &str, _: &str) {}
+    fn emit_tool_result(&self, _: &str, _: &str, _: bool, _: &str) {}
+    fn emit_tool_result_with_images_and_artifact_identity(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: &str,
+        _: &[nomi_types::tool::ToolImage],
+    ) -> ToolMediaDelivery {
+        ToolMediaDelivery::Delivered {
+            context: "Verified artifact receipt: nomifun-artifacts/image.png".to_owned(),
+        }
+    }
+    fn emit_stream_start(&self, _: &str) {}
+    fn emit_stream_end(&self, _: &str, _: usize, _: u64, _: u64, _: u64, _: u64) {}
+    fn emit_error(&self, _: &str) {}
+    fn emit_info(&self, _: &str) {}
+}
+
+impl OutputSink for FailedMediaOutput {
+    fn emit_text_delta(&self, _: &str, _: &str) {}
+    fn emit_thinking(&self, _: &str, _: &str) {}
+    fn emit_tool_call(&self, _: &str, _: &str, _: &str) {}
+    fn emit_tool_result(&self, _: &str, _: &str, _: bool, _: &str) {}
+    fn emit_tool_result_with_images_and_artifact_identity(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: &str,
+        _: &[nomi_types::tool::ToolImage],
+    ) -> ToolMediaDelivery {
+        ToolMediaDelivery::Failed {
+            error: "durable image persistence failed".to_owned(),
+        }
+    }
+    fn emit_stream_start(&self, _: &str) {}
+    fn emit_stream_end(&self, _: &str, _: usize, _: u64, _: u64, _: u64, _: u64) {}
+    fn emit_error(&self, _: &str) {}
+    fn emit_info(&self, _: &str) {}
+}
+
+struct StrictImageThenStopProvider {
+    requests: Mutex<Vec<LlmRequest>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for StrictImageThenStopProvider {
+    async fn stream(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let turn = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        if turn == 0 {
+            tx.send(LlmEvent::ToolUse {
+                id: "image-call".to_owned(),
+                name: "image_gen".to_owned(),
+                input: serde_json::json!({"prompt": "fox"}),
+                extra: None,
+            })
+            .await
+            .unwrap();
+            tx.send(LlmEvent::Done {
+                stop_reason: nomi_types::message::StopReason::ToolUse,
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        } else {
+            tx.send(LlmEvent::Done {
+                stop_reason: nomi_types::message::StopReason::EndTurn,
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        }
+        Ok(rx)
+    }
+}
+
 struct RequiredKbIdTool {
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -711,6 +808,40 @@ impl Tool for DiagnosticImageErrorTool {
     }
 }
 
+#[async_trait::async_trait]
+impl Tool for SuccessfulImageTool {
+    fn name(&self) -> &str {
+        "image_gen"
+    }
+
+    fn description(&self) -> &str {
+        "test image generator"
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        false
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Exec
+    }
+
+    fn requires_explicit_route(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, _input: Value) -> ToolResult {
+        ToolResult::text("generated").with_images(vec![nomi_types::tool::ToolImage {
+            media_type: "image/png".to_owned(),
+            data: "aW1hZ2UtYnl0ZXM=".to_owned(),
+        }])
+    }
+}
+
 /// A real deferred catalog entry used to exercise ToolSearch through the
 /// complete AgentEngine dispatch path.
 struct DeferredProbeTool;
@@ -865,14 +996,16 @@ struct ToolThenStopProvider {
 struct NamedToolThenStopProvider {
     calls: std::sync::atomic::AtomicUsize,
     provider_name: String,
+    requests: Mutex<Vec<LlmRequest>>,
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for NamedToolThenStopProvider {
     async fn stream(
         &self,
-        _request: &LlmRequest,
+        request: &LlmRequest,
     ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.requests.lock().unwrap().push(request.clone());
         let turn = self
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -988,6 +1121,7 @@ fn make_engine(model: &str) -> super::AgentEngine {
         system_resource_inbox: None,
         process_supervisor: None,
         editable_turn: None,
+        host_context: Default::default(),
     }
 }
 
@@ -1259,11 +1393,21 @@ fn rewind_last_turn_truncates_to_marker() {
     // 既有历史：U0, A0
     engine.messages.push(Message::now(Role::User, vec![ContentBlock::Text { text: "u0".into() }]));
     engine.messages.push(Message::now(Role::Assistant, vec![ContentBlock::Text { text: "a0".into() }]));
+    let prior_host_context = std::collections::BTreeMap::from([(
+        "nomifun.image_generation.route".to_owned(),
+        "native".to_owned(),
+    )]);
+    engine.host_context = prior_host_context.clone();
     // 标记最后一个 turn 起始 = 当前长度(2)，再 push U1（被中断的 turn）
     engine.editable_turn = Some(EditableTurnCheckpoint {
         source_message_id: "message-u1".into(),
         start_len: engine.messages.len(),
+        prior_host_context: prior_host_context.clone(),
     });
+    engine.host_context.insert(
+        "nomifun.image_generation.route".to_owned(),
+        "explicit_external".to_owned(),
+    );
     engine.messages.push(Message::now(Role::User, vec![ContentBlock::Text { text: "u1".into() }]));
     assert_eq!(engine.messages.len(), 3);
 
@@ -1271,6 +1415,7 @@ fn rewind_last_turn_truncates_to_marker() {
     assert!(engine.rewind_last_turn("message-u1"));
     assert_eq!(engine.messages.len(), 2); // U1 被回退
     assert!(engine.editable_turn.is_none()); // 锚点被消费
+    assert_eq!(engine.host_context, prior_host_context);
 
     // 再次回退无锚点 → false
     assert!(!engine.rewind_last_turn("message-u1"));
@@ -1283,6 +1428,7 @@ fn rewind_last_turn_rejects_stale_marker() {
     engine.editable_turn = Some(EditableTurnCheckpoint {
         source_message_id: "message-stale".into(),
         start_len: 5,
+        prior_host_context: Default::default(),
     });
     assert!(!engine.rewind_last_turn("message-stale"));
 }
@@ -1329,6 +1475,7 @@ async fn continuation_passes_keep_the_root_user_checkpoint() {
         Some(EditableTurnCheckpoint {
             source_message_id: "message-root".into(),
             start_len: 0,
+            prior_host_context: Default::default(),
         })
     );
 
@@ -1364,10 +1511,128 @@ async fn continuation_passes_keep_the_root_user_checkpoint() {
         Some(EditableTurnCheckpoint {
             source_message_id: "message-next".into(),
             start_len: next_root_start,
+            prior_host_context: Default::default(),
         })
     );
     assert!(!engine.can_rewind_last_turn("message-root"));
     assert!(engine.can_rewind_last_turn("message-next"));
+}
+
+#[tokio::test]
+async fn turn_tool_allowlist_is_exact_and_does_not_leak_to_the_next_turn() {
+    let provider = Arc::new(RecordingProvider::successful());
+    let mut engine = make_engine("turn-tool-route");
+    engine.provider = provider.clone();
+    assert!(engine.tools.register(Box::new(SuccessfulImageTool)));
+    assert!(engine.tools.register(Box::new(ConstantResultTool {
+        name: "browser",
+        polling: false,
+        category: ToolCategory::Exec,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        steer_on_call: None,
+    })));
+
+    let image_only = std::collections::HashSet::from(["image_gen".to_owned()]);
+    engine
+        .execute_turn_with_content_for_source_and_tool_allowlist(
+            vec![ContentBlock::Text {
+                text: "generate an image".into(),
+            }],
+            "wire-image",
+            "message-image",
+            Some(&image_only),
+        )
+        .await
+        .unwrap();
+    engine
+        .execute_turn_with_content_for_source(
+            vec![ContentBlock::Text {
+                text: "open a website".into(),
+            }],
+            "wire-normal",
+            "message-normal",
+        )
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    let first_names = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(first_names, vec!["image_gen"]);
+    let second_names = requests[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(second_names, std::collections::HashSet::from(["browser"]));
+}
+
+#[tokio::test]
+async fn strict_route_prefixes_authority_over_hidden_knowledge_tool_promises() {
+    let provider = Arc::new(RecordingProvider::successful());
+    let mut engine = make_engine("strict-tool-authority");
+    engine.provider = provider.clone();
+    engine.system_prompt = "## Knowledge bases (extended knowledge source)\nCall the `knowledge_search` tool BEFORE answering, then call `knowledge_read`.".to_owned();
+    assert!(engine.tools.register(Box::new(SuccessfulImageTool)));
+    let image_only = std::collections::HashSet::from(["image_gen".to_owned()]);
+
+    engine
+        .execute_turn_with_content_for_source_and_tool_allowlist(
+            vec![ContentBlock::Text {
+                text: "generate an image".into(),
+            }],
+            "wire-strict-authority",
+            "message-strict-authority",
+            Some(&image_only),
+        )
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["image_gen"]
+    );
+    assert!(requests[0].system.starts_with(REQUEST_SCOPED_TOOL_AUTHORITY_HEADER));
+    assert!(requests[0].system.contains(REQUEST_SCOPED_TOOL_AUTHORITY_RULE));
+    assert!(
+        requests[0]
+            .system
+            .contains("Declared tools for this request: `image_gen`")
+    );
+    assert!(
+        requests[0].system.contains("knowledge_search"),
+        "the authority rule must override hidden promises without brittle prompt-string removal"
+    );
+}
+
+#[test]
+fn deterministic_host_turn_is_persisted_with_a_rewind_checkpoint() {
+    let mut engine = make_engine("host-turn");
+    engine
+        .record_host_text_turn("generate a fox", "configure an image model", "message-host")
+        .unwrap();
+
+    assert_eq!(engine.messages.len(), 2);
+    assert_eq!(engine.messages[0].role, Role::User);
+    assert_eq!(engine.messages[1].role, Role::Assistant);
+    assert_eq!(
+        engine.editable_turn,
+        Some(EditableTurnCheckpoint {
+            source_message_id: "message-host".into(),
+            start_len: 0,
+            prior_host_context: Default::default(),
+        })
+    );
+    assert!(engine.can_rewind_last_turn("message-host"));
 }
 
 fn make_engine_with_compat(
@@ -2163,6 +2428,92 @@ async fn failed_tool_diagnostic_images_are_not_replayed_to_the_provider() {
 }
 
 #[tokio::test]
+async fn delivered_image_bytes_are_replaced_by_receipt_context_without_a_redundant_model_pass() {
+    let mut engine = make_engine("delivered-image");
+    let provider = Arc::new(StrictImageThenStopProvider {
+        requests: Mutex::new(Vec::new()),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    engine.provider = provider.clone();
+    engine.output = Arc::new(DeliveredMediaOutput);
+    engine.tools.register(Box::new(SuccessfulImageTool));
+    let allowlist = std::collections::HashSet::from(["image_gen".to_owned()]);
+
+    engine
+        .execute_turn_with_content_for_source_and_tool_allowlist(
+            vec![ContentBlock::Text {
+                text: "generate a fox".to_owned(),
+            }],
+            "m-delivered-image",
+            "root-delivered-image",
+            Some(&allowlist),
+        )
+        .await
+        .expect("verified image delivery should return directly to the host commit gate");
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a paid artifact result must not depend on a redundant text-only provider pass"
+    );
+    assert_eq!(requests[0].tools.len(), 1);
+    drop(requests);
+
+    let ContentBlock::ToolResult {
+        content, images, ..
+    } = &engine.messages[2].content[0]
+    else {
+        panic!("session history should retain the compact tool result");
+    };
+    assert!(content.contains("Verified artifact receipt"));
+    assert!(images.is_empty(), "base64 image bytes must never persist in session history");
+}
+
+#[tokio::test]
+async fn strict_image_delivery_failure_stops_before_an_empty_tool_provider_pass() {
+    let mut engine = make_engine("failed-image-delivery");
+    let provider = Arc::new(StrictImageThenStopProvider {
+        requests: Mutex::new(Vec::new()),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    engine.provider = provider.clone();
+    engine.output = Arc::new(FailedMediaOutput);
+    engine.tools.register(Box::new(SuccessfulImageTool));
+    let allowlist = std::collections::HashSet::from(["image_gen".to_owned()]);
+
+    engine
+        .execute_turn_with_content_for_source_and_tool_allowlist(
+            vec![ContentBlock::Text {
+                text: "generate a fox".to_owned(),
+            }],
+            "m-failed-image-delivery",
+            "root-failed-image-delivery",
+            Some(&allowlist),
+        )
+        .await
+        .expect("the engine phase must return control to the host receipt gate");
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "artifact failure must not trigger a prose pass with tools=[]"
+    );
+    assert_eq!(requests[0].tools.len(), 1);
+    drop(requests);
+
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = &engine.messages[2].content[0]
+    else {
+        panic!("session history should retain the failed tool result");
+    };
+    assert!(*is_error);
+    assert!(content.contains("Artifact delivery failed"));
+}
+
+#[tokio::test]
 async fn bounded_mcp_alias_uses_untruncated_export_identity_and_rejects_text_only_success() {
     for semantic_tool in ["export_pdf", "render_video"] {
         // This is the shape of a 64-byte MCP provider alias after a long
@@ -2176,10 +2527,12 @@ async fn bounded_mcp_alias_uses_untruncated_export_identity_and_rejects_text_onl
         );
         let output = Arc::new(ArtifactIdentityOutput::default());
         let mut engine = make_engine("mcp-artifact-identity");
-        engine.provider = Arc::new(NamedToolThenStopProvider {
+        let provider = Arc::new(NamedToolThenStopProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
             provider_name: provider_name.clone(),
+            requests: Mutex::new(Vec::new()),
         });
+        engine.provider = provider.clone();
         engine.output = output.clone();
         engine.tools.register(Box::new(ArtifactIdentityTool {
             provider_name,
@@ -2211,6 +2564,13 @@ async fn bounded_mcp_alias_uses_untruncated_export_identity_and_rejects_text_onl
         assert!(*is_error, "text-only {semantic_tool} must not remain successful");
         assert!(images.is_empty());
         assert!(content.contains("Artifact delivery failed"));
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tools.len(), 1);
+        assert!(
+            requests[1].tools.is_empty(),
+            "the handled contract failure must close artifact execution authority for the accepted turn"
+        );
     }
 }
 
@@ -2455,4 +2815,116 @@ fn set_config_effort_clear_always_works() {
     let changes = engine.apply_config_update(None, None, None, Some(String::new()), None);
     assert!(engine.current_reasoning_effort.is_none());
     assert!(changes.iter().any(|c| c.contains("cleared")));
+}
+
+/// Emits one round of "large text draft + a Write of that same draft", then ends.
+struct DraftThenWriteProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    draft: String,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for DraftThenWriteProvider {
+    async fn stream(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        if n == 0 {
+            let _ = tx.send(LlmEvent::TextDelta(self.draft.clone())).await;
+            let _ = tx
+                .send(LlmEvent::ToolUse {
+                    id: "w1".to_string(),
+                    name: "Write".to_string(),
+                    input: serde_json::json!({
+                        "file_path": "tests/cli.test.ts",
+                        "content": self.draft.clone(),
+                    }),
+                    extra: None,
+                })
+                .await;
+            let _ = tx
+                .send(LlmEvent::Done {
+                    stop_reason: nomi_types::message::StopReason::ToolUse,
+                    usage: Default::default(),
+                })
+                .await;
+        } else {
+            let _ = tx
+                .send(LlmEvent::Done {
+                    stop_reason: nomi_types::message::StopReason::EndTurn,
+                    usage: Default::default(),
+                })
+                .await;
+        }
+        Ok(rx)
+    }
+}
+
+#[tokio::test]
+async fn a_draft_written_in_the_same_round_does_not_stay_in_engine_history() {
+    // Durable history is what gets re-sent to the provider on every later turn,
+    // so a 5 KB draft the round already wrote to disk must not survive there:
+    // in the reported session it would have been replayed across 54 turns.
+    // Lives here rather than in superseded_draft_tests.rs to reuse make_engine
+    // and ConstantResultTool; that module covers the classification rules, this
+    // one proves the engine loop actually applies them.
+    let mut draft = String::new();
+    for i in 0..30 {
+        draft.push_str(&format!(
+            "it(\"contract clause {i} is honored by the CLI\", () => {{\n  \
+             expect(runCli([\"list\"]).exitCode).toBe(0);\n}});\n"
+        ));
+    }
+    let mut engine = make_engine("draft-write");
+    engine.provider = Arc::new(DraftThenWriteProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        draft: draft.clone(),
+    });
+    engine.tools.register(Box::new(ConstantResultTool {
+        name: "Write",
+        polling: false,
+        category: ToolCategory::Exec,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        steer_on_call: None,
+    }));
+
+    let result = engine
+        .execute_turn("write the tests", "m-draft")
+        .await
+        .expect("engine.execute_turn ok");
+
+    let assistant = engine
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("the tool round is in history");
+    let text = assistant
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("the text block is kept in place");
+    assert!(
+        !text.contains("is honored by the CLI"),
+        "the written draft lines must not remain in history: {text}"
+    );
+    assert!(
+        text.contains("tests/cli.test.ts"),
+        "the marker names the file that superseded it: {text}"
+    );
+    assert!(
+        !result.text.contains("[Draft omitted"),
+        "the value returned to the caller keeps the model's own words"
+    );
+    assert!(
+        assistant
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "Write")),
+        "the Write call still carries the real body"
+    );
 }

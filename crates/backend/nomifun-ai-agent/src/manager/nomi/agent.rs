@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +24,10 @@ use nomi_protocol::commands::SessionMode;
 use nomi_protocol::events::ToolCategory;
 use nomi_protocol::{ToolApprovalManager, ToolApprovalResult};
 use nomi_types::message::ContentBlock;
-use nomifun_api_types::{AgentModeResponse, SlashCommandItem};
+use nomifun_api_types::{
+    AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind,
+    AgentErrorResolutionTarget, AgentModeResponse, SlashCommandItem,
+};
 use nomifun_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
 };
@@ -33,8 +37,15 @@ use tracing::{debug, error, info};
 
 use crate::runtime_state::AgentRuntimeState;
 use crate::runtime_handle::SystemResourceNoticeDelivery;
-use crate::capability::backend_output_sink::BackendOutputSink;
+use crate::capability::backend_output_sink::{
+    AsyncArtifactDeliveryOutcome, BackendOutputSink,
+};
 use crate::capability::backend_protocol_sink::BackendProtocolSink;
+use crate::image_generation::{
+    IMAGE_GEN_TOOL_NAME, ImageGenerationIntent, ImageGenerationToolDiscovery,
+    classify_image_generation_intent, classify_image_generation_intent_with_model,
+    explicitly_requests_external_image_execution, image_intent_attachment_summary,
+};
 use crate::protocol::events::{AgentStreamEvent, TurnCompletedEventData, TurnStopReason};
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{NomiResolvedConfig, SendMessageData};
@@ -55,6 +66,13 @@ struct TurnTeardownFence {
     changed: Notify,
 }
 
+/// A successor is never allowed to wait forever on cleanup owned by a prior
+/// unwound turn. Exact teardown still owns the underlying resources, but this
+/// bound turns a stuck fence into a structured broken-runtime failure so the
+/// registry can quarantine/replace the manager instead of reusing it.
+const TURN_TEARDOWN_FENCE_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(7);
+
 impl TurnTeardownFence {
     fn new() -> Self {
         Self {
@@ -72,14 +90,18 @@ impl TurnTeardownFence {
         self.changed.notify_waiters();
     }
 
-    async fn wait_until_clear(&self) {
-        loop {
-            let changed = self.changed.notified();
-            if !self.pending.load(Ordering::Acquire) {
-                return;
+    async fn wait_until_clear(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.changed.notified();
+                if !self.pending.load(Ordering::Acquire) {
+                    return;
+                }
+                changed.await;
             }
-            changed.await;
-        }
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -167,7 +189,7 @@ pub struct NomiAgentManager {
     /// One-shot knowledge reminder prepended to the FIRST user turn of a session
     /// that has bound bases — keeps the retrieval protocol adjacent to the task
     /// (the system-prompt section alone is too far from the user message to
-    /// reliably fire). Mirrors the ACP `KnowledgeContextHook`. `None` once
+    /// reliably fire). `None` once
     /// consumed or when no bases are mounted.
     knowledge_prelude: std::sync::Mutex<Option<String>>,
     /// When set, each user message is augmented with auto-retrieved KB hits
@@ -176,6 +198,12 @@ pub struct NomiAgentManager {
         Arc<dyn nomi_agent::knowledge_tools::KnowledgeRetrievalSink>,
         Vec<nomifun_common::KnowledgeBaseId>,
     )>,
+    /// Refreshed from the authoritative local catalog before every admitted
+    /// turn. The engine registry is changed under its mutex before this state is
+    /// published, so route readiness and tool presence cannot disagree.
+    image_generation_availability: std::sync::RwLock<ImageGenerationAvailability>,
+    image_generation_discovery: Option<Arc<dyn ImageGenerationToolDiscovery>>,
+    image_generation_response_in_chinese: bool,
 }
 
 impl Drop for NomiAgentManager {
@@ -221,6 +249,430 @@ pub(crate) const KNOWLEDGE_WRITE_TOOL_NAME: &str = "knowledge_write";
 /// pushes during every pass. Any leftover after the cap is absorbed by this
 /// turn's terminal transition; steering is never transferred to another turn.
 const MAX_STEERING_RACE_TAIL_RERUNS: usize = 3;
+
+const IMAGE_MODEL_MANAGEMENT_LINK: &str = "nomifun://model-management/image";
+const IMAGE_ROUTE_CONTEXT_KEY: &str = "nomifun.image_generation.route";
+const IMAGE_ROUTE_NATIVE: &str = "native";
+const IMAGE_ROUTE_EXTERNAL: &str = "explicit_external";
+/// Browser screenshots and arbitrary website downloads are context, not a
+/// durable generated-image artifact. Keep external execution closed until a
+/// bridge can persist, verify, and commit those bytes through the same receipt
+/// protocol as the native image tool.
+const EXTERNAL_IMAGE_ARTIFACT_BRIDGE_AVAILABLE: bool = false;
+
+fn image_route_from_context(value: Option<&str>) -> Option<ImageGenerationIntent> {
+    match value {
+        Some(IMAGE_ROUTE_NATIVE) => Some(ImageGenerationIntent::Creation),
+        Some(IMAGE_ROUTE_EXTERNAL) => Some(ImageGenerationIntent::ExplicitExternal),
+        _ => None,
+    }
+}
+
+fn image_route_context_value(intent: ImageGenerationIntent) -> Option<&'static str> {
+    match intent {
+        ImageGenerationIntent::Creation => Some(IMAGE_ROUTE_NATIVE),
+        ImageGenerationIntent::ExplicitExternal => Some(IMAGE_ROUTE_EXTERNAL),
+        ImageGenerationIntent::Discussion | ImageGenerationIntent::None => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageGenerationAvailability {
+    Ready,
+    NoConfiguredModel,
+    DiscoveryFailed,
+    NotEntitled,
+}
+
+fn image_generation_unavailable_message(
+    availability: ImageGenerationAvailability,
+    respond_in_chinese: bool,
+) -> String {
+    match (availability, respond_in_chinese) {
+        (ImageGenerationAvailability::NoConfiguredModel, true) => format!(
+            "尚未配置可用的生图模型。请先前往[模型管理 · 图片模型]({IMAGE_MODEL_MANAGEMENT_LINK})，启用并完整配置一个支持图片生成的模型。此次没有生成图片，也没有调用浏览器或第三方生图网站。"
+        ),
+        (ImageGenerationAvailability::NoConfiguredModel, false) => format!(
+            "No usable image-generation model is configured. Open [Model Management · Image models]({IMAGE_MODEL_MANAGEMENT_LINK}) and enable a fully configured image-generation model. No image was generated, and no browser or third-party image site was used."
+        ),
+        (ImageGenerationAvailability::DiscoveryFailed, true) =>
+            "暂时无法核验本地生图模型配置。请刷新 Agent 会话后重试；此次没有生成图片，也没有调用浏览器或第三方生图网站。".to_owned(),
+        (ImageGenerationAvailability::DiscoveryFailed, false) =>
+            "The local image-model configuration could not be verified. Retry on the next turn; this capability refreshes automatically. No image was generated, and no browser or third-party image site was used.".to_owned(),
+        (ImageGenerationAvailability::NotEntitled, true) =>
+            "当前受限 Agent 会话没有生图权限。请在完整的本地会话中重试，或由会话所有者开放原生生图能力。此次没有生成图片，也没有调用浏览器或第三方生图网站。".to_owned(),
+        (ImageGenerationAvailability::NotEntitled, false) =>
+            "Image generation is not permitted in this restricted Agent session. Retry in a full local session or ask the session owner to enable the native capability. No image was generated, and no browser or third-party image site was used.".to_owned(),
+        (ImageGenerationAvailability::Ready, _) =>
+            "Image generation is available.".to_owned(),
+    }
+}
+
+fn external_image_generation_unavailable_message(
+    availability: ImageGenerationAvailability,
+    respond_in_chinese: bool,
+) -> String {
+    let bridge_message = if respond_in_chinese {
+        "当前版本尚未提供可将浏览器或第三方网站生成结果持久化并核验为图片制品的通道，因此此次没有打开浏览器，也没有开始外部生图。"
+    } else {
+        "This version cannot yet persist and verify an image generated by a browser or third-party website, so no browser was opened and no external image generation was started."
+    };
+    if availability == ImageGenerationAvailability::Ready {
+        return if respond_in_chinese {
+            format!("{bridge_message}请改为直接要求使用已配置的原生生图模型。")
+        } else {
+            format!(
+                "{bridge_message} Ask to use the configured native image model instead."
+            )
+        };
+    }
+    format!(
+        "{bridge_message} {}",
+        image_generation_unavailable_message(availability, respond_in_chinese)
+    )
+}
+
+fn ambiguous_visual_clarification_message(
+    availability: ImageGenerationAvailability,
+    respond_in_chinese: bool,
+) -> String {
+    let clarification = if respond_in_chinese {
+        "我无法可靠判断你是否希望现在生成一张新图片。请明确说明“生成/绘制一张图片”及画面要求。"
+    } else {
+        "I could not reliably determine whether you want a new image now. Please explicitly ask to generate or draw an image and include the visual requirements."
+    };
+    if availability == ImageGenerationAvailability::Ready {
+        return if respond_in_chinese {
+            format!(
+                "{clarification}此次没有生成图片，也没有调用浏览器或第三方生图网站。"
+            )
+        } else {
+            format!(
+                "{clarification} No image was generated, and no browser or third-party image site was used."
+            )
+        };
+    }
+    format!(
+        "{clarification} {}",
+        image_generation_unavailable_message(availability, respond_in_chinese)
+    )
+}
+
+/// Context-only edits such as "make it 16:9" are image requests only when the
+/// immediately preceding accepted turn was itself image generation. Keeping
+/// this state in the serialized manager turn lane avoids both Browser escape
+/// on real follow-ups and false positives such as a standalone "one more".
+fn contextual_image_generation_followup(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    const HINTS: &[&str] = &[
+        "再来一张",
+        "再来一个",
+        "再来个",
+        "换成",
+        "改成",
+        "按刚才",
+        "同样风格",
+        "相同风格",
+        "重新做",
+        "重做",
+        "竖版",
+        "横版",
+        "another one",
+        "one more",
+        "make it",
+        "change it",
+        "same style",
+        "redo it",
+        "portrait version",
+        "landscape version",
+    ];
+    HINTS.iter().any(|hint| normalized.contains(hint))
+}
+
+fn is_context_only_image_followup(input: &str) -> bool {
+    if !contextual_image_generation_followup(input) {
+        return false;
+    }
+    const EXPLICIT_TERMS: &[&str] = &[
+        "生成", "创建", "创作", "绘制", "图片", "图像", "插画", "海报", "照片", "头像",
+        "壁纸", "封面", "图标", "漫画", "generate", "create", "draw", "render", "image",
+        "picture", "photo", "poster", "illustration", "wallpaper", "avatar", "artwork", "logo",
+    ];
+    let normalized = input.to_lowercase();
+    !EXPLICIT_TERMS.iter().any(|term| normalized.contains(term))
+}
+
+fn image_followup_route(
+    direct: ImageGenerationIntent,
+    input: &str,
+    prior: Option<ImageGenerationIntent>,
+) -> Option<ImageGenerationIntent> {
+    if direct == ImageGenerationIntent::Creation && is_context_only_image_followup(input) {
+        return prior;
+    }
+    if direct == ImageGenerationIntent::None && contextual_image_generation_followup(input) {
+        return prior;
+    }
+    None
+}
+
+/// The model may recognize creation intent, but it can never grant Browser
+/// authority. External execution requires an independent affirmative host
+/// check over the current user text; otherwise the safe interpretation is the
+/// native image route.
+fn host_validated_image_intent(
+    classified: ImageGenerationIntent,
+    direct: ImageGenerationIntent,
+    input: &str,
+    prior: Option<ImageGenerationIntent>,
+    plan_mode_active: bool,
+) -> ImageGenerationIntent {
+    if plan_mode_active {
+        return ImageGenerationIntent::None;
+    }
+    if is_code_native_visual_request(input) {
+        // Canvas, SVG, Mermaid, UI icons, and chart/diagram source are coding
+        // outputs. A semantic classifier may not upgrade them into a billable
+        // raster-image operation merely because the request contains 图/画 or
+        // an English visual noun.
+        return ImageGenerationIntent::None;
+    }
+    if direct == ImageGenerationIntent::None && explicitly_requests_visual_discussion(input) {
+        // The semantic pass may recognize long-tail creation wording, but it
+        // may not upgrade an explicit host-recognized explanation, analysis,
+        // comparison, or inspection request into a billable image operation.
+        return ImageGenerationIntent::None;
+    }
+    if let Some(route) = image_followup_route(direct, input, prior) {
+        return route;
+    }
+    match classified {
+        ImageGenerationIntent::ExplicitExternal
+            if direct == ImageGenerationIntent::ExplicitExternal
+                || explicitly_requests_external_image_execution(input) =>
+        {
+            ImageGenerationIntent::ExplicitExternal
+        }
+        ImageGenerationIntent::ExplicitExternal => ImageGenerationIntent::Creation,
+        ImageGenerationIntent::Creation => ImageGenerationIntent::Creation,
+        ImageGenerationIntent::Discussion | ImageGenerationIntent::None => {
+            ImageGenerationIntent::None
+        }
+    }
+}
+
+fn contains_ascii_word(input: &str, candidates: &[&str]) -> bool {
+    input
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .any(|word| candidates.contains(&word))
+}
+
+/// Code-native visuals belong to the coding agent. Requiring both a coding
+/// output signal and a visual/source signal avoids treating ordinary prose
+/// containing a single 图 or 画 as image-generation intent.
+fn is_code_native_visual_request(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    const CN_CODE_OUTPUTS: &[&str] = &[
+        "代码",
+        "源码",
+        "组件",
+        "编程",
+        "编码",
+        "开发",
+        "实现",
+        "重构",
+        "修复",
+        "合并需求",
+        "项目助手",
+    ];
+    const CN_CODE_VISUALS: &[&str] = &[
+        "画布", "图表", "流程图", "架构图", "时序图", "关系图", "图标", "界面", "图形",
+        "可视化", "svg", "mermaid", "canvas", "ui",
+    ];
+    if CN_CODE_OUTPUTS
+        .iter()
+        .any(|signal| normalized.contains(signal))
+        && CN_CODE_VISUALS
+            .iter()
+            .any(|signal| normalized.contains(signal))
+    {
+        return true;
+    }
+
+    const EN_CODE_OUTPUTS: &[&str] = &[
+        "code",
+        "coding",
+        "source",
+        "component",
+        "components",
+        "program",
+        "programming",
+        "implement",
+        "implementation",
+        "refactor",
+        "debug",
+        "fix",
+        "module",
+        "function",
+        "class",
+        "typescript",
+        "javascript",
+        "react",
+        "vue",
+        "html",
+        "css",
+    ];
+    const EN_CODE_VISUALS: &[&str] = &[
+        "canvas",
+        "chart",
+        "charts",
+        "diagram",
+        "diagrams",
+        "flowchart",
+        "flowcharts",
+        "icon",
+        "icons",
+        "image",
+        "images",
+        "graphic",
+        "graphics",
+        "visual",
+        "visuals",
+        "ui",
+        "svg",
+        "mermaid",
+    ];
+    contains_ascii_word(&normalized, EN_CODE_OUTPUTS)
+        && contains_ascii_word(&normalized, EN_CODE_VISUALS)
+}
+
+fn has_ambiguous_visual_signal(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    if normalized.is_empty() || is_code_native_visual_request(&normalized) {
+        return false;
+    }
+    const CN_ACTIONS: &[&str] = &[
+        "生成", "创建", "创作", "绘制", "设计", "制作", "做一张", "来一张", "给我", "弄一张",
+        "出一张", "画一张", "画个", "重绘", "渲染", "惊喜",
+    ];
+    const CN_VISUAL_OBJECTS: &[&str] = &[
+        "图片", "图像", "视觉", "美术", "艺术", "配图", "海报", "封面", "头像", "壁纸", "插画",
+        "照片", "图标", "徽标", "画面", "画作", "图稿", "漫画", "概念图", "效果图",
+    ];
+    if CN_ACTIONS
+        .iter()
+        .any(|action| normalized.contains(action))
+        && CN_VISUAL_OBJECTS
+            .iter()
+            .any(|object| normalized.contains(object))
+    {
+        return true;
+    }
+    const EN_ACTIONS: &[&str] = &[
+        "give", "show", "surprise", "make", "create", "generate", "draw", "render", "design",
+        "produce", "paint", "want", "need",
+    ];
+    const EN_VISUAL_OBJECTS: &[&str] = &[
+        "image", "images", "picture", "pictures", "visual", "visuals", "visually", "art",
+        "artwork", "artworks", "graphic", "graphics", "illustration", "illustrations", "photo",
+        "photos", "poster", "posters", "banner", "banners", "logo", "logos", "icon", "icons",
+        "wallpaper", "wallpapers", "avatar", "avatars", "render", "rendering", "draw", "drawing",
+        "paint", "painting", "sketch", "sketches", "thumbnail", "thumbnails", "sprite", "sprites",
+    ];
+    contains_ascii_word(&normalized, EN_ACTIONS)
+        && contains_ascii_word(&normalized, EN_VISUAL_OBJECTS)
+}
+
+fn attachment_suggests_visual_creation(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    if is_code_native_visual_request(&normalized) {
+        return false;
+    }
+    const CN_ACTIONS: &[&str] = &[
+        "生成", "画", "绘", "做", "重做", "改成", "换成", "变成", "风格化", "修图", "重绘",
+        "去背景", "换背景",
+    ];
+    if CN_ACTIONS.iter().any(|action| normalized.contains(action)) {
+        return true;
+    }
+    const EN_ACTIONS: &[&str] = &[
+        "make", "create", "generate", "draw", "render", "edit", "transform", "convert",
+        "stylize", "restyle", "redo", "change", "remove", "replace", "add",
+    ];
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .any(|word| EN_ACTIONS.contains(&word))
+}
+
+fn explicitly_requests_visual_discussion(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    const CN_DISCUSSION: &[&str] = &[
+        "解释", "说明", "讨论", "分析", "比较", "对比", "描述", "评价", "点评", "审查", "为什么",
+        "如何", "怎么", "什么是", "识别", "读取", "提取",
+    ];
+    if CN_DISCUSSION
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        return true;
+    }
+    const EN_DISCUSSION_PHRASES: &[&str] = &[
+        "tell me about",
+        "tell me what",
+        "what is",
+        "what's",
+        "why is",
+        "how does",
+        "how do",
+    ];
+    if EN_DISCUSSION_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        return true;
+    }
+    const EN_DISCUSSION_WORDS: &[&str] = &[
+        "discuss", "explain", "analyze", "analyse", "compare", "describe", "review", "critique",
+        "inspect", "identify", "read", "extract",
+    ];
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .any(|word| EN_DISCUSSION_WORDS.contains(&word))
+}
+
+fn should_run_image_intent_model(
+    direct: ImageGenerationIntent,
+    prior: Option<ImageGenerationIntent>,
+    input: &str,
+    has_attachments: bool,
+    plan_mode_active: bool,
+) -> bool {
+    !plan_mode_active
+        && !is_code_native_visual_request(input)
+        && direct == ImageGenerationIntent::None
+        && image_followup_route(direct, input, prior).is_none()
+        // The broad signal only decides whether to spend a small semantic
+        // classification call; it never decides the route. This keeps clearly
+        // unrelated chat single-call while creation wording outside the strict
+        // host shortcuts (including when no image model is configured) still
+        // reaches the typed conversation-model decision.
+        && (has_ambiguous_visual_signal(input)
+            || (has_attachments && attachment_suggests_visual_creation(input)))
+}
+
+fn route_allows_knowledge_context(tool_allowlist: Option<&HashSet<String>>) -> bool {
+    tool_allowlist.is_none_or(|allowed| allowed.contains("knowledge_search"))
+}
 
 /// Atomically close one exact manager turn and absorb every steering entry
 /// that was admitted for it.
@@ -343,6 +795,21 @@ pub(crate) struct NomiHostWiring {
     /// engine) so teardown has something to report on: a runtime that dropped its
     /// lease could never say whether the operator's shell survived it.
     pub ssh_lease: Option<Arc<dyn crate::SshSessionLease>>,
+    /// Native image generation is a trusted process capability assembled from
+    /// the live model catalog. `None` means no enabled, fully configured image
+    /// model exists, so the provider must never see an `image_gen` schema.
+    pub image_generation_tool: Option<Box<dyn nomi_tools::Tool>>,
+    /// Retained local discovery authority. Entitled runtimes use it before
+    /// every turn so catalog/default/connection edits do not require teardown.
+    pub image_generation_discovery: Option<Arc<dyn ImageGenerationToolDiscovery>>,
+    /// Whether this process-owned principal may receive the native capability.
+    /// Kept separate from tool presence so a restricted session never lies
+    /// that the installation has no configured model.
+    pub image_generation_entitled: bool,
+    /// Catalog/repository failures are not equivalent to an empty catalog.
+    pub image_generation_discovery_failed: bool,
+    /// The app's normalized UI language captured on this runtime build.
+    pub image_generation_response_in_chinese: bool,
 }
 
 impl Default for NomiHostWiring {
@@ -352,6 +819,11 @@ impl Default for NomiHostWiring {
             browser_lane_binding: None,
             ssh_backend: None,
             ssh_lease: None,
+            image_generation_tool: None,
+            image_generation_discovery: None,
+            image_generation_entitled: true,
+            image_generation_discovery_failed: false,
+            image_generation_response_in_chinese: false,
         }
     }
 }
@@ -428,6 +900,20 @@ impl NomiAgentManager {
         #[cfg(feature = "browser-use")]
         let browser_lane_binding = host_wiring.browser_lane_binding;
         let ssh_lease = host_wiring.ssh_lease;
+        let image_generation_entitled = host_wiring.image_generation_entitled;
+        let image_generation_discovery = host_wiring.image_generation_discovery;
+        let image_generation_tool = host_wiring.image_generation_tool;
+        let image_generation_availability = if image_generation_tool.is_some() {
+            ImageGenerationAvailability::Ready
+        } else if host_wiring.image_generation_discovery_failed {
+            ImageGenerationAvailability::DiscoveryFailed
+        } else if host_wiring.image_generation_entitled {
+            ImageGenerationAvailability::NoConfiguredModel
+        } else {
+            ImageGenerationAvailability::NotEntitled
+        };
+        let image_generation_response_in_chinese =
+            host_wiring.image_generation_response_in_chinese;
         let image_read_root = config_extra
             .write_root
             .as_deref()
@@ -484,6 +970,7 @@ impl NomiAgentManager {
         if let Some(required) = config_extra.compat_overrides.require_reasoning_content {
             config.compat.require_reasoning_content = Some(required);
         }
+        config.compat.extra_body = config_extra.compat_overrides.extra_body;
         // 图片支持 override(主动剔除):工厂据 VisionUnsupportedRegistry 命中注入
         // Some(false),灌进 compat.supports_image → build_messages 发送时剔图。
         // None → 保持 Config::resolve 的默认(supports_image()==true),行为不变。
@@ -568,6 +1055,21 @@ impl NomiAgentManager {
             config.tools.allow_list.push("companion_skill".to_owned());
         }
 
+        // Read-only knowledge tools must bypass the approval lane whenever the
+        // same sink/base truth permits their later registration. Do this before
+        // bootstrap so the engine policy and the advertised prompt cannot drift.
+        let register_knowledge_search = should_register_knowledge_search(
+            knowledge_retrieval_sink.is_some(),
+            &knowledge_kb_ids,
+        );
+        if register_knowledge_search {
+            for tool_name in ["knowledge_search", "knowledge_read"] {
+                if !config.tools.allow_list.iter().any(|name| name == tool_name) {
+                    config.tools.allow_list.push(tool_name.to_owned());
+                }
+            }
+        }
+
         // The native knowledge_write (回血) tool writes only into the user's own
         // bound knowledge base (DIRECT → base body; STAGED → review inbox) via
         // the backend service. Allow-list it so it bypasses the per-call approval
@@ -580,6 +1082,23 @@ impl NomiAgentManager {
             should_register_knowledge_write(knowledge_writeback_sink.is_some(), &knowledge_write_bases);
         if register_knowledge_write {
             config.tools.allow_list.push(KNOWLEDGE_WRITE_TOOL_NAME.to_owned());
+        }
+        // The native image tool writes only through the verified artifact
+        // store and is the expected path for an ordinary generation request.
+        // Add it before bootstrap so the registry's persistent allow policy
+        // accepts the late registration and the turn never stalls on an
+        // approval UI while a provider request is already in flight.
+        if image_generation_entitled
+            && !config
+                .tools
+                .allow_list
+                .iter()
+                .any(|name| name == IMAGE_GEN_TOOL_NAME)
+        {
+            config
+                .tools
+                .allow_list
+                .push(IMAGE_GEN_TOOL_NAME.to_owned());
         }
 
         let is_resume = resume_session.is_some();
@@ -735,16 +1254,24 @@ impl NomiAgentManager {
         // by tool registration below (only when bound bases make search valid).
         let knowledge_auto_rag = knowledge_retrieval_sink
             .as_ref()
-            .filter(|_| should_register_knowledge_search(true, &knowledge_kb_ids))
+            .filter(|_| register_knowledge_search)
             .map(|s| (s.clone(), knowledge_kb_ids.clone()));
         if let Some(sink) = knowledge_retrieval_sink {
-            if should_register_knowledge_search(true, &knowledge_kb_ids) {
-                engine
+            if register_knowledge_search {
+                let search_registered = engine
                     .registry_mut()
-                    .register(Box::new(KnowledgeSearchTool::new(sink.clone(), knowledge_kb_ids.clone())));
-                engine
+                    .register(Box::new(KnowledgeSearchTool::new(
+                        sink.clone(),
+                        knowledge_kb_ids.clone(),
+                    )));
+                let read_registered = engine
                     .registry_mut()
                     .register(Box::new(KnowledgeReadTool::new(sink, knowledge_kb_ids)));
+                if !search_registered || !read_registered {
+                    return Err(AppError::Internal(format!(
+                        "knowledge tool registration disagreed with the advertised session surface (knowledge_search={search_registered}, knowledge_read={read_registered})"
+                    )));
+                }
                 debug!(conversation_id = %conversation_id, "Registered knowledge_search + knowledge_read tools");
             }
         }
@@ -766,6 +1293,15 @@ impl NomiAgentManager {
                     "Registered knowledge_write tool"
                 );
             }
+        }
+        if let Some(tool) = image_generation_tool {
+            let registered = engine.registry_mut().register(tool);
+            if !registered {
+                return Err(AppError::Internal(
+                    "image_gen could not be registered under the session tool policy".to_owned(),
+                ));
+            }
+            debug!(conversation_id = %conversation_id, "Registered native image_gen tool");
         }
         if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
             error!(
@@ -821,7 +1357,68 @@ impl NomiAgentManager {
             distill_cfg,
             knowledge_prelude: std::sync::Mutex::new(knowledge_prelude),
             knowledge_auto_rag,
+            image_generation_availability: std::sync::RwLock::new(
+                image_generation_availability,
+            ),
+            image_generation_discovery,
+            image_generation_response_in_chinese,
         })
+    }
+
+    fn image_generation_availability(&self) -> ImageGenerationAvailability {
+        *self
+            .image_generation_availability
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Refresh the process-owned image route before a new turn becomes active.
+    /// Discovery is local-only; registry replacement happens under the engine
+    /// mutex and the route state is published last.
+    async fn refresh_image_generation_capability(&self) -> ImageGenerationAvailability {
+        let Some(discovery) = self.image_generation_discovery.as_ref() else {
+            return self.image_generation_availability();
+        };
+
+        let discovered = discovery.discover_tool().await;
+        let mut engine = self.engine.lock().await;
+        engine.registry_mut().unregister(IMAGE_GEN_TOOL_NAME);
+        let availability = match discovered {
+            Ok(Some(tool)) if tool.name() == IMAGE_GEN_TOOL_NAME => {
+                if engine.registry_mut().register(tool) {
+                    ImageGenerationAvailability::Ready
+                } else {
+                    error!(
+                        conversation_id = %self.runtime.conversation_id(),
+                        "image_gen: refreshed tool could not be registered under the persistent policy"
+                    );
+                    ImageGenerationAvailability::DiscoveryFailed
+                }
+            }
+            Ok(Some(tool)) => {
+                error!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    tool = %tool.name(),
+                    "image_gen: discovery returned an unexpected tool route"
+                );
+                ImageGenerationAvailability::DiscoveryFailed
+            }
+            Ok(None) => ImageGenerationAvailability::NoConfiguredModel,
+            Err(error) => {
+                error!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    error = %ErrorChain(&error),
+                    "image_gen: live catalog refresh failed closed"
+                );
+                ImageGenerationAvailability::DiscoveryFailed
+            }
+        };
+        *self
+            .image_generation_availability
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = availability;
+        drop(engine);
+        availability
     }
 
     fn request_stop(
@@ -946,7 +1543,23 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             "Nomi send_message started"
         );
         let _turn = self.turn_gate.lock().await;
-        self.turn_teardown_fence.wait_until_clear().await;
+        if !self
+            .turn_teardown_fence
+            .wait_until_clear(TURN_TEARDOWN_FENCE_WAIT_TIMEOUT)
+            .await
+        {
+            // Do not publish a manager terminal here: exact cleanup still owns
+            // the old generation. The result-bearing send-error path emits the
+            // structured stream failure, while this irreversible health bit
+            // makes registry reuse impossible until teardown is proven.
+            self.runtime.mark_transport_broken();
+            return Err(AgentSendError::stream_broken(
+                format!(
+                    "A prior Nomi turn did not prove exact process/tool cleanup within {} seconds; the cached runtime is quarantined",
+                    TURN_TEARDOWN_FENCE_WAIT_TIMEOUT.as_secs()
+                ),
+            ));
+        }
         // Capture the exact process authority before admitting the new runtime
         // generation. The turn termination guard can then fence subprocesses
         // even if the engine future panics and its mutex guard unwinds.
@@ -997,6 +1610,283 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             armed: true,
         };
 
+        // Catalog refresh belongs to this accepted turn's cancellation
+        // domain. Previously it ran before `reset_for_new_turn`, so Stop could
+        // observe an idle runtime, cancel the old token, and still lose to a
+        // slow local discovery that went on to start a fresh turn. Discovery
+        // itself is local-only, but it may wait on SQLite/decryption locks.
+        let image_generation_availability = tokio::select! {
+            biased;
+            _ = turn_cancel.cancelled() => {
+                self.backend_output_sink.cancel_active_tool_calls(
+                    "The turn was cancelled during image-model capability refresh.",
+                );
+                term_guard.fence_cancelled_processes().await?;
+                term_guard
+                    .terminalize(|runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
+                    })
+                    .await
+                    .map_err(AgentSendError::from_app_error)?;
+                return Ok(());
+            }
+            availability = self.refresh_image_generation_capability() => availability,
+        };
+
+        let direct_image_intent = classify_image_generation_intent(&data.content);
+        let (prior_image_intent, plan_mode_active, intent_provider, intent_model, intent_history) =
+            tokio::select! {
+                biased;
+                _ = turn_cancel.cancelled() => {
+                    self.backend_output_sink.cancel_active_tool_calls(
+                        "The turn was cancelled before image-intent routing preparation completed.",
+                    );
+                    term_guard.fence_cancelled_processes().await?;
+                    term_guard.terminalize(|runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
+                    }).await.map_err(AgentSendError::from_app_error)?;
+                    return Ok(());
+                }
+                snapshot = async {
+                    let engine = self.engine.lock().await;
+                    let marker = engine.host_context_value(IMAGE_ROUTE_CONTEXT_KEY);
+                    (
+                        image_route_from_context(marker.as_deref()),
+                        engine.is_plan_mode_active(),
+                        Arc::clone(engine.provider()),
+                        engine.model_name().to_owned(),
+                        engine.messages_transcript(),
+                    )
+                } => snapshot,
+            };
+        let should_classify_ambiguous_visual = should_run_image_intent_model(
+            direct_image_intent,
+            prior_image_intent,
+            &data.content,
+            !data.files.is_empty(),
+            plan_mode_active,
+        );
+        let mut image_intent_classification_failed = false;
+        let classified_image_intent = if let Some(route) = image_followup_route(
+            direct_image_intent,
+            &data.content,
+            prior_image_intent,
+        ) {
+            route
+        } else if should_classify_ambiguous_visual {
+            let attachment_summary = image_intent_attachment_summary(&data.files);
+            let classification = tokio::select! {
+                biased;
+                _ = turn_cancel.cancelled() => {
+                    self.backend_output_sink.cancel_active_tool_calls(
+                        "The turn was cancelled during image-intent classification.",
+                    );
+                    term_guard.fence_cancelled_processes().await?;
+                    term_guard.terminalize(|runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
+                    }).await.map_err(AgentSendError::from_app_error)?;
+                    return Ok(());
+                }
+                result = classify_image_generation_intent_with_model(
+                    intent_provider,
+                    intent_model,
+                    &data.content,
+                    prior_image_intent,
+                    &intent_history,
+                    &attachment_summary,
+                ) => result,
+            };
+            match classification {
+                Ok(intent) => intent,
+                Err(error) => {
+                    // Classification is an optimization/safety router, not the
+                    // user's task. A malformed or unavailable classifier must
+                    // not fail unrelated chat. The exact empty allowlist below
+                    // keeps this ambiguous visual turn tool-less, so failure
+                    // can never reopen Browser or a third-party generator.
+                    tracing::warn!(
+                        conversation_id = %self.runtime.conversation_id(),
+                        error = %error,
+                        "isolated image-intent classification failed closed"
+                    );
+                    image_intent_classification_failed = true;
+                    direct_image_intent
+                }
+            }
+        } else {
+            direct_image_intent
+        };
+        let image_generation_intent = host_validated_image_intent(
+            classified_image_intent,
+            direct_image_intent,
+            &data.content,
+            prior_image_intent,
+            plan_mode_active,
+        );
+        let user_authorized_external_image_execution =
+            explicitly_requests_external_image_execution(&data.content);
+        let ambiguous_visual_needs_host_clarification = should_classify_ambiguous_visual
+            && image_generation_intent == ImageGenerationIntent::None
+            && !user_authorized_external_image_execution
+            && !explicitly_requests_visual_discussion(&data.content);
+        let deterministic_image_response = if image_generation_intent
+            == ImageGenerationIntent::ExplicitExternal
+            && !EXTERNAL_IMAGE_ARTIFACT_BRIDGE_AVAILABLE
+        {
+            Some((
+                external_image_generation_unavailable_message(
+                    image_generation_availability,
+                    self.image_generation_response_in_chinese,
+                ),
+                false,
+            ))
+        } else if image_generation_intent == ImageGenerationIntent::Creation
+            && image_generation_availability != ImageGenerationAvailability::Ready
+        {
+            Some((
+                image_generation_unavailable_message(
+                    image_generation_availability,
+                    self.image_generation_response_in_chinese,
+                ),
+                true,
+            ))
+        } else if ambiguous_visual_needs_host_clarification {
+            Some((
+                ambiguous_visual_clarification_message(
+                    image_generation_availability,
+                    self.image_generation_response_in_chinese,
+                ),
+                false,
+            ))
+        } else {
+            None
+        };
+        if let Some((response, commits_native_image_route)) = deterministic_image_response {
+            // This is a deterministic capability response, not model-authored
+            // prose. With no native image model, or without a durable external
+            // artifact bridge, there is nothing valid the chat model can call.
+            // An ambiguous visual request whose classifier did not establish
+            // creation is likewise clarified by the host instead of giving a
+            // second model pass an opportunity to browse or claim false success.
+            // Persist the exchange so a later runtime retains honest history.
+            let mut engine = tokio::select! {
+                biased;
+                _ = turn_cancel.cancelled() => {
+                    self.backend_output_sink.cancel_active_tool_calls(
+                        "The turn was cancelled before the image capability response was recorded.",
+                    );
+                    term_guard.fence_cancelled_processes().await?;
+                    term_guard.terminalize(|runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
+                    }).await.map_err(AgentSendError::from_app_error)?;
+                    return Ok(());
+                }
+                engine = self.engine.lock() => engine,
+            };
+            engine
+                .record_host_text_turn(
+                    data.content.clone(),
+                    response.clone(),
+                    &source_message_id,
+                )
+                .map_err(|error| {
+                    AgentSendError::from_app_error(AppError::Internal(format!(
+                        "failed to persist image capability response: {error}"
+                    )))
+                })?;
+            let context_tokens = engine.context_tokens();
+            let context_window = engine.context_window();
+            drop(engine);
+            let published = term_guard
+                .publish_host_text_if_not_cancelled(
+                    &turn_cancel,
+                    &data.msg_id,
+                    &response,
+                    TurnCompletedEventData {
+                        elapsed_ms: now_ms() - started_at,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        context_tokens,
+                        context_window,
+                    },
+                )
+                .await
+                .map_err(AgentSendError::from_app_error)?;
+            if !published {
+                let rewound = self.engine.lock().await.rewind_last_turn(&source_message_id);
+                if !rewound {
+                    return Err(AgentSendError::from_app_error(AppError::Internal(
+                        "cancelled image capability response could not be rewound".to_owned(),
+                    )));
+                }
+                self.backend_output_sink.cancel_active_tool_calls(
+                    "The image capability response was cancelled before publication.",
+                );
+                term_guard.fence_cancelled_processes().await?;
+                term_guard
+                    .terminalize(|runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
+                    })
+                    .await
+                    .map_err(AgentSendError::from_app_error)?;
+            } else if commits_native_image_route {
+                self.engine.lock().await.set_host_context_value(
+                    IMAGE_ROUTE_CONTEXT_KEY,
+                    Some(IMAGE_ROUTE_NATIVE),
+                );
+            }
+            return Ok(());
+        }
+
+        let ambiguous_visual_requires_tool_gate = should_classify_ambiguous_visual
+            && image_generation_intent == ImageGenerationIntent::None
+            && !user_authorized_external_image_execution;
+        let plan_mode_image_request_requires_tool_gate = plan_mode_active
+            && matches!(
+                direct_image_intent,
+                ImageGenerationIntent::Creation | ImageGenerationIntent::ExplicitExternal
+            );
+        let image_tool_allowlist = if image_generation_intent == ImageGenerationIntent::Creation {
+            Some(HashSet::from([IMAGE_GEN_TOOL_NAME.to_owned()]))
+        } else if image_intent_classification_failed
+            || ambiguous_visual_requires_tool_gate
+            || plan_mode_image_request_requires_tool_gate
+        {
+            // `Some(empty)` is deliberately different from `None`: the
+            // request-scoped engine authority advertises and dispatches no
+            // tools. A visual-candidate classifier returning `none` or
+            // `discussion` is not authority to reopen Browser: only an
+            // affirmative user request for external execution may do so.
+            // Plan mode likewise cannot execute a native or external image
+            // route. The global image policy tells the main response to
+            // clarify without fabricating an image.
+            Some(HashSet::new())
+        } else {
+            None
+        };
+        let route_allows_knowledge =
+            route_allows_knowledge_context(image_tool_allowlist.as_ref());
+
         // Every asynchronous operation after entering Running belongs to this
         // durable cancellation domain. Preparation and execution converge on
         // one cancellation terminal below.
@@ -1014,7 +1904,9 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
 
                 // Proactive RAG is best-effort, but never allowed to make a
                 // cancelled turn wait forever.
-                let knowledge_hits = if let Some((sink, kb_ids)) = &self.knowledge_auto_rag {
+                let knowledge_hits = if route_allows_knowledge
+                    && let Some((sink, kb_ids)) = &self.knowledge_auto_rag
+                {
                     match sink.search(kb_ids, &data.content, 3).await {
                         Ok(hits) if !hits.is_empty() => Some(hits),
                         _ => None,
@@ -1051,21 +1943,42 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
 
             // Consume the one-shot prelude only after every cancellable
             // preparation await has completed successfully.
-            let prelude = self
-                .knowledge_prelude
-                .lock()
-                .expect("knowledge_prelude lock poisoned")
-                .take();
+            let prelude = route_allows_knowledge.then(|| {
+                self.knowledge_prelude
+                    .lock()
+                    .expect("knowledge_prelude lock poisoned")
+                    .take()
+            }).flatten();
             let content = apply_knowledge_prelude(prelude, &data.content);
             let content = match knowledge_hits {
                 Some(hits) => prepend_knowledge_context(&hits, content),
                 None => content,
             };
 
-            self.backend_output_sink.begin_artifact_delivery_turn();
+            self.backend_output_sink
+                .begin_deferred_artifact_delivery_turn_for(
+                    self.runtime.conversation_id(),
+                    &data.msg_id,
+                )
+                .map_err(|error| {
+                    AgentSendError::from_app_error(AppError::Internal(format!(
+                        "failed to begin recoverable artifact delivery: {error}"
+                    )))
+                })?;
+            if matches!(
+                image_generation_intent,
+                ImageGenerationIntent::Creation | ImageGenerationIntent::ExplicitExternal
+            ) {
+                self.backend_output_sink
+                    .require_image_artifact_for_turn()
+                    .map_err(|error| {
+                        AgentSendError::from_app_error(AppError::Internal(format!(
+                            "failed to register image-generation artifact requirement: {error}"
+                        )))
+                    })?;
+            }
             engine.set_steering_inbox(Some(self.steering_inbox.clone()));
             engine.set_system_resource_inbox(Some(self.system_resource_inbox.clone()));
-
             // Each iteration runs one engine pass inside the same accepted
             // Agent turn. Re-run only for steering race-tail interjections or
             // bounded output truncation continuation.
@@ -1092,10 +2005,11 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                         engine.set_system_resource_inbox(None);
                         break 'accepted None;
                     }
-                    res = engine.execute_turn_with_content_for_source(
+                    res = engine.execute_turn_with_content_for_source_and_tool_allowlist(
                         current_content,
                         &data.msg_id,
                         &source_message_id,
+                        image_tool_allowlist.as_ref(),
                     ) => res,
                 };
 
@@ -1219,39 +2133,19 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     "The model turn ended with {stop_reason:?} before this tool call reached a terminal state."
                 ));
 
-                if let Err(delivery_error) = self
-                    .backend_output_sink
-                    .finish_artifact_delivery_turn()
-                {
-                    error!(
-                        conversation_id = %self.runtime.conversation_id(),
-                        elapsed_ms,
-                        error = %delivery_error,
-                        "Nomi turn ended without satisfying every artifact-delivery obligation"
-                    );
-                    let send_error = AgentSendError::from_app_error(AppError::Internal(format!(
-                        "Artifact delivery failed: {delivery_error}"
-                    )));
-                    let stream_error = send_error.stream_error().clone();
-                    term_guard.terminalize(move |runtime, turn| {
-                        runtime.emit_error_data_for_turn(turn, stream_error)
-                    }).await.map_err(AgentSendError::from_app_error)?;
-                    return Err(send_error);
-                }
-
                 // Phase 3 observability: a per-turn metrics event the UI shows as
                 // duration / token cost and telemetry records. Purely additive and
                 // non-terminal — emitted via `emit()` so it does NOT flip the
                 // absorbing Finished state before the real `Finish` below.
                 let context_tokens = engine.context_tokens();
                 let context_window = engine.context_window();
-                self.runtime.emit(AgentStreamEvent::TurnCompleted(TurnCompletedEventData {
+                let completed_event = TurnCompletedEventData {
                     elapsed_ms,
                     input_tokens: agent_result.usage.input_tokens,
                     output_tokens: agent_result.usage.output_tokens,
                     context_tokens,
                     context_window,
-                }));
+                };
 
                 // —— Post-session memory distillation (exact turn child) ——
                 // Eligibility gates, cheapest first:
@@ -1282,7 +2176,52 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                 } else {
                     None
                 };
-                drop(engine); // never hold the engine mutex across the provider call
+                drop(engine); // no engine mutex across artifact I/O or provider work
+
+                match self
+                    .backend_output_sink
+                    .verify_artifact_delivery_turn_async(&turn_cancel)
+                    .await
+                {
+                    AsyncArtifactDeliveryOutcome::Verified(_) => {}
+                    AsyncArtifactDeliveryOutcome::Cancelled => {
+                        self.backend_output_sink.cancel_active_tool_calls(
+                            "The tool call was cancelled during durable artifact delivery.",
+                        );
+                        term_guard.fence_cancelled_processes().await?;
+                        term_guard
+                            .terminalize(|runtime, turn| {
+                                runtime.emit_finish_for_turn(
+                                    turn,
+                                    None,
+                                    Some(TurnStopReason::Cancelled),
+                                )
+                            })
+                            .await
+                            .map_err(AgentSendError::from_app_error)?;
+                        return Ok(());
+                    }
+                    AsyncArtifactDeliveryOutcome::Failed(delivery_error) => {
+                        error!(
+                            conversation_id = %self.runtime.conversation_id(),
+                            elapsed_ms,
+                            error = %delivery_error,
+                            "Nomi turn ended without satisfying every artifact-delivery obligation"
+                        );
+                        let send_error = image_artifact_delivery_error_to_send_error(
+                            image_generation_intent,
+                            &delivery_error,
+                        );
+                        let stream_error = send_error.stream_error().clone();
+                        term_guard
+                            .terminalize(move |runtime, turn| {
+                                runtime.emit_error_data_for_turn(turn, stream_error)
+                            })
+                            .await
+                            .map_err(AgentSendError::from_app_error)?;
+                        return Err(send_error);
+                    }
+                }
 
                 let distill_completed = match distill_job {
                     Some((cfg, dir, transcript)) => {
@@ -1296,7 +2235,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     }
                     None => !turn_cancel.is_cancelled(),
                 };
-                if !distill_completed || turn_cancel.is_cancelled() {
+                if !distill_completed {
                     self.backend_output_sink.cancel_active_tool_calls(
                         "The tool call was cancelled because the user stopped the turn.",
                     );
@@ -1311,10 +2250,60 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     return Ok(());
                 }
 
-                term_guard.terminalize(|runtime, turn| {
-                    runtime.emit_finish_for_turn(turn, None, Some(stop_reason))
-                }).await.map_err(AgentSendError::from_app_error)?;
-                Ok(())
+                match term_guard
+                    .commit_verified_turn_if_not_cancelled(
+                        &turn_cancel,
+                        completed_event,
+                        stop_reason,
+                    )
+                    .await
+                    .map_err(AgentSendError::from_app_error)?
+                {
+                    VerifiedTurnCommitOutcome::Committed => {
+                        self.engine.lock().await.set_host_context_value(
+                            IMAGE_ROUTE_CONTEXT_KEY,
+                            image_route_context_value(image_generation_intent),
+                        );
+                        Ok(())
+                    }
+                    VerifiedTurnCommitOutcome::Cancelled => {
+                        self.backend_output_sink.cancel_active_tool_calls(
+                            "The tool call was cancelled before its verified delivery was committed.",
+                        );
+                        term_guard.fence_cancelled_processes().await?;
+                        term_guard
+                            .terminalize(|runtime, turn| {
+                                runtime.emit_finish_for_turn(
+                                    turn,
+                                    None,
+                                    Some(TurnStopReason::Cancelled),
+                                )
+                            })
+                            .await
+                            .map_err(AgentSendError::from_app_error)?;
+                        Ok(())
+                    }
+                    VerifiedTurnCommitOutcome::DeliveryFailed(delivery_error) => {
+                        error!(
+                            conversation_id = %self.runtime.conversation_id(),
+                            elapsed_ms,
+                            error = %delivery_error,
+                            "artifact delivery changed before the exact turn commit"
+                        );
+                        let send_error = image_artifact_delivery_error_to_send_error(
+                            image_generation_intent,
+                            &delivery_error,
+                        );
+                        let stream_error = send_error.stream_error().clone();
+                        term_guard
+                            .terminalize(move |runtime, turn| {
+                                runtime.emit_error_data_for_turn(turn, stream_error)
+                            })
+                            .await
+                            .map_err(AgentSendError::from_app_error)?;
+                        Err(send_error)
+                    }
+                }
             }
             Err(e) => {
                 let error_msg = format!("Nomi agent error: {e}");
@@ -1328,6 +2317,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                 self.backend_output_sink.fail_active_tool_calls(&format!(
                     "The model/provider turn failed before this tool call completed: {e}"
                 ));
+                self.backend_output_sink.abort_artifact_delivery_turn();
                 let stream_error = send_error.stream_error().clone();
                 term_guard.terminalize(move |runtime, turn| {
                     runtime.emit_error_data_for_turn(turn, stream_error)
@@ -1393,6 +2383,12 @@ struct TurnTerminationGuard {
     armed: bool,
 }
 
+enum VerifiedTurnCommitOutcome {
+    Committed,
+    Cancelled,
+    DeliveryFailed(String),
+}
+
 impl TurnTerminationGuard {
     async fn terminalize(
         &mut self,
@@ -1420,6 +2416,111 @@ impl TurnTerminationGuard {
         );
         self.armed = false;
         Ok(emitted)
+    }
+
+    /// Linearize a deterministic host response against Stop. Browser cleanup
+    /// happens first; then the cancellation token is rechecked while holding
+    /// the same lifecycle gate used by `request_stop`. If Stop won, no response
+    /// event is published and the caller can rewind the provisional engine
+    /// history before emitting the normal Cancelled terminal.
+    async fn publish_host_text_if_not_cancelled(
+        &mut self,
+        turn_cancel: &tokio_util::sync::CancellationToken,
+        msg_id: &str,
+        response: &str,
+        completed: TurnCompletedEventData,
+    ) -> Result<bool, AppError> {
+        #[cfg(feature = "browser-use")]
+        if let Some(binding) = &self.browser_lane_binding {
+            binding.close_turn_lanes().await?;
+        }
+
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = self
+            .active_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.as_ref() != Some(&self.turn) || turn_cancel.is_cancelled() {
+            return Ok(false);
+        }
+
+        self.backend_output_sink.emit_stream_start(msg_id);
+        self.backend_output_sink.emit_text_delta(response, msg_id);
+        self.runtime.emit(AgentStreamEvent::TurnCompleted(completed));
+        let emitted = self.runtime.emit_finish_for_turn(
+            self.turn,
+            None,
+            Some(TurnStopReason::EndTurn),
+        );
+        self.steering_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *active = None;
+        self.armed = false;
+        Ok(emitted)
+    }
+
+    /// Atomically transfer verified artifacts/held prose to the visible turn
+    /// and publish its terminal event. Stop uses the same lifecycle gate, so it
+    /// must linearize either before this commit (no prose or receipt escapes) or
+    /// after the exact EndTurn has already absorbed the active generation.
+    async fn commit_verified_turn_if_not_cancelled(
+        &mut self,
+        turn_cancel: &tokio_util::sync::CancellationToken,
+        completed: TurnCompletedEventData,
+        stop_reason: TurnStopReason,
+    ) -> Result<VerifiedTurnCommitOutcome, AppError> {
+        #[cfg(feature = "browser-use")]
+        if let Some(binding) = &self.browser_lane_binding {
+            binding.close_turn_lanes().await?;
+        }
+
+        let verified = match self
+            .backend_output_sink
+            .verify_artifact_delivery_turn_async(turn_cancel)
+            .await
+        {
+            AsyncArtifactDeliveryOutcome::Verified(verified) => verified,
+            AsyncArtifactDeliveryOutcome::Cancelled => {
+                return Ok(VerifiedTurnCommitOutcome::Cancelled);
+            }
+            AsyncArtifactDeliveryOutcome::Failed(error) => {
+                return Ok(VerifiedTurnCommitOutcome::DeliveryFailed(error));
+            }
+        };
+
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = self
+            .active_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.as_ref() != Some(&self.turn) || turn_cancel.is_cancelled() {
+            return Ok(VerifiedTurnCommitOutcome::Cancelled);
+        }
+        if let Err(error) = self
+            .backend_output_sink
+            .finish_verified_artifact_delivery_turn(verified)
+        {
+            return Ok(VerifiedTurnCommitOutcome::DeliveryFailed(error));
+        }
+
+        self.runtime.emit(AgentStreamEvent::TurnCompleted(completed));
+        self.runtime
+            .emit_finish_for_turn(self.turn, None, Some(stop_reason));
+        self.steering_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *active = None;
+        self.armed = false;
+        Ok(VerifiedTurnCommitOutcome::Committed)
     }
 
     async fn fence_cancelled_processes(&self) -> Result<(), AppError> {
@@ -1452,6 +2553,12 @@ impl Drop for TurnTerminationGuard {
             // `turn_gate`. Therefore a queued successor can never slip between
             // the unwind and the asynchronous process-tree fence.
             self.turn_teardown_fence.begin();
+            // The exact cleanup task below retains resource authority. Marking
+            // only the event transport broken is not a cleanup proof and does
+            // not release that authority; it makes the abnormal manager
+            // ineligible for cache reuse and routes the owner through the
+            // registry's bounded quarantine teardown path.
+            self.runtime.mark_transport_broken();
             self.backend_output_sink.cancel_active_tool_calls(
                 "The turn ended unexpectedly before this tool call reached a terminal state.",
             );
@@ -2081,6 +3188,49 @@ fn nomi_engine_error_to_send_error(error_msg: String) -> AgentSendError {
     AgentSendError::from_app_error(AppError::Internal(error_msg))
 }
 
+fn image_artifact_delivery_error_to_send_error(
+    intent: ImageGenerationIntent,
+    delivery_error: &str,
+) -> AgentSendError {
+    let lower = delivery_error.trim().to_ascii_lowercase();
+    let model_skipped_required_tool =
+        lower.starts_with("accepted turn required a verified image artifact")
+            && !lower.contains(';');
+    let model_or_image_tool_returned_no_artifact = [
+        "tool returned an error",
+        "tool completed without a verified artifact receipt",
+        "artifact-producing tool returned no image artifact",
+        "image model completed without an image asset result",
+        "image model produced 0 image candidate",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+
+    if intent == ImageGenerationIntent::Creation
+        && (model_skipped_required_tool || model_or_image_tool_returned_no_artifact)
+    {
+        return AgentSendError::new(
+            "The selected model did not deliver the requested image",
+            AgentErrorCode::UserLlmProviderEmptyResponse,
+            AgentErrorOwnership::UserLlmProvider,
+            Some(format!("Artifact delivery failed: {delivery_error}")),
+            true,
+            false,
+            Some(AgentErrorResolution::new(
+                AgentErrorResolutionKind::ChangeModel,
+                Some(AgentErrorResolutionTarget::ProviderSettings),
+            )),
+        );
+    }
+
+    // Ledger, persistence, final verification, and generation-CAS failures are
+    // host integrity failures. Keep those classified as Nomi-owned rather than
+    // hiding a real receipt invariant violation behind a provider error.
+    AgentSendError::from_app_error(AppError::Internal(format!(
+        "Artifact delivery failed: {delivery_error}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2098,6 +3248,37 @@ mod tests {
 
     #[cfg(feature = "browser-use")]
     struct RejectingBrowserHostFactory;
+
+    #[tokio::test]
+    async fn turn_teardown_fence_wait_is_bounded_while_cleanup_is_stuck() {
+        let fence = TurnTeardownFence::new();
+        fence.begin();
+
+        assert!(
+            !fence
+                .wait_until_clear(std::time::Duration::from_millis(10))
+                .await,
+            "a successor must not wait forever for an abandoned teardown fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_teardown_fence_wait_observes_exact_completion() {
+        let fence = Arc::new(TurnTeardownFence::new());
+        fence.begin();
+        let completer = Arc::clone(&fence);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            completer.complete();
+        });
+
+        assert!(
+            fence
+                .wait_until_clear(std::time::Duration::from_secs(1))
+                .await,
+            "an exact cleanup proof must release the successor fence"
+        );
+    }
 
     #[cfg(feature = "browser-use")]
     #[async_trait::async_trait]
@@ -2804,6 +3985,160 @@ mod tests {
         }
     }
 
+    #[test]
+    fn restricted_image_session_does_not_misreport_missing_catalog_configuration() {
+        let message = image_generation_unavailable_message(
+            ImageGenerationAvailability::NotEntitled,
+            true,
+        );
+        assert!(message.contains("受限 Agent 会话"));
+        assert!(!message.contains(IMAGE_MODEL_MANAGEMENT_LINK));
+        assert!(!message.contains("尚未配置"));
+
+        let failed = image_generation_unavailable_message(
+            ImageGenerationAvailability::DiscoveryFailed,
+            true,
+        );
+        assert!(failed.contains("无法核验"));
+        assert!(!failed.contains(IMAGE_MODEL_MANAGEMENT_LINK));
+        assert!(!failed.contains("尚未配置"));
+    }
+
+    #[test]
+    fn model_intent_cannot_grant_browser_authority_and_plan_mode_never_routes_execution() {
+        assert_eq!(
+            host_validated_image_intent(
+                ImageGenerationIntent::ExplicitExternal,
+                ImageGenerationIntent::None,
+                "create an image for my website",
+                None,
+                false,
+            ),
+            ImageGenerationIntent::Creation,
+            "an output destination is not Browser execution authority"
+        );
+        assert_eq!(
+            host_validated_image_intent(
+                ImageGenerationIntent::ExplicitExternal,
+                ImageGenerationIntent::None,
+                "Use the browser to make something visually surprising",
+                None,
+                false,
+            ),
+            ImageGenerationIntent::ExplicitExternal,
+        );
+        assert_eq!(
+            host_validated_image_intent(
+                ImageGenerationIntent::Creation,
+                ImageGenerationIntent::Creation,
+                "生成一张学生图片",
+                None,
+                true,
+            ),
+            ImageGenerationIntent::None,
+            "plan mode must not create an impossible execution/artifact obligation"
+        );
+    }
+
+    #[test]
+    fn ambiguous_visual_signals_use_semantic_pass_without_double_calling_unrelated_chat() {
+        assert!(should_run_image_intent_model(
+            ImageGenerationIntent::None,
+            None,
+            "surprise me visually",
+            false,
+            false,
+        ));
+        assert!(should_run_image_intent_model(
+            ImageGenerationIntent::None,
+            None,
+            "Give me cat art",
+            false,
+            false,
+        ));
+        assert!(!should_run_image_intent_model(
+            ImageGenerationIntent::Discussion,
+            None,
+            "explain the image generation route",
+            false,
+            false,
+        ));
+        assert!(!should_run_image_intent_model(
+            ImageGenerationIntent::None,
+            None,
+            "How should I structure this Rust module?",
+            false,
+            false,
+        ));
+        assert!(!should_run_image_intent_model(
+            ImageGenerationIntent::None,
+            None,
+            "What is shown?",
+            true,
+            false,
+        ));
+        assert!(should_run_image_intent_model(
+            ImageGenerationIntent::None,
+            None,
+            "make it watercolor",
+            true,
+            false,
+        ));
+        assert!(!should_run_image_intent_model(
+            ImageGenerationIntent::None,
+            None,
+            "surprise me visually",
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn code_native_visual_requests_never_route_to_image_generation() {
+        for request in [
+            "画布项目助手合并需求",
+            "请实现 canvas 图表渲染代码",
+            "绘制这个流程图的 Mermaid 源码",
+            "创建一个 UI 图标组件",
+            "Implement this canvas chart in TypeScript",
+            "Create the Mermaid source for a flowchart",
+            "Build a React UI icon component",
+            "Fix the SVG diagram rendering code",
+        ] {
+            let direct = classify_image_generation_intent(request);
+            assert_eq!(
+                host_validated_image_intent(direct, direct, request, None, false),
+                ImageGenerationIntent::None,
+                "code-native visual request was routed as image generation: {request}"
+            );
+            assert!(
+                !should_run_image_intent_model(direct, None, request, false, false),
+                "code-native visual request must not spend an image-intent model pass: {request}"
+            );
+        }
+
+        for request in ["生成一张水彩海报", "Create a watercolor poster"] {
+            let direct = classify_image_generation_intent(request);
+            assert_eq!(
+                host_validated_image_intent(direct, direct, request, None, false),
+                ImageGenerationIntent::Creation,
+                "a real visual-asset request must keep the native image route: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_image_routes_do_not_mount_forced_knowledge_context() {
+        let image_only = HashSet::from([IMAGE_GEN_TOOL_NAME.to_owned()]);
+        let no_tools = HashSet::new();
+        let knowledge_only = HashSet::from(["knowledge_search".to_owned()]);
+
+        assert!(!route_allows_knowledge_context(Some(&image_only)));
+        assert!(!route_allows_knowledge_context(Some(&no_tools)));
+        assert!(route_allows_knowledge_context(Some(&knowledge_only)));
+        assert!(route_allows_knowledge_context(None));
+    }
+
     struct ScriptedProvider {
         calls: AtomicUsize,
         responses: Vec<Vec<LlmEvent>>,
@@ -3001,6 +4336,78 @@ mod tests {
         }
     }
 
+    struct SequencedImageToolDiscovery {
+        ready: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    }
+
+    struct BlockingImageToolDiscovery {
+        started: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl SequencedImageToolDiscovery {
+        fn new(ready: impl IntoIterator<Item = bool>) -> Self {
+            Self {
+                ready: std::sync::Mutex::new(ready.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageGenerationToolDiscovery for SequencedImageToolDiscovery {
+        async fn discover_tool(&self) -> Result<Option<Box<dyn Tool>>, AppError> {
+            let ready = self
+                .ready
+                .lock()
+                .expect("image discovery sequence lock poisoned")
+                .pop_front()
+                .expect("image discovery invoked more often than expected");
+            Ok(ready.then(|| Box::new(MissingImageArtifactTool) as Box<dyn Tool>))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageGenerationToolDiscovery for BlockingImageToolDiscovery {
+        async fn discover_tool(&self) -> Result<Option<Box<dyn Tool>>, AppError> {
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+
+    struct BrowserScreenshotOnlyTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BrowserScreenshotOnlyTool {
+        fn name(&self) -> &str {
+            "browserScreenshot"
+        }
+
+        fn description(&self) -> &str {
+            "Test-only observational browser screenshot"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
+            true
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> ToolResult {
+            const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+            ToolResult::text("browser screenshot captured").with_images(vec![
+                nomi_types::tool::ToolImage {
+                    media_type: "image/png".into(),
+                    data: PNG.into(),
+                },
+            ])
+        }
+
+        fn category(&self) -> ToolCategory {
+            ToolCategory::Info
+        }
+    }
+
     struct HangingKnowledgeSink {
         started: Arc<tokio::sync::Semaphore>,
     }
@@ -3115,7 +4522,111 @@ mod tests {
             distill_cfg: Arc::new(config),
             knowledge_prelude: std::sync::Mutex::new(None),
             knowledge_auto_rag: None,
+            image_generation_availability: std::sync::RwLock::new(
+                ImageGenerationAvailability::NoConfiguredModel,
+            ),
+            image_generation_discovery: None,
+            image_generation_response_in_chinese: false,
         }
+    }
+
+    #[tokio::test]
+    async fn next_turn_refresh_promotes_none_to_ready_in_the_same_runtime() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]]));
+        let mut agent = make_agent_with_provider(provider.clone());
+        agent.image_generation_discovery = Some(Arc::new(SequencedImageToolDiscovery::new([
+            true,
+        ])));
+
+        assert_eq!(
+            agent.image_generation_availability(),
+            ImageGenerationAvailability::NoConfiguredModel
+        );
+        assert!(
+            !agent
+                .engine
+                .get_mut()
+                .tool_names()
+                .iter()
+                .any(|name| name == IMAGE_GEN_TOOL_NAME)
+        );
+
+        let result = agent
+            .send_message(SendMessageData {
+                content: "generate an image of a lighthouse".into(),
+                msg_id: "msg-live-image-model-enabled".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the test provider intentionally returns no verified image receipt"
+        );
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(
+            provider.requests()[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![IMAGE_GEN_TOOL_NAME]
+        );
+        assert_eq!(
+            agent.image_generation_availability(),
+            ImageGenerationAvailability::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn next_turn_refresh_demotes_ready_to_none_in_the_same_runtime() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let mut agent = make_agent_with_provider(provider.clone());
+        *agent.image_generation_availability.get_mut().unwrap() =
+            ImageGenerationAvailability::Ready;
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(MissingImageArtifactTool))
+        );
+        agent.image_generation_discovery = Some(Arc::new(SequencedImageToolDiscovery::new([
+            false,
+        ])));
+
+        agent
+            .send_message(SendMessageData {
+                content: "generate an image of a lighthouse".into(),
+                msg_id: "msg-live-image-model-disabled".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(
+            agent.image_generation_availability(),
+            ImageGenerationAvailability::NoConfiguredModel
+        );
+        assert!(
+            !agent
+                .engine
+                .lock()
+                .await
+                .tool_names()
+                .iter()
+                .any(|name| name == IMAGE_GEN_TOOL_NAME)
+        );
     }
 
     #[tokio::test]
@@ -3311,6 +4822,11 @@ mod tests {
             distill_cfg: Arc::new(config),
             knowledge_prelude: std::sync::Mutex::new(None),
             knowledge_auto_rag: None,
+            image_generation_availability: std::sync::RwLock::new(
+                ImageGenerationAvailability::NoConfiguredModel,
+            ),
+            image_generation_discovery: None,
+            image_generation_response_in_chinese: false,
         };
         let attachment_dir = tempfile::tempdir().unwrap();
         let missing_image = attachment_dir
@@ -3394,6 +4910,669 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_image_request_without_model_short_circuits_without_provider_or_tools() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let mut agent = make_agent_with_provider(provider.clone());
+        agent.image_generation_response_in_chinese = true;
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "请生成一张水彩风格的学生图片".into(),
+                msg_id: "msg-no-image-model".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Text(data)
+                if data.content.contains(IMAGE_MODEL_MANAGEMENT_LINK)
+                    && data.content.contains("没有生成图片")
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+        assert!(events.iter().any(|event| matches!(event, AgentStreamEvent::Finish(_))));
+    }
+
+    #[tokio::test]
+    async fn strict_image_route_suppresses_forced_knowledge_prelude_and_projects_authority() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]]));
+        let mut agent = make_agent_with_provider(provider.clone());
+        *agent.image_generation_availability.get_mut().unwrap() =
+            ImageGenerationAvailability::Ready;
+        *agent.knowledge_prelude.get_mut().unwrap() = Some(
+            "[Knowledge bases mounted: private] Call knowledge_search before answering.".into(),
+        );
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(MissingImageArtifactTool))
+        );
+
+        let send_error = agent
+            .send_message(SendMessageData {
+                content: "generate an image of a student".into(),
+                msg_id: "msg-image-no-kb-promise".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            send_error.code(),
+            Some(AgentErrorCode::UserLlmProviderEmptyResponse)
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].system.starts_with("## Request-scoped tool authority"));
+        assert!(requests[0].system.contains("Declared tools for this request: `image_gen`"));
+        let user_text = requests[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!user_text.contains("Knowledge bases mounted"));
+        assert_eq!(
+            agent
+                .knowledge_prelude
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("[Knowledge bases mounted: private] Call knowledge_search before answering."),
+            "a strict route must not consume the one-shot knowledge prelude"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_visual_request_uses_typed_pass_then_honest_no_model_response() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            LlmEvent::TextDelta(r#"{"intent":"creation"}"#.into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            },
+        ]]));
+        let agent = make_agent_with_provider(provider.clone());
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "Give me cat art".into(),
+                msg_id: "msg-semantic-no-model".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 1, "only the isolated intent pass may run");
+        assert!(provider.requests()[0].tools.is_empty());
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Text(data)
+                if data.content.contains(IMAGE_MODEL_MANAGEMENT_LINK)
+                    && data.content.contains("No image was generated")
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+    }
+
+    #[tokio::test]
+    async fn semantic_creation_routes_only_to_native_image_tool_never_browser() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                LlmEvent::TextDelta(r#"{"intent":"creation"}"#.into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Default::default(),
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta("done".into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Default::default(),
+                },
+            ],
+        ]));
+        let mut agent = make_agent_with_provider(provider.clone());
+        *agent.image_generation_availability.get_mut().unwrap() =
+            ImageGenerationAvailability::Ready;
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(MissingImageArtifactTool))
+        );
+
+        let result = agent
+            .send_message(SendMessageData {
+                content: "surprise me visually".into(),
+                msg_id: "msg-semantic-native".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await;
+
+        assert!(result.is_err(), "text alone cannot satisfy the image receipt gate");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.is_empty(), "classifier must be toolless");
+        assert_eq!(
+            requests[1]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![IMAGE_GEN_TOOL_NAME],
+            "the execution request must expose only the native image tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_visual_discussion_skips_classifier_and_artifact_obligation() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]]));
+        let agent = make_agent_with_provider(provider.clone());
+
+        agent
+            .send_message(SendMessageData {
+                content: "Let's discuss visual systems architecture".into(),
+                msg_id: "msg-semantic-discussion".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_visual_explanation_is_a_single_normal_answer_pass() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]]));
+        let agent = make_agent_with_provider(provider.clone());
+
+        agent
+            .send_message(SendMessageData {
+                content: "Explain this visual art style".into(),
+                msg_id: "msg-semantic-discussion-not-creation".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "an explicit discussion must remain a normal answer turn");
+        assert!(requests[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_semantic_image_classification_cannot_reopen_browser_tools() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            LlmEvent::TextDelta("not valid routing json".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            },
+        ]]));
+        let mut agent = make_agent_with_provider(provider.clone());
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(BrowserScreenshotOnlyTool))
+        );
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "surprise me visually".into(),
+                msg_id: "msg-semantic-failure-closed".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "only the isolated classifier may run");
+        assert!(requests[0].tools.is_empty(), "classifier must be toolless");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Text(data) if data.content.contains("No image was generated")
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+    }
+
+    #[tokio::test]
+    async fn semantic_visual_none_or_discussion_is_host_clarified_without_false_success() {
+        for classified_intent in ["none", "discussion"] {
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                vec![
+                    LlmEvent::TextDelta(
+                        serde_json::json!({"intent": classified_intent}).to_string(),
+                    ),
+                    LlmEvent::Done {
+                        stop_reason: StopReason::EndTurn,
+                        usage: Default::default(),
+                    },
+                ],
+                vec![
+                    LlmEvent::TextDelta("The image was generated successfully.".into()),
+                    LlmEvent::Done {
+                        stop_reason: StopReason::EndTurn,
+                        usage: Default::default(),
+                    },
+                ],
+            ]));
+            let mut agent = make_agent_with_provider(provider.clone());
+            assert!(
+                agent
+                    .engine
+                    .get_mut()
+                    .registry_mut()
+                    .register(Box::new(BrowserScreenshotOnlyTool))
+            );
+            let mut rx = agent.subscribe();
+
+            agent
+                .send_message(SendMessageData {
+                    content: "surprise me visually".into(),
+                    msg_id: format!("msg-semantic-{classified_intent}-closed"),
+                    source_message_id: None,
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    origin: None,
+                })
+                .await
+                .unwrap();
+
+            let requests = provider.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "classifier={classified_intent} must not reach a free-form main pass"
+            );
+            assert!(requests[0].tools.is_empty(), "classifier must be toolless");
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentStreamEvent::Text(data)
+                    if data.content.contains(IMAGE_MODEL_MANAGEMENT_LINK)
+                        && data.content.contains("No image was generated")
+                        && !data.content.contains("generated successfully")
+            )));
+            assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn contextual_image_followup_reuses_the_native_route_without_opening_browser_tools() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let agent = make_agent_with_provider(provider.clone());
+
+        for (index, content) in [
+            "generate an image of a student",
+            "换成 16:9，按刚才风格重做",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            agent
+                .send_message(SendMessageData {
+                    content: content.into(),
+                    msg_id: format!("msg-image-followup-{index}"),
+                    source_message_id: None,
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    origin: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(
+            agent
+                .engine
+                .lock()
+                .await
+                .host_context_value(IMAGE_ROUTE_CONTEXT_KEY)
+                .as_deref(),
+            Some(IMAGE_ROUTE_NATIVE)
+        );
+        assert!(contextual_image_generation_followup("再来个竖版"));
+        assert!(is_context_only_image_followup("再来个竖版"));
+        assert!(!is_context_only_image_followup("再生成一张竖版图片"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_external_followup_short_circuits_before_provider() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let agent = make_agent_with_provider(provider.clone());
+        agent.engine.lock().await.set_host_context_value(
+            IMAGE_ROUTE_CONTEXT_KEY,
+            Some(IMAGE_ROUTE_EXTERNAL),
+        );
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "another one in the same site".into(),
+                msg_id: "msg-external-image-followup".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Text(data)
+                if data.content.contains("cannot yet persist and verify")
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+        assert!(events.iter().any(|event| matches!(event, AgentStreamEvent::Finish(_))));
+        assert_eq!(
+            agent
+                .engine
+                .lock()
+                .await
+                .host_context_value(IMAGE_ROUTE_CONTEXT_KEY)
+            .as_deref(),
+            Some(IMAGE_ROUTE_EXTERNAL),
+            "an unsupported follow-up must not overwrite the last completed image route"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_while_no_model_response_waits_for_engine_history_lock() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let agent = Arc::new(make_agent_with_provider(provider.clone()));
+        let mut rx = agent.subscribe();
+        let engine_guard = agent.engine.lock().await;
+        let sending_agent = Arc::clone(&agent);
+        let send = tokio::spawn(async move {
+            sending_agent
+                .send_message(SendMessageData {
+                    content: "generate a watercolor image".into(),
+                    msg_id: "msg-cancel-no-model".into(),
+                    source_message_id: None,
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    origin: None,
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while agent.status() != Some(ConversationStatus::Running) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test turn should enter Running");
+
+        agent.cancel().await.unwrap();
+        drop(engine_guard);
+        send.await.unwrap().unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::Text(_))));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Finish(data)
+                if data.stop_reason == Some(TurnStopReason::Cancelled)
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_while_image_capability_refresh_is_pending() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut raw_agent = make_agent_with_provider(provider.clone());
+        raw_agent.image_generation_discovery = Some(Arc::new(BlockingImageToolDiscovery {
+            started: Arc::clone(&started),
+        }));
+        let agent = Arc::new(raw_agent);
+        let mut rx = agent.subscribe();
+        let sending_agent = Arc::clone(&agent);
+        let send = tokio::spawn(async move {
+            sending_agent
+                .send_message(SendMessageData {
+                    content: "generate an image of a lighthouse".into(),
+                    msg_id: "msg-cancel-image-refresh".into(),
+                    source_message_id: None,
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    origin: None,
+                })
+                .await
+        });
+
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            started.acquire(),
+        )
+        .await
+        .expect("image capability discovery should start")
+        .expect("discovery semaphore should remain open");
+        permit.forget();
+        assert_eq!(agent.status(), Some(ConversationStatus::Running));
+
+        agent.cancel().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), send)
+            .await
+            .expect("cancel must drop a pending local capability refresh")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Finish(data)
+                if data.stop_reason == Some(TurnStopReason::Cancelled)
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::Text(_))));
+    }
+
+    #[tokio::test]
+    async fn routed_image_turn_discards_text_success_claim_without_a_receipt() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            LlmEvent::TextDelta("The image was generated successfully.".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            },
+        ]]));
+        let mut agent = make_agent_with_provider(provider.clone());
+        *agent.image_generation_availability.get_mut().unwrap() =
+            ImageGenerationAvailability::Ready;
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(MissingImageArtifactTool))
+        );
+        let mut rx = agent.subscribe();
+
+        let result = agent
+            .send_message(SendMessageData {
+                content: "generate an image of a student".into(),
+                msg_id: "msg-false-success".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(
+            provider.requests()[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![IMAGE_GEN_TOOL_NAME]
+        );
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(event, AgentStreamEvent::Error(_))));
+        assert!(
+            !events.iter().any(|event| matches!(event, AgentStreamEvent::Text(_))),
+            "a success claim must stay provisional and be discarded without a receipt"
+        );
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::Finish(_))));
+    }
+
+    #[tokio::test]
+    async fn external_image_request_without_bridge_or_native_model_short_circuits() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                LlmEvent::ToolUse {
+                    id: "browser-shot".into(),
+                    name: "browserScreenshot".into(),
+                    input: serde_json::json!({}),
+                    extra: None,
+                },
+                LlmEvent::Done {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Default::default(),
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta("Generated successfully in the browser.".into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Default::default(),
+                },
+            ],
+        ]));
+        let mut agent = make_agent_with_provider(provider.clone());
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(BrowserScreenshotOnlyTool))
+        );
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "Use the browser website to generate a student image".into(),
+                msg_id: "msg-browser-image".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Text(data)
+                if data.content.contains("cannot yet persist and verify")
+                    && data.content.contains(IMAGE_MODEL_MANAGEMENT_LINK)
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::Error(_))));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+        assert!(events.iter().any(|event| matches!(event, AgentStreamEvent::Finish(_))));
+    }
+
+    #[tokio::test]
+    async fn external_image_request_without_durable_bridge_stays_host_deterministic() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let mut agent = make_agent_with_provider(provider.clone());
+        *agent.image_generation_availability.get_mut().unwrap() =
+            ImageGenerationAvailability::Ready;
+        assert!(
+            agent
+                .engine
+                .get_mut()
+                .registry_mut()
+                .register(Box::new(BrowserScreenshotOnlyTool))
+        );
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "Use the browser website to generate a student image".into(),
+                msg_id: "msg-browser-image-ready-native".into(),
+                source_message_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 0);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::Text(data)
+                if data.content.contains("cannot yet persist and verify")
+                    && data.content.contains("configured native image model")
+        )));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::Error(_))));
+        assert!(!events.iter().any(|event| matches!(event, AgentStreamEvent::ToolCall(_))));
+        assert!(events.iter().any(|event| matches!(event, AgentStreamEvent::Finish(_))));
+    }
+
+    #[tokio::test]
     async fn missing_generated_artifact_emits_error_and_never_normal_finish() {
         let provider = Arc::new(ScriptedProvider::new(vec![
             vec![
@@ -3414,6 +5593,8 @@ mod tests {
             }],
         ]));
         let mut agent = make_agent_with_provider(provider);
+        *agent.image_generation_availability.get_mut().unwrap() =
+            ImageGenerationAvailability::Ready;
         assert!(
             agent
                 .engine
@@ -3434,7 +5615,17 @@ mod tests {
             })
             .await;
 
-        assert!(result.is_err());
+        let send_error = result.unwrap_err();
+        assert_eq!(
+            send_error.code(),
+            Some(AgentErrorCode::UserLlmProviderEmptyResponse)
+        );
+        assert_eq!(
+            send_error.ownership(),
+            Some(AgentErrorOwnership::UserLlmProvider)
+        );
+        assert_eq!(send_error.stream_error().retryable, Some(true));
+        assert_eq!(send_error.stream_error().feedback_recommended, Some(false));
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| matches!(
             event,
@@ -3455,6 +5646,34 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentStreamEvent::TurnCompleted(_)))
         );
+    }
+
+    #[test]
+    fn image_delivery_error_mapping_keeps_host_integrity_failures_internal() {
+        let provider_failure = image_artifact_delivery_error_to_send_error(
+            ImageGenerationIntent::Creation,
+            "image_gen (image artifact) failed artifact delivery: tool returned an error; accepted turn required a verified image artifact, but no matching receipt was committed",
+        );
+        assert_eq!(
+            provider_failure.code(),
+            Some(AgentErrorCode::UserLlmProviderEmptyResponse)
+        );
+        assert_eq!(
+            provider_failure.ownership(),
+            Some(AgentErrorOwnership::UserLlmProvider)
+        );
+        assert_eq!(provider_failure.stream_error().retryable, Some(true));
+        assert_eq!(provider_failure.stream_error().feedback_recommended, Some(false));
+
+        let ledger_failure = image_artifact_delivery_error_to_send_error(
+            ImageGenerationIntent::Creation,
+            "artifact-delivery ledger lock was poisoned",
+        );
+        assert_eq!(
+            ledger_failure.code(),
+            Some(AgentErrorCode::NomifunInternalError)
+        );
+        assert_eq!(ledger_failure.ownership(), Some(AgentErrorOwnership::Nomifun));
     }
 
     #[tokio::test]
@@ -4568,6 +6787,10 @@ mod tests {
                 armed: true,
             };
         }
+        assert!(
+            !rt.is_transport_healthy(),
+            "an abnormal unwind must make the cached manager ineligible for reuse"
+        );
         match rx.try_recv() {
             Ok(AgentStreamEvent::ToolCall(data)) => {
                 assert_eq!(data.call_id, "nomi-guarded-call");

@@ -11,8 +11,39 @@ use sqlx::{Row, SqlitePool};
 
 use crate::error::DbError;
 
+/// The customer-service notes full-text index.
+///
+/// External-content FTS5 over `cs_notes.search_text` (migration 035), the
+/// lexical half of note recall. It is a virtual table, so it carries NONE of
+/// the row-key invariants the product tables below do — see
+/// [`FTS_SHADOW_TABLES`].
+pub(crate) const CS_NOTES_FTS_TABLE: &str = "cs_notes_fts";
+
+/// Shadow tables SQLite materializes for [`CS_NOTES_FTS_TABLE`].
+///
+/// These belong to the v3 baseline table SET (so the registry stays an exact
+/// equality check and a stray table is still caught), but they are EXEMPT from
+/// the per-table structural asserts because their shape is owned by SQLite,
+/// not by this repository: `cs_notes_fts` has no primary key at all, `_config`
+/// keys on `k` and is WITHOUT ROWID, `_data`/`_docsize` declare
+/// `id INTEGER PRIMARY KEY` without AUTOINCREMENT, and `_idx` uses a composite
+/// `(segid, term)` key. Four of the five would fail
+/// [`require_autoincrement_primary_key`]. Same treatment as the companion
+/// store's FTS baseline (`nomifun-companion/src/store.rs:709-717`).
+pub(crate) const FTS_SHADOW_TABLES: &[&str] = &[
+    "cs_notes_fts_config",
+    "cs_notes_fts_data",
+    "cs_notes_fts_docsize",
+    "cs_notes_fts_idx",
+];
+
+/// Every table that is an FTS virtual table or one of its shadow tables.
+#[cfg(test)]
+pub(crate) fn is_fts_table(name: &str) -> bool {
+    name == CS_NOTES_FTS_TABLE || FTS_SHADOW_TABLES.contains(&name)
+}
+
 pub(crate) const PRODUCT_TABLES: &[&str] = &[
-    "acp_session",
     "agent_execution_attempts",
     "agent_execution_events",
     "agent_execution_participants",
@@ -76,9 +107,9 @@ pub(crate) const PRODUCT_TABLES: &[&str] = &[
     "preset_user_state",
     "presets",
     "provider_connections",
+    "provider_model_capabilities",
     "provider_models",
     "providers",
-    "remote_agents",
     "requirement_display_sequence",
     "requirement_pre_effect_abandon_guards",
     "requirement_tags",
@@ -136,7 +167,6 @@ const UUIDV7_BUSINESS_COLUMNS: &[(&str, &str)] = &[
     ("presets", "preset_id"),
     ("provider_connections", "connection_id"),
     ("providers", "provider_id"),
-    ("remote_agents", "remote_agent_id"),
     ("requirements", "requirement_id"),
     ("ssh_hosts", "ssh_host_id"),
     ("terminal_sessions", "terminal_id"),
@@ -155,7 +185,6 @@ const UUIDV7_MANAGED_VALUE_COLUMNS: &[(&str, &str)] = &[("creation_tasks", "node
 /// opaque remote handles rather than relational links. Every other physical
 /// `_id` column must be present in [`LOGICAL_REFERENCES`].
 const NON_REFERENCE_ID_COLUMNS: &[(&str, &str)] = &[
-    ("acp_session", "acp_session_id"),
     ("agent_metadata", "agent_id"),
     ("agent_metadata", "yolo_id"),
     ("agent_execution_attempts", "attempt_id"),
@@ -217,8 +246,6 @@ const NON_REFERENCE_ID_COLUMNS: &[(&str, &str)] = &[
     ("presets", "preset_id"),
     ("provider_connections", "connection_id"),
     ("providers", "provider_id"),
-    ("remote_agents", "remote_agent_id"),
-    ("remote_agents", "device_id"),
     ("requirements", "requirement_id"),
     ("ssh_hosts", "ssh_host_id"),
     ("terminal_sessions", "terminal_id"),
@@ -745,6 +772,7 @@ pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("message_correlations", "message_id" => "messages", "message_id", false, "idx_message_correlations_message_id", KeepHistory)
         .with_aggregate_scope("parent.conversation_id = child.conversation_id"),
     text_ref!("provider_connections", "provider_id" => "providers", "provider_id", false, "idx_provider_connections_provider_id", Cascade),
+    text_ref!("provider_model_capabilities", "provider_id" => "providers", "provider_id", false, "idx_provider_model_capabilities_provider_model", Cascade),
     text_ref!("provider_models", "provider_id" => "providers", "provider_id", false, "idx_provider_models_provider_id", Cascade),
     text_ref!("preset_agent_preferences", "preset_id" => "presets", "preset_id", false, "idx_preset_agent_preferences_preset_id", Cascade),
     text_ref!("preset_agent_preferences", "agent_id" => "agent_metadata", "agent_id", false, "idx_preset_agent_preferences_agent_id", Restrict),
@@ -761,8 +789,6 @@ pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("preset_targets", "preset_id" => "presets", "preset_id", false, "idx_preset_targets_preset_id", Cascade),
     text_ref!("requirement_tags", "paused_requirement_id" => "requirements", "requirement_id", true, "idx_requirement_tags_paused_requirement_id", SetNull),
     text_ref!("tag_settings", "webhook_id" => "webhooks", "webhook_id", true, "idx_tag_settings_webhook_id", SetNull),
-    text_ref!("acp_session", "conversation_id" => "conversations", "conversation_id", false, "idx_acp_session_conversation_id", Cascade),
-    text_ref!("acp_session", "agent_id" => "agent_metadata", "agent_id", true, "idx_acp_session_agent_id", Restrict),
     external_ref!("companion_access_token", "companion_id", Text, false, CanonicalUuidV7, "idx_companion_access_token_companion_id", Cascade),
     text_ref!("installation_identity", "owner_user_id" => "users", "user_id", false, "idx_installation_identity_owner_user_id", Restrict),
     text_ref!("preset_knowledge_policy", "preset_id" => "presets", "preset_id", false, "idx_preset_knowledge_policy_preset_id", Cascade),
@@ -852,13 +878,18 @@ pub(crate) const JSON_LOGICAL_REFERENCES: &[JsonLogicalReference] = &[
     ),
     json_text_ref!(
         "client_preferences", "value", "$.provider_id",
-        "SELECT json_extract(value, '$.provider_id') AS value FROM client_preferences WHERE (key = 'nomi.defaultModel' OR key = 'knowledge.autogenModel' OR key = 'tools.imageGenerationModel' OR key = 'tools.speechToText' OR key = 'tools.textToSpeech' OR key LIKE 'channels.%.defaultModel') AND json_valid(value)" =>
+        "SELECT json_extract(value, '$.provider_id') AS value FROM client_preferences WHERE (key = 'nomi.defaultModel' OR key = 'knowledge.autogenModel' OR key = 'models.default.imageGeneration' OR key = 'tools.speechToText' OR key = 'tools.textToSpeech' OR key LIKE 'channels.%.defaultModel') AND json_valid(value)" =>
         "providers", "provider_id", "idx_client_preferences_provider_key", SetNull, RequireParent
     ),
     json_text_ref!(
-        "conversations", "extra", "$.remote_agent_id",
-        "SELECT json_extract(extra, '$.remote_agent_id') AS value FROM conversations" =>
-        "remote_agents", "remote_agent_id", "idx_conversations_extra_remote_agent_id", Restrict, RequireParent
+        "client_preferences", "value", "$.embedding.provider_id",
+        "SELECT json_extract(value, '$.embedding.provider_id') AS value FROM client_preferences WHERE key = 'knowledge.retrieval' AND json_valid(value) AND json_extract(value, '$.embedding.mode') = 'remote'" =>
+        "providers", "provider_id", "idx_client_preferences_provider_key", SetNull, RequireParent
+    ),
+    json_text_ref!(
+        "client_preferences", "value", "$.rerank.provider_id",
+        "SELECT json_extract(value, '$.rerank.provider_id') AS value FROM client_preferences WHERE key = 'knowledge.retrieval' AND json_valid(value) AND json_extract(value, '$.rerank.mode') = 'remote'" =>
+        "providers", "provider_id", "idx_client_preferences_provider_key", SetNull, RequireParent
     ),
     json_text_ref!(
         "conversations", "extra", "$.ssh_host_id",
@@ -910,7 +941,15 @@ pub async fn validate_id_schema_contract(pool: &SqlitePool) -> Result<(), DbErro
     .await?
     .into_iter()
     .collect();
-    let expected_tables: BTreeSet<String> = PRODUCT_TABLES.iter().map(|value| (*value).to_owned()).collect();
+    // The FTS virtual table and its shadow tables belong to the baseline SET
+    // (so an unexpected table is still caught) but not to the structural loop
+    // below — SQLite owns their shape. See `FTS_SHADOW_TABLES`.
+    let expected_tables: BTreeSet<String> = PRODUCT_TABLES
+        .iter()
+        .chain(std::iter::once(&CS_NOTES_FTS_TABLE))
+        .chain(FTS_SHADOW_TABLES.iter())
+        .map(|value| (*value).to_owned())
+        .collect();
     if actual_tables != expected_tables {
         let missing = expected_tables.difference(&actual_tables).cloned().collect::<Vec<_>>();
         let extra = actual_tables.difference(&expected_tables).cloned().collect::<Vec<_>>();
@@ -922,6 +961,7 @@ pub async fn validate_id_schema_contract(pool: &SqlitePool) -> Result<(), DbErro
     for table in PRODUCT_TABLES {
         require_autoincrement_primary_key(pool, table).await?;
     }
+    validate_cs_notes_fts_contract(pool).await?;
     validate_no_physical_foreign_keys(pool).await?;
     validate_no_triggers(pool).await?;
     validate_no_row_id_columns(pool).await?;
@@ -983,6 +1023,28 @@ pub async fn validate_id_schema_contract(pool: &SqlitePool) -> Result<(), DbErro
         return Err(DbError::Init(
             "v3 schema channel_plugins.owner_domain must default to 'companion'".to_owned(),
         ));
+    }
+
+    // Group-chat authorization metadata (migration 033) defaults to the
+    // backward-compatible, least-privilege interpretation for each row type.
+    for (table, column, expected_default) in [
+        ("channel_plugins", "group_access_mode", "'allowlist'"),
+        ("channel_users", "authorization_kind", "'approved'"),
+        ("channel_sessions", "chat_kind", "'unknown'"),
+    ] {
+        require_column(pool, table, column, "TEXT", true).await?;
+        let column_default: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT dflt_value FROM pragma_table_info('{table}') WHERE name = ?"
+        ))
+        .bind(column)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+        if column_default.as_deref() != Some(expected_default) {
+            return Err(DbError::Init(format!(
+                "v3 schema {table}.{column} must default to {expected_default}"
+            )));
+        }
     }
 
     validate_logical_reference_registry(pool).await?;
@@ -1210,6 +1272,38 @@ async fn require_autoincrement_primary_key(pool: &SqlitePool, table: &str) -> Re
         return Err(DbError::Init(format!(
             "v3 schema table {table} must declare id INTEGER PRIMARY KEY AUTOINCREMENT"
         )));
+    }
+    Ok(())
+}
+
+/// Assert the customer-service notes FTS index still has the definition note
+/// recall depends on.
+///
+/// Every fragment here is load-bearing, and a silent edit degrades recall
+/// rather than failing loudly, which is why this is a boot assertion:
+/// - `content='cs_notes'` / `content_rowid='id'` make it external-content, so
+///   `cs_notes` stays the single source of truth for note text. Dropping them
+///   turns the index into a second, silently diverging copy.
+/// - `tokenize='trigram'` is what allows substring and CJK matching at all.
+///   Falling back to the default unicode61 tokenizer would break every
+///   Chinese query, since it splits on whitespace that Chinese does not use.
+async fn validate_cs_notes_fts_contract(pool: &SqlitePool) -> Result<(), DbError> {
+    let create_sql: Option<String> =
+        sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+            .bind(CS_NOTES_FTS_TABLE)
+            .fetch_optional(pool)
+            .await?;
+    let create_sql = create_sql.ok_or_else(|| {
+        DbError::Init(format!("v3 schema is missing the FTS index table {CS_NOTES_FTS_TABLE}"))
+    })?;
+    // Collapse whitespace so the check is insensitive to DDL formatting.
+    let normalized = create_sql.split_whitespace().collect::<Vec<_>>().join("").to_ascii_lowercase();
+    for fragment in ["usingfts5", "content='cs_notes'", "content_rowid='id'", "tokenize='trigram'"] {
+        if !normalized.contains(fragment) {
+            return Err(DbError::Init(format!(
+                "v3 schema {CS_NOTES_FTS_TABLE} is missing the required definition fragment {fragment}"
+            )));
+        }
     }
     Ok(())
 }
@@ -2728,8 +2822,8 @@ mod tests {
         let provider_id = nomifun_common::ProviderId::new();
         sqlx::query(
             "INSERT INTO providers \
-             (provider_id, platform, name, base_url, api_key_encrypted, created_at, updated_at) \
-             VALUES (?, 'contract', 'Creation audit provider', 'https://example.invalid', '', 1, 1)",
+             (provider_id, platform, name, base_url, auth_scheme, credentials_encrypted, created_at, updated_at) \
+             VALUES (?, 'contract', 'Creation audit provider', 'https://example.invalid', 'bearer', '', 1, 1)",
         )
         .bind(provider_id.as_str())
         .execute(pool)

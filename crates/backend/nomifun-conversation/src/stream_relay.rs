@@ -8,14 +8,13 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use nomifun_ai_agent::{
     AgentSendError, AgentStreamEvent,
-    artifact_store::ArtifactStore,
+    artifact_store::{
+        ArtifactRecoveryEnvelope, ArtifactRecoveryOwner, ArtifactRecoverySource,
+        ArtifactRecoveryState, ArtifactStore, PersistedArtifact,
+    },
     protocol::events::{
         FinishEventData, PlanEventData, TextEventData, ThinkingEventData, TurnStopReason,
-        tool_call::{
-            AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallEventData,
-            ToolCallStatus, validate_artifact_receipt_integrity,
-            validate_completed_artifact_contract,
-        },
+        tool_call::{ToolCallEventData, ToolCallStatus, validate_completed_artifact_contract},
     },
 };
 
@@ -44,6 +43,43 @@ const ARTIFACT_DELIVERY_COMMITTED_FIELD: &str = "artifact_delivery_committed";
 const ARTIFACT_DELIVERY_PENDING_OUTPUT: &str =
     "Artifact delivery is pending final turn validation";
 
+/// A relay owns the producer-side in-process leases for its exact wire until
+/// every terminal path (including task cancellation/drop) exits. Dropping the
+/// guard only relinquishes the lease: the durable journal remains the sole
+/// recovery owner and the next relay must still acquire and reconcile it.
+struct ArtifactRecoveryLeaseHandoff {
+    store: Option<ArtifactStore>,
+    source: ArtifactRecoverySource,
+}
+
+impl ArtifactRecoveryLeaseHandoff {
+    fn new(workspace: Option<&PathBuf>, conversation_id: &str, wire_msg_id: &str) -> Self {
+        Self {
+            store: workspace.map(ArtifactStore::new),
+            source: ArtifactRecoverySource {
+                conversation_id: conversation_id.to_owned(),
+                wire_msg_id: wire_msg_id.to_owned(),
+            },
+        }
+    }
+}
+
+impl Drop for ArtifactRecoveryLeaseHandoff {
+    fn drop(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.release_recovery_leases_for_source(&self.source) {
+            warn!(
+                error = %error,
+                conversation_id = self.source.conversation_id,
+                wire_msg_id = self.source.wire_msg_id,
+                "Could not hand artifact recovery leases to the next relay"
+            );
+        }
+    }
+}
+
 fn track_bounded<V>(map: &mut HashMap<String, V>, key: String, value: V, kind: &'static str) -> bool {
     if map.contains_key(&key) || map.len() < MAX_TERMINAL_ACTIVE_ITEMS {
         map.insert(key, value);
@@ -62,149 +98,6 @@ fn remember_bounded(set: &mut HashSet<String>, value: String, kind: &'static str
         warn!(kind, max = MAX_TERMINAL_ACTIVE_ITEMS, "Relay terminal deduplication limit reached");
         false
     }
-}
-
-/// Apply the normalized ToolCall artifact contract to an externally-produced
-/// ACP update. Only locally verified `Artifact` receipts count; a remote
-/// ResourceLink is a locator, not proof that a requested image/export exists.
-fn validate_completed_acp_artifact_contract(
-    data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-) -> Result<(), String> {
-    if data.update.status != Some(AcpToolCallStatus::Completed) {
-        return Ok(());
-    }
-    let artifacts = data
-        .update
-        .content
-        .iter()
-        .flatten()
-        .filter_map(|item| match item {
-            nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact {
-                artifact,
-                ..
-            } => Some(artifact.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    validate_artifact_receipt_integrity("ACP artifact delivery", &artifacts)
-        .map_err(|error| format!("ACP {error}"))?;
-    const IDENTITY_KEYS: &[&str] = &[
-        "tool",
-        "tool_name",
-        "toolName",
-        "name",
-        "operation",
-        "operation_name",
-        "operationName",
-    ];
-    let mut identities = data.update.title.iter().map(String::as_str).collect::<Vec<_>>();
-    for value in [&data.update.raw_input, &data.update.raw_output]
-        .into_iter()
-        .filter_map(Option::as_ref)
-    {
-        let Some(object) = value.as_object() else {
-            continue;
-        };
-        identities.extend(
-            IDENTITY_KEYS
-                .iter()
-                .filter_map(|key| object.get(*key).and_then(Value::as_str)),
-        );
-    }
-    identities.sort_unstable();
-    identities.dedup();
-
-    for name in identities {
-        validate_completed_artifact_contract(&ToolCallEventData {
-            call_id: data.update.tool_call_id.clone(),
-            name: name.to_owned(),
-            args: data.update.raw_input.clone().unwrap_or(Value::Null),
-            status: ToolCallStatus::Completed,
-            input: None,
-            output: None,
-            description: None,
-            artifacts: artifacts.clone(),
-            retry: None,
-        })
-        .map_err(|error| format!("ACP {error}"))?;
-    }
-    Ok(())
-}
-
-/// Materialize a provider's sparse ACP update against the latest lifecycle
-/// snapshot before validating or persisting it. ACP `ToolCallUpdate` fields are
-/// optional and prompt-boundary completion synthesis intentionally carries only
-/// the call id, terminal status and verified receipts. Committing that sparse
-/// frame directly would discard the tool identity/input that established the
-/// artifact contract.
-fn effective_acp_tool_call_projection(
-    active: Option<&nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData>,
-    incoming: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-) -> nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData {
-    let Some(active) = active else {
-        return incoming.clone();
-    };
-    let mut effective = incoming.clone();
-    if effective.session_id.trim().is_empty() {
-        effective.session_id.clone_from(&active.session_id);
-    }
-    if effective.update.status.is_none() {
-        effective.update.status = active.update.status;
-    }
-    if effective.update.title.is_none() {
-        effective.update.title.clone_from(&active.update.title);
-    }
-    if effective.update.kind.is_none() {
-        effective.update.kind = active.update.kind;
-    }
-    if effective.update.raw_input.is_none() {
-        effective.update.raw_input.clone_from(&active.update.raw_input);
-    }
-    if effective.update.raw_output.is_none() {
-        effective.update.raw_output.clone_from(&active.update.raw_output);
-    }
-    if effective.update.content.is_none() {
-        effective.update.content.clone_from(&active.update.content);
-    } else if effective.update.status == Some(AcpToolCallStatus::Completed) {
-        // A synthesized completion carries an authoritative delivery receipt
-        // list but no narration/diff/terminal blocks. Retain those non-delivery
-        // blocks from the active snapshot while replacing (rather than
-        // duplicating) provisional artifact/resource locators.
-        let mut merged = active
-            .update
-            .content
-            .iter()
-            .flatten()
-            .filter(|item| {
-                !matches!(
-                    item,
-                    nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                        | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut seen = merged
-            .iter()
-            .filter_map(|item| serde_json::to_string(item).ok())
-            .collect::<HashSet<_>>();
-        for item in incoming.update.content.iter().flatten() {
-            let duplicate = serde_json::to_string(item)
-                .ok()
-                .is_some_and(|encoded| !seen.insert(encoded));
-            if !duplicate {
-                merged.push(item.clone());
-            }
-        }
-        effective.update.content = Some(merged);
-    }
-    if effective.update.locations.is_none() {
-        effective.update.locations.clone_from(&active.update.locations);
-    }
-    if effective.meta.is_none() {
-        effective.meta.clone_from(&active.meta);
-    }
-    effective
 }
 
 /// ToolGroup is a legacy summary event and has no artifact receipt field. A
@@ -289,7 +182,7 @@ pub struct RelayOutcome {
     pub stop_reason: Option<TurnStopReason>,
     /// Phase 3 (plan D4): whether this turn emitted **any** externally-visible
     /// response before terminating — assistant `Text` OR a forwarded/persisted
-    /// tool action (ToolCall / AcpToolCall / ToolGroup / persisted Thinking).
+    /// tool action (ToolCall / ToolGroup / persisted Thinking).
     /// The failover seam only switches models pre-response (`!emitted_response`)
     /// so a fault AFTER any visible output is never failed over — that would
     /// duplicate already-streamed text OR re-run a tool side effect (and re-bill).
@@ -309,6 +202,10 @@ pub struct RelayOutcome {
     /// post-processing UI state. This may differ from the turn's primary msg_id
     /// when the turn starts with thinking/tool output before final text.
     pub final_text_msg_id: Option<String>,
+    /// Number of locally verified artifacts whose complete turn batch crossed
+    /// the durable repository commit barrier. Provisional receipts and
+    /// partially/ambiguously committed batches never increment this value.
+    pub committed_artifact_count: usize,
 }
 
 fn turn_writeback_status_label(status: nomifun_knowledge::TurnWritebackStatus) -> &'static str {
@@ -1678,6 +1575,48 @@ pub enum RelayTerminal {
     ChannelClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactCommitReconciliation {
+    AllDurable,
+    DefinitelyNotCommitted,
+    Indeterminate,
+}
+
+#[derive(Debug)]
+struct ArtifactCommitFailure {
+    error: DbError,
+    rollback_safe: bool,
+    commit_state: &'static str,
+}
+
+impl ArtifactCommitFailure {
+    fn before_commit(error: DbError) -> Self {
+        Self {
+            error,
+            rollback_safe: true,
+            commit_state: "not_started",
+        }
+    }
+
+    fn after_reconciliation(
+        error: DbError,
+        reconciliation: ArtifactCommitReconciliation,
+    ) -> Self {
+        let (rollback_safe, commit_state) = match reconciliation {
+            ArtifactCommitReconciliation::DefinitelyNotCommitted => (true, "not_committed"),
+            ArtifactCommitReconciliation::Indeterminate => (false, "indeterminate"),
+            ArtifactCommitReconciliation::AllDurable => {
+                unreachable!("an all-durable artifact commit is successful")
+            }
+        };
+        Self {
+            error,
+            rollback_safe,
+            commit_state,
+        }
+    }
+}
+
 impl RelayTerminal {
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error { .. })
@@ -1707,6 +1646,10 @@ pub struct StreamRelay {
     /// Stable identity of the user-visible logical turn. This remains fixed
     /// across model failover and system continuations.
     root_turn_id: String,
+    /// Set only after the structural root row is known durable. The service
+    /// may run the public preflight before starting billable agent work; the
+    /// relay repeats the check defensively when callers omit that preflight.
+    turn_root_ready: AtomicBool,
     /// Identity of the current provider wire segment within `root_turn_id`.
     ///
     /// This is only a transport/stream identity. Durable child messages and
@@ -1723,6 +1666,8 @@ pub struct StreamRelay {
     /// finalize -> exact release -> event fence.
     #[cfg(test)]
     complete_turn: bool,
+    #[cfg(test)]
+    allow_legacy_unjournaled_artifacts: bool,
     /// Companion-companion wire markers (from `conversation.extra.companion_session` /
     /// `.companion_id`), stamped onto every `message.stream` / `turn.completed`
     /// payload so the companion collector can classify the turn off the wire.
@@ -1835,6 +1780,7 @@ impl StreamRelay {
         Self {
             conversation_id,
             root_turn_id,
+            turn_root_ready: AtomicBool::new(false),
             msg_id,
             user_id,
             repo,
@@ -1842,6 +1788,8 @@ impl StreamRelay {
             cron_service,
             #[cfg(test)]
             complete_turn: false,
+            #[cfg(test)]
+            allow_legacy_unjournaled_artifacts: false,
             companion: false,
             companion_id: None,
             origin: None,
@@ -1861,9 +1809,153 @@ impl StreamRelay {
         self
     }
 
+    #[cfg(test)]
+    fn with_test_legacy_unjournaled_artifacts(mut self) -> Self {
+        self.allow_legacy_unjournaled_artifacts = true;
+        self
+    }
+
     pub fn with_root_turn_id(mut self, turn_id: impl Into<String>) -> Self {
         self.root_turn_id = turn_id.into();
+        self.turn_root_ready.store(false, Ordering::Release);
         self
+    }
+
+    /// Persist the hidden structural owner of every root-scoped child row.
+    ///
+    /// Call this before starting provider work. SQLite enforces that any
+    /// `msg_id` which differs from a child's `message_id` already exists, so a
+    /// tool/status/artifact event cannot safely race the first visible text
+    /// segment. The root is deliberately hidden and terminal-looking: it is an
+    /// immutable relationship anchor, not a user-visible lifecycle message.
+    ///
+    /// This method is idempotent for the same relay and reconciles a concurrent
+    /// insert. It also accepts a pre-upgrade turn whose first visible text or
+    /// thinking row already owns the root id; new turns never create that
+    /// representation.
+    pub async fn ensure_turn_root_persisted(&self) -> Result<(), DbError> {
+        if self.turn_root_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let expected = MessageRow {
+            id: 0,
+            message_id: self.root_turn_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            msg_id: Some(self.root_turn_id.clone()),
+            r#type: "turn_root".to_owned(),
+            content: json!({ "kind": "turn_root" }).to_string(),
+            position: Some("center".to_owned()),
+            status: Some("finish".to_owned()),
+            hidden: true,
+            created_at: now_ms(),
+        };
+
+        let insert_error = match self.repo.insert_message(&expected).await {
+            Ok(()) => {
+                self.turn_root_ready.store(true, Ordering::Release);
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+
+        match self
+            .repo
+            .get_message(&self.conversation_id, &self.root_turn_id)
+            .await
+        {
+            Ok(Some(existing)) if self.is_compatible_turn_root(&existing) => {
+                self.turn_root_ready.store(true, Ordering::Release);
+                Ok(())
+            }
+            Ok(Some(existing)) => Err(DbError::Conflict(format!(
+                "logical turn root '{}' conflicts with an existing {} message owned by {:?}",
+                self.root_turn_id, existing.r#type, existing.msg_id
+            ))),
+            Ok(None) => Err(insert_error),
+            Err(reconcile_error) => Err(DbError::Conflict(format!(
+                "logical turn root '{}' insert failed ({insert_error}) and its durable state could not be reconciled ({reconcile_error})",
+                self.root_turn_id
+            ))),
+        }
+    }
+
+    /// Convert a failed pre-send root preflight directly into the relay's
+    /// terminal contract. This deliberately does not retry the database and
+    /// does not wait on an agent receiver: provider work has not started, and
+    /// no child row may be persisted without its structural owner.
+    pub fn into_turn_root_failure_outcome(self, root_error: DbError) -> RelayOutcome {
+        error!(
+            error = %ErrorChain(&root_error),
+            conversation_id = %self.conversation_id,
+            root_turn_id = %self.root_turn_id,
+            "Refusing to start or consume an agent stream without a durable logical turn root"
+        );
+        let event = AgentStreamEvent::Error(
+            nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                "The assistant turn could not be initialized in conversation history",
+                Some(AgentErrorCode::NomifunStateInconsistent),
+            ),
+        );
+        let terminal = Self::terminal_from_event(&event);
+        let terminal_claimed = self
+            .cancellation
+            .as_ref()
+            .map(AgentTurnCancellation::try_claim_terminal_surface)
+            .unwrap_or(true);
+        if terminal_claimed {
+            self.forward_terminal_without_projection(&self.msg_id, &event);
+            if let Some(cancellation) = self.cancellation.as_ref() {
+                cancellation.mark_terminal_observed();
+            }
+        }
+        RelayOutcome {
+            terminal,
+            ..RelayOutcome::default()
+        }
+    }
+
+    fn is_compatible_turn_root(&self, row: &MessageRow) -> bool {
+        if row.message_id != self.root_turn_id
+            || row.conversation_id != self.conversation_id
+            || row.msg_id.as_deref() != Some(self.root_turn_id.as_str())
+        {
+            return false;
+        }
+
+        let content = serde_json::from_str::<Value>(&row.content).ok();
+        let canonical = matches!(row.r#type.as_str(), "turn_root" | "system")
+            && row.position.as_deref() == Some("center")
+            && row.status.as_deref() == Some("finish")
+            && row.hidden
+            && content
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str)
+                == Some("turn_root");
+        if canonical {
+            return true;
+        }
+
+        // Before structural roots existed, the first visible segment reused
+        // the logical root id. Accept only the two representations the old
+        // relay could create, with their exact assistant-side ownership.
+        if row.position.as_deref() != Some("left") {
+            return false;
+        }
+        match (row.r#type.as_str(), content.as_ref()) {
+            ("text", Some(content)) => {
+                content.get("turn_id").and_then(Value::as_str)
+                    == Some(self.root_turn_id.as_str())
+                    && content.get("content").is_some_and(Value::is_string)
+            }
+            ("thinking", Some(content)) => {
+                !row.hidden
+                    && content.get("content").is_some_and(Value::is_string)
+                    && content.get("status").and_then(Value::as_str) == Some("done")
+            }
+            _ => false,
+        }
     }
 
     /// Wire the process-wide runtime state so this relay accumulates each turn's
@@ -1884,6 +1976,17 @@ impl StreamRelay {
     pub fn with_artifact_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
         self.artifact_workspace = Some(workspace.into());
         self
+    }
+
+    fn allows_legacy_unjournaled_artifacts(&self) -> bool {
+        #[cfg(test)]
+        {
+            return self.allow_legacy_unjournaled_artifacts;
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Wire the pre-response failover error-suppressor (review #1/#5). When the
@@ -1968,13 +2071,23 @@ impl StreamRelay {
         if !cancellation.try_claim_terminal_surface() {
             return false;
         }
+        if let Err(error) = self.ensure_turn_root_persisted().await {
+            error!(
+                error = %ErrorChain(&error),
+                conversation_id = %self.conversation_id,
+                root_turn_id = %self.root_turn_id,
+                "Could not persist the logical turn root before surfacing a terminal error"
+            );
+            cancellation.mark_terminal_observed();
+            return false;
+        }
         if cancellation.is_cancelled() {
-            self.forward_to_websocket(&Self::cancelled_finish_event());
+            self.forward_terminal_without_projection(&self.msg_id, &Self::cancelled_finish_event());
             cancellation.mark_terminal_observed();
             return false;
         }
         let error_message_id = ConversationService::mint_msg_id();
-        self.forward_to_websocket_with_msg_id(&error_message_id, event);
+        self.forward_terminal_without_projection(&error_message_id, event);
         // This projection belongs to the still-authoritative turn owner.  Do
         // not detach or time out the insert: cancelling an in-flight database
         // future can make its commit result ambiguous and lets a later turn
@@ -2009,6 +2122,15 @@ impl StreamRelay {
     ) -> RelayOutcome {
         let started_at = now_ms();
         info!("StreamRelay started");
+        if let Err(root_error) = self.ensure_turn_root_persisted().await {
+            return self.into_turn_root_failure_outcome(root_error);
+        }
+        let _artifact_recovery_lease_handoff = ArtifactRecoveryLeaseHandoff::new(
+            self.artifact_workspace.as_ref(),
+            self.conv_id(),
+            &self.msg_id,
+        );
+        self.reconcile_pending_artifact_recovery_journal().await;
 
         let mut full_text_buffer = String::new();
         // Robot threads only (see `robot_session`): withholds at most one
@@ -2021,23 +2143,12 @@ impl StreamRelay {
         let mut completed_artifact_tool_calls: HashMap<String, ToolCallEventData> = HashMap::new();
         let mut terminal_tool_calls: HashSet<String> = HashSet::new();
         let mut failed_terminal_tool_calls: HashSet<String> = HashSet::new();
-        let mut active_acp_tool_calls: HashMap<
-            String,
-            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        > = HashMap::new();
-        let mut completed_artifact_acp_tool_calls: HashMap<
-            String,
-            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        > = HashMap::new();
-        let mut terminal_acp_tool_calls: HashSet<String> = HashSet::new();
-        let mut failed_terminal_acp_tool_calls: HashSet<String> = HashSet::new();
         let mut active_tool_groups: HashMap<
             String,
             Vec<nomifun_ai_agent::protocol::events::tool_call::ToolGroupEntry>,
         > = HashMap::new();
         let mut active_plan_ids: HashSet<String> = HashSet::new();
         let mut active_agent_status: Option<nomifun_ai_agent::protocol::events::AgentStatusEventData> = None;
-        let mut used_primary_segment_msg_id = false;
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
         let mut fatal_tracking_error: Option<String> = None;
@@ -2047,6 +2158,7 @@ impl StreamRelay {
         // switching to faults that produced NO visible output (no duplicate
         // text, no duplicate tool side effect / billing).
         let mut emitted_response = false;
+        let mut committed_artifact_count = 0usize;
         let mut send_error_done = send_error_rx.is_none();
 
         loop {
@@ -2227,7 +2339,7 @@ impl StreamRelay {
                             }
 
                             let segment = active_thinking.get_or_insert_with(|| ThinkingSegmentState {
-                                id: Self::mint_segment_msg_id(&mut used_primary_segment_msg_id, &self.msg_id),
+                                id: ConversationService::mint_msg_id(),
                                 buffer: String::new(),
                                 started_at: now_ms(),
                                 completed_duration_ms: None,
@@ -2255,7 +2367,7 @@ impl StreamRelay {
                             }
 
                             let segment = active_text.get_or_insert_with(|| TextSegmentState {
-                                id: Self::mint_segment_msg_id(&mut used_primary_segment_msg_id, &self.msg_id),
+                                id: ConversationService::mint_msg_id(),
                                 buffer: String::new(),
                                 created_at: now_ms(),
                                 record_created: false,
@@ -2315,6 +2427,33 @@ impl StreamRelay {
                                     suppress_error = false;
                                 }
                             }
+                            if let Err(recovery_error) = self
+                                .merge_prepared_generic_artifact_recoveries(
+                                    &mut completed_artifact_tool_calls,
+                                )
+                                .await
+                            {
+                                error!(
+                                    error = %ErrorChain(&recovery_error),
+                                    "Artifact terminal could not reconstruct its durable recovery envelope"
+                                );
+                                event = AgentStreamEvent::Error(
+                                    nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                                        "The generated artifacts could not be recovered from the event stream",
+                                        Some(AgentErrorCode::NomifunStateInconsistent),
+                                    ),
+                                );
+                                terminal = Self::terminal_from_event(&event);
+                                suppress_error = false;
+                            }
+                            // Physical artifact snapshots are provisional until
+                            // the exact terminal projection is durable. A normal
+                            // unsuccessful terminal has never attempted the
+                            // artifact transaction, so ownership is unambiguous
+                            // and those store-owned snapshots may be rolled back.
+                            let mut rollback_completed_artifact_receipts =
+                                Self::invalidates_completed_artifacts(&event);
+                            let mut preserve_indeterminate_artifact_rows = false;
 
                             // Visible assistant-segment durability is a
                             // prerequisite for committing successful artifact
@@ -2365,12 +2504,12 @@ impl StreamRelay {
                                 event = Self::assistant_segment_persistence_error_event();
                                 terminal = Self::terminal_from_event(&event);
                                 suppress_error = false;
+                                rollback_completed_artifact_receipts = true;
                             }
 
                             if terminal_claimed
                                 && !Self::invalidates_completed_artifacts(&event)
-                                && (!completed_artifact_tool_calls.is_empty()
-                                    || !completed_artifact_acp_tool_calls.is_empty())
+                                && !completed_artifact_tool_calls.is_empty()
                             {
                                 // The transaction commit is a terminal
                                 // linearization point.  Timing out COMMIT would
@@ -2378,14 +2517,12 @@ impl StreamRelay {
                                 // projection race the next turn, so keep the
                                 // current turn admission until it returns.
                                 let commit_result = self
-                                    .commit_pending_artifact_deliveries(
-                                        &completed_artifact_tool_calls,
-                                        &completed_artifact_acp_tool_calls,
-                                    )
+                                    .commit_pending_artifact_deliveries(&completed_artifact_tool_calls)
                                     .await;
 
                                 match commit_result {
-                                    Ok(()) => {
+                                    Ok(durable_artifact_count) => {
+                                        committed_artifact_count = durable_artifact_count;
                                         // The transaction is now the linearization
                                         // point for artifact success. Publish every
                                         // receipt-bearing Completed frame only after
@@ -2393,17 +2530,26 @@ impl StreamRelay {
                                         self.broadcast_committed_artifact_tool_calls(
                                             &completed_artifact_tool_calls,
                                         );
-                                        self.broadcast_committed_artifact_acp_tool_calls(
-                                            &completed_artifact_acp_tool_calls,
+                                        self.finalize_generic_artifact_recovery(
+                                            &completed_artifact_tool_calls,
                                         );
                                         completed_artifact_tool_calls.clear();
-                                        completed_artifact_acp_tool_calls.clear();
                                     }
-                                    Err(commit_error) => {
+                                    Err(commit_failure) => {
                                         error!(
-                                            error = %ErrorChain(&commit_error),
+                                            error = %ErrorChain(&commit_failure.error),
+                                            commit_state = commit_failure.commit_state,
+                                            rollback_safe = commit_failure.rollback_safe,
                                             "Atomic artifact projection failed; rejecting turn success"
                                         );
+                                        rollback_completed_artifact_receipts =
+                                            commit_failure.rollback_safe;
+                                        if !commit_failure.rollback_safe {
+                                            preserve_indeterminate_artifact_rows = true;
+                                            self.mark_generic_artifact_recovery_needs_reconcile(
+                                                &completed_artifact_tool_calls,
+                                            );
+                                        }
                                         event = AgentStreamEvent::Error(
                                             nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
                                                 "The generated artifacts could not be committed to conversation history",
@@ -2462,29 +2608,25 @@ impl StreamRelay {
                             // consumers with an earlier green receipt.
                             let invalidates_artifacts =
                                 !suppress_error && Self::invalidates_completed_artifacts(&event);
-                            let (failed_completed_tools, failed_completed_acp_tools) =
-                                if invalidates_artifacts {
-                                    let reason = Self::incomplete_tool_reason(&event)
-                                        .unwrap_or("incomplete_turn");
-                                    let tools = Self::take_failed_tool_calls(
-                                        &mut completed_artifact_tool_calls,
-                                        reason,
-                                    );
-                                    let acp_tools = Self::take_failed_acp_tool_calls(
-                                        &mut completed_artifact_acp_tool_calls,
-                                        reason,
-                                    );
-                                    self.broadcast_failed_tool_calls(&tools);
-                                    self.broadcast_failed_acp_tool_calls(&acp_tools);
-                                    (tools, acp_tools)
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
+                            if invalidates_artifacts && rollback_completed_artifact_receipts {
+                                self.rollback_completed_artifact_receipts(&completed_artifact_tool_calls);
+                            }
+                            let failed_completed_tools = if invalidates_artifacts {
+                                let reason =
+                                    Self::incomplete_tool_reason(&event).unwrap_or("incomplete_turn");
+                                let tools = Self::take_failed_tool_calls(
+                                    &mut completed_artifact_tool_calls,
+                                    reason,
+                                );
+                                self.broadcast_failed_tool_calls(&tools);
+                                tools
+                            } else {
+                                Vec::new()
+                            };
 
-                            let _ = tokio::join!(
-                                self.persist_failed_tool_calls(&failed_completed_tools),
-                                self.persist_failed_acp_tool_calls(&failed_completed_acp_tools),
-                            );
+                            if !preserve_indeterminate_artifact_rows {
+                                self.persist_failed_tool_calls(&failed_completed_tools).await;
+                            }
                             // review #1/#5: a pre-response provider-fault that the
                             // send loop will fail over must NOT reach the user —
                             // suppress the WS error event AND the error `tips` row
@@ -2503,7 +2645,6 @@ impl StreamRelay {
                                     // keeps already verified completed artifacts, while still
                                     // closing genuinely Running tools below.
                                     self.fail_active_tool_calls(&mut active_tool_calls, reason).await;
-                                    self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, reason).await;
                                     self.fail_active_tool_groups(&mut active_tool_groups, reason).await;
                                 }
                             }
@@ -2527,6 +2668,7 @@ impl StreamRelay {
                                     emitted_response,
                                     suppress_error,
                                     &terminal_message_id,
+                                    committed_artifact_count,
                                 )
                                 .await;
                             // Publish the terminal only after all lifecycle
@@ -2534,7 +2676,27 @@ impl StreamRelay {
                             // Error/Finish, so a receipt retraction sent after it
                             // would leave stale success visible.
                             if terminal_claimed {
-                                self.forward_to_websocket_with_msg_id(&terminal_message_id, &event);
+                                if Self::is_cancelled_finish(&event)
+                                    || matches!(event, AgentStreamEvent::Error(_))
+                                {
+                                    // A cancelled or failed terminal preserves
+                                    // the raw/error rows, but it does not prove
+                                    // that the normal final-text middleware
+                                    // projection ran. In particular, never let
+                                    // a partial Error response advertise
+                                    // authority and suppress a future legacy
+                                    // compatibility path.
+                                    self.forward_terminal_without_projection(
+                                        &terminal_message_id,
+                                        &event,
+                                    );
+                                } else {
+                                    self.forward_terminal_to_websocket(
+                                        &terminal_message_id,
+                                        &event,
+                                        outcome.final_text_msg_id.as_deref(),
+                                    );
+                                }
                             }
                             outcome
                             };
@@ -2711,15 +2873,18 @@ impl StreamRelay {
                                 )
                                 .await;
                             if has_artifact_delivery {
-                                let identity_ready = matches!(
-                                    self.ordered_event_side_effect(
-                                        "claim_artifact_tool_identity",
-                                        self.try_derived_message_id("tool_call", &data.call_id),
+                                let ownership_ready = self
+                                    .ordered_event_side_effect(
+                                        "claim_artifact_tool_recovery",
+                                        self.claim_generic_artifact_recovery(data),
                                     )
-                                    .await,
-                                    Ok(_)
-                                );
-                                if !identity_ready {
+                                    .await;
+                                if let Err(error) = ownership_ready {
+                                    error!(
+                                        call_id = %data.call_id,
+                                        error = %ErrorChain(&error),
+                                        "Artifact delivery could not transfer its recovery journal"
+                                    );
                                     completed_artifact_tool_calls.remove(&data.call_id);
                                     let mut failed = data.clone();
                                     failed.status = ToolCallStatus::Error;
@@ -2730,7 +2895,7 @@ impl StreamRelay {
                                     );
                                     self.forward_to_websocket(&AgentStreamEvent::ToolCall(failed));
                                     fatal_tracking_error = Some(
-                                        "Artifact delivery could not be projected durably; the turn was terminated"
+                                        "Artifact delivery could not claim durable recovery ownership; the turn was terminated"
                                             .to_owned(),
                                     );
                                     continue;
@@ -2755,240 +2920,6 @@ impl StreamRelay {
                                     .ordered_event_side_effect(
                                         "persist_tool_call",
                                         self.persist_tool_call(data),
-                                    )
-                                    .await;
-                            }
-                        }
-                        AgentStreamEvent::AcpToolCall(data) => {
-                            // Plan D4: see ToolCall — an ACP tool call is a
-                            // visible, side-effecting action; block failover.
-                            emitted_response = true;
-                            let tool_call_id = data.update.tool_call_id.clone();
-                            let effective_data = effective_acp_tool_call_projection(
-                                active_acp_tool_calls.get(&tool_call_id),
-                                data,
-                            );
-                            let has_artifact_delivery = effective_data
-                                .update
-                                .content
-                                .as_ref()
-                                .is_some_and(|items| {
-                                    items.iter().any(|item| {
-                                        matches!(
-                                            item,
-                                            nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                                                | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                                        )
-                                    })
-                                });
-                            let artifact_contract_error = if effective_data.update.status
-                                == Some(AcpToolCallStatus::Completed)
-                            {
-                                validate_completed_acp_artifact_contract(&effective_data).err()
-                            } else {
-                                None
-                            };
-                            let mut tracking_overflow = false;
-                            match effective_data.update.status {
-                                Some(AcpToolCallStatus::Completed | AcpToolCallStatus::Failed) => {
-                                    if terminal_acp_tool_calls.contains(&tool_call_id) {
-                                        if effective_data.update.status == Some(AcpToolCallStatus::Failed)
-                                            && !failed_terminal_acp_tool_calls.contains(&tool_call_id)
-                                        {
-                                            tracking_overflow |= !remember_bounded(
-                                                &mut failed_terminal_acp_tool_calls,
-                                                tool_call_id.clone(),
-                                                "failed_terminal_acp_tool_call",
-                                            );
-                                        } else {
-                                            warn!(
-                                                tool_call_id,
-                                                status = ?effective_data.update.status,
-                                                "Ignoring duplicate or non-failing terminal ACP tool event"
-                                            );
-                                            continue;
-                                        }
-                                    } else {
-                                        tracking_overflow |= !remember_bounded(
-                                            &mut terminal_acp_tool_calls,
-                                            tool_call_id.clone(),
-                                            "terminal_acp_tool_call",
-                                        );
-                                        if effective_data.update.status == Some(AcpToolCallStatus::Failed) {
-                                            tracking_overflow |= !remember_bounded(
-                                                &mut failed_terminal_acp_tool_calls,
-                                                tool_call_id.clone(),
-                                                "failed_terminal_acp_tool_call",
-                                            );
-                                        }
-                                    }
-                                    active_acp_tool_calls.remove(&tool_call_id);
-                                    if effective_data.update.status == Some(AcpToolCallStatus::Completed)
-                                        && has_artifact_delivery
-                                        && artifact_contract_error.is_none()
-                                    {
-                                        tracking_overflow |= !track_bounded(
-                                            &mut completed_artifact_acp_tool_calls,
-                                            tool_call_id.clone(),
-                                            effective_data.clone(),
-                                            "completed_artifact_acp_tool_call",
-                                        );
-                                    } else {
-                                        completed_artifact_acp_tool_calls.remove(&tool_call_id);
-                                    }
-                                }
-                                Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress) | None => {
-                                    if terminal_acp_tool_calls.contains(&tool_call_id) {
-                                        warn!(
-                                            tool_call_id,
-                                            "Ignoring late progress event for terminal ACP tool call"
-                                        );
-                                        continue;
-                                    }
-                                    tracking_overflow |= !track_bounded(
-                                        &mut active_acp_tool_calls,
-                                        tool_call_id.clone(),
-                                        effective_data.clone(),
-                                        "acp_tool_call",
-                                    );
-                                }
-                            }
-                            if tracking_overflow {
-                                active_acp_tool_calls.remove(&tool_call_id);
-                                completed_artifact_acp_tool_calls.remove(&tool_call_id);
-                                let mut failed = effective_data.clone();
-                                failed.update.session_update = AcpToolCallSessionUpdateKind::ToolCallUpdate;
-                                failed.update.status = Some(AcpToolCallStatus::Failed);
-                                failed.update.raw_output = Some(json!(
-                                    "The turn exceeded its safe tool-lifecycle tracking limit; artifact delivery was rejected"
-                                ));
-                                if let Some(content) = failed.update.content.as_mut() {
-                                    content.retain(|item| {
-                                        !matches!(
-                                            item,
-                                            nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                                                | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                                        )
-                                    });
-                                }
-                                let failed_event = AgentStreamEvent::AcpToolCall(failed.clone());
-                                self.forward_to_websocket(&failed_event);
-                                let _ = self
-                                    .ordered_event_side_effect(
-                                        "persist_acp_tracking_overflow",
-                                        self.persist_acp_tool_call(&failed),
-                                    )
-                                    .await;
-                                fatal_tracking_error = Some(
-                                    "The agent emitted more ACP tool lifecycle events than can be verified safely; the turn was terminated"
-                                        .to_owned(),
-                                );
-                                continue;
-                            }
-                            if let Some(contract_error) = artifact_contract_error {
-                                completed_artifact_acp_tool_calls.remove(&tool_call_id);
-                                let mut failed = effective_data.clone();
-                                failed.update.session_update =
-                                    AcpToolCallSessionUpdateKind::ToolCallUpdate;
-                                failed.update.status = Some(AcpToolCallStatus::Failed);
-                                failed.update.raw_output = Some(json!(contract_error.clone()));
-                                if let Some(content) = failed.update.content.as_mut() {
-                                    content.retain(|item| {
-                                        !matches!(
-                                            item,
-                                            nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                                                | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                                        )
-                                    });
-                                }
-                                let failed_event = AgentStreamEvent::AcpToolCall(failed.clone());
-                                self.forward_to_websocket(&failed_event);
-                                let _ = self
-                                    .ordered_event_side_effect(
-                                        "persist_acp_artifact_contract_failure",
-                                        self.persist_acp_tool_call(&failed),
-                                    )
-                                    .await;
-                                fatal_tracking_error = Some(format!(
-                                    "ACP artifact delivery contract failed; the turn was terminated: {contract_error}"
-                                ));
-                                continue;
-                            }
-                            let _ = self
-                                .ordered_event_side_effect(
-                                    "complete_thinking_before_acp_tool",
-                                    self.complete_active_thinking(&mut active_thinking),
-                                )
-                                .await;
-                            let _ = self
-                                .ordered_event_side_effect(
-                                    "close_text_before_acp_tool",
-                                    self.close_active_text_segment(
-                                        &mut active_text,
-                                        &mut text_segments,
-                                        "finish",
-                                    ),
-                                )
-                                .await;
-                            if effective_data.update.status == Some(AcpToolCallStatus::Completed)
-                                && has_artifact_delivery
-                            {
-                                let identity_ready = matches!(
-                                    self.ordered_event_side_effect(
-                                        "claim_artifact_acp_tool_identity",
-                                        self.try_derived_message_id(
-                                            "acp_tool_call",
-                                            &effective_data.update.tool_call_id,
-                                        ),
-                                    )
-                                    .await,
-                                    Ok(_)
-                                );
-                                if !identity_ready {
-                                    completed_artifact_acp_tool_calls.remove(&tool_call_id);
-                                    let mut failed = effective_data.clone();
-                                    failed.update.session_update =
-                                        AcpToolCallSessionUpdateKind::ToolCallUpdate;
-                                    failed.update.status = Some(AcpToolCallStatus::Failed);
-                                    failed.update.raw_output = Some(json!(
-                                        "Artifact delivery could not claim a durable message identity"
-                                    ));
-                                    if let Some(content) = failed.update.content.as_mut() {
-                                        content.retain(|item| {
-                                            !matches!(
-                                                item,
-                                                nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                                                    | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                                            )
-                                        });
-                                    }
-                                    self.forward_to_websocket(&AgentStreamEvent::AcpToolCall(failed));
-                                    fatal_tracking_error = Some(
-                                        "ACP artifact delivery could not be projected durably; the turn was terminated"
-                                            .to_owned(),
-                                    );
-                                    continue;
-                                }
-
-                                let provisional =
-                                    Self::provisional_artifact_acp_tool_call(&effective_data);
-                                self.forward_to_websocket(&AgentStreamEvent::AcpToolCall(provisional));
-                                let _ = self
-                                    .ordered_event_side_effect(
-                                        "persist_provisional_artifact_acp_tool_call",
-                                        self.persist_provisional_artifact_acp_tool_call(
-                                            &effective_data,
-                                        ),
-                                    )
-                                    .await;
-                            } else {
-                                self.forward_to_websocket(&AgentStreamEvent::AcpToolCall(
-                                    effective_data.clone(),
-                                ));
-                                let _ = self
-                                    .ordered_event_side_effect(
-                                        "persist_acp_tool_call",
-                                        self.persist_acp_tool_call(&effective_data),
                                     )
                                     .await;
                             }
@@ -3245,26 +3176,33 @@ impl StreamRelay {
                     } else {
                         self.msg_id.clone()
                     };
+                    if let Err(recovery_error) = self
+                        .merge_prepared_generic_artifact_recoveries(
+                            &mut completed_artifact_tool_calls,
+                        )
+                        .await
+                    {
+                        error!(
+                            error = %ErrorChain(&recovery_error),
+                            "Closed artifact stream retained an unreconciled recovery envelope"
+                        );
+                    }
                     let terminal_cleanup = async {
                         let incomplete_reason = if Self::is_cancelled_finish(&terminal_event) {
                             "cancelled"
                         } else {
                             "channel_closed"
                         };
+                        // No artifact transaction is ever attempted on this
+                        // branch, so the relay still has unambiguous ownership
+                        // of every provisional snapshot.
+                        self.rollback_completed_artifact_receipts(&completed_artifact_tool_calls);
                         let failed_completed_tools = Self::take_failed_tool_calls(
                             &mut completed_artifact_tool_calls,
                             incomplete_reason,
                         );
-                        let failed_completed_acp_tools = Self::take_failed_acp_tool_calls(
-                            &mut completed_artifact_acp_tool_calls,
-                            incomplete_reason,
-                        );
                         self.broadcast_failed_tool_calls(&failed_completed_tools);
-                        self.broadcast_failed_acp_tool_calls(&failed_completed_acp_tools);
-                        let _ = tokio::join!(
-                            self.persist_failed_tool_calls(&failed_completed_tools),
-                            self.persist_failed_acp_tool_calls(&failed_completed_acp_tools),
-                        );
+                        self.persist_failed_tool_calls(&failed_completed_tools).await;
                         let thinking_persistence_complete = self
                             .complete_active_thinking(&mut active_thinking)
                             .await;
@@ -3281,8 +3219,6 @@ impl StreamRelay {
                         )
                         .await;
                         self.fail_active_tool_calls(&mut active_tool_calls, incomplete_reason).await;
-                        self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, incomplete_reason)
-                            .await;
                         self.fail_active_tool_groups(&mut active_tool_groups, incomplete_reason)
                             .await;
                         self.finalize_active_plans(
@@ -3321,10 +3257,17 @@ impl StreamRelay {
                                 // suppressible provider failure.
                                 false,
                                 &terminal_message_id,
+                                0,
                             )
                             .await;
                         if terminal_claimed {
-                            self.forward_to_websocket_with_msg_id(&terminal_message_id, &terminal_event);
+                            // A channel close is a recovery/error boundary, not
+                            // proof that the normal final-text projection
+                            // completed.
+                            self.forward_terminal_without_projection(
+                                &terminal_message_id,
+                                &terminal_event,
+                            );
                         }
                         outcome
                     };
@@ -3366,19 +3309,12 @@ impl StreamRelay {
             AgentStreamEvent::Tips(_) => "Tips",
             AgentStreamEvent::Thinking(_) => "Thinking",
             AgentStreamEvent::ToolCall(_) => "ToolCall",
-            AgentStreamEvent::AcpToolCall(_) => "AcpToolCall",
             AgentStreamEvent::ToolGroup(_) => "ToolGroup",
             AgentStreamEvent::AgentStatus(_) => "AgentStatus",
             AgentStreamEvent::Plan(_) => "Plan",
             AgentStreamEvent::Permission(_) => "Permission",
-            AgentStreamEvent::AcpPermission(_) => "AcpPermission",
             AgentStreamEvent::SkillSuggest(_) => "SkillSuggest",
             AgentStreamEvent::CronTrigger(_) => "CronTrigger",
-            AgentStreamEvent::AcpModelInfo(_) => "AcpModelInfo",
-            AgentStreamEvent::AcpModeInfo(_) => "AcpModeInfo",
-            AgentStreamEvent::AcpConfigOption(_) => "AcpConfigOption",
-            AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
-            AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
             AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
             AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
             AgentStreamEvent::TurnCompleted(_) => "TurnCompleted",
@@ -3437,18 +3373,9 @@ impl StreamRelay {
         if !cancellation.try_claim_terminal_surface() {
             return false;
         }
-        self.forward_to_websocket(&Self::cancelled_finish_event());
+        self.forward_terminal_without_projection(&self.msg_id, &Self::cancelled_finish_event());
         cancellation.mark_terminal_observed();
         true
-    }
-
-    fn mint_segment_msg_id(used_primary: &mut bool, primary_msg_id: &str) -> String {
-        if !*used_primary {
-            *used_primary = true;
-            primary_msg_id.to_owned()
-        } else {
-            ConversationService::mint_msg_id()
-        }
     }
 
     /// The canonical Conversation ID used by repository calls and events.
@@ -3471,11 +3398,64 @@ impl StreamRelay {
         self.forward_to_websocket_with_msg_id_and_visibility(msg_id, event, false);
     }
 
+    /// Forward a terminal event together with the durable visible text row that
+    /// owns any terminal post-processing projection.
+    ///
+    /// `msg_id` remains the terminal/wire identity.  It is deliberately not
+    /// overloaded with the text segment identity because a logical turn may
+    /// contain thinking, tool, continuation, or multiple text segments.
+    fn forward_terminal_to_websocket(
+        &self,
+        msg_id: &str,
+        event: &AgentStreamEvent,
+        final_text_msg_id: Option<&str>,
+    ) {
+        self.forward_to_websocket_with_msg_id_and_visibility_and_metadata(
+            msg_id,
+            event,
+            false,
+            final_text_msg_id,
+            true,
+        );
+    }
+
+    /// Forward a terminal surface that did not pass through `finalize`.
+    ///
+    /// Recovery/cancellation paths still need a terminal wire boundary, but
+    /// they must not claim that the backend's final-text middleware projection
+    /// is authoritative when no such projection was completed.
+    fn forward_terminal_without_projection(&self, msg_id: &str, event: &AgentStreamEvent) {
+        self.forward_to_websocket_with_msg_id_and_visibility_and_metadata(
+            msg_id,
+            event,
+            false,
+            None,
+            false,
+        );
+    }
+
     fn forward_to_websocket_with_msg_id_and_visibility(
         &self,
         msg_id: &str,
         event: &AgentStreamEvent,
         hidden: bool,
+    ) {
+        self.forward_to_websocket_with_msg_id_and_visibility_and_metadata(
+            msg_id,
+            event,
+            hidden,
+            None,
+            false,
+        );
+    }
+
+    fn forward_to_websocket_with_msg_id_and_visibility_and_metadata(
+        &self,
+        msg_id: &str,
+        event: &AgentStreamEvent,
+        hidden: bool,
+        final_text_msg_id: Option<&str>,
+        terminal_authoritative: bool,
     ) {
         let mut event_data = match serde_json::to_value(event) {
             Ok(v) => v,
@@ -3489,13 +3469,40 @@ impl StreamRelay {
         // wire contract stays uniform.
         normalize_keys_to_snake_case(&mut event_data);
 
-        let payload = json!({
+        let mut payload = json!({
             "conversation_id": self.conv_id(),
             "msg_id": msg_id,
             "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
             "data": event_data.get("data").cloned().unwrap_or(json!({})),
             "hidden": hidden,
         });
+        if terminal_authoritative {
+            if let Some(final_text_msg_id) = final_text_msg_id {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert(
+                        "final_text_msg_id".to_owned(),
+                        json!(final_text_msg_id),
+                    );
+                }
+            }
+            if let Some(object) = payload.as_object_mut() {
+                // This terminal is emitted only after `finalize` has completed
+                // its repository-backed middleware projection. Consumers must
+                // not race it with an independent local rewrite; absence of a
+                // `final_text_msg_id` can mean empty/hidden text or a
+                // deliberately failed durable rewrite, not permission to
+                // invent another view.
+                object.insert("final_text_authoritative".to_owned(), json!(true));
+            }
+        } else if final_text_msg_id.is_some() {
+            // `final_text_msg_id` is a terminal-only association. Keep this
+            // branch fail-closed if a future caller accidentally supplies one
+            // to an ordinary frame rather than leaking misleading metadata.
+            warn!(
+                msg_id,
+                "Ignoring final_text_msg_id on a non-terminal stream frame"
+            );
+        }
 
         self.broadcast_stream_payload(payload);
     }
@@ -3697,6 +3704,7 @@ impl StreamRelay {
         emitted_response: bool,
         suppress_error: bool,
         terminal_message_id: &str,
+        committed_artifact_count: usize,
     ) -> RelayOutcome {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
@@ -3709,8 +3717,10 @@ impl StreamRelay {
             suppressed_error: None,
             final_text: None,
             final_text_msg_id: None,
+            committed_artifact_count,
         };
         let cancelled = Self::is_cancelled_finish(event);
+        let failed_terminal = matches!(event, AgentStreamEvent::Error(_)) || cancelled;
         let status = if matches!(event, AgentStreamEvent::Error(_)) || cancelled {
             "error"
         } else {
@@ -3737,18 +3747,18 @@ impl StreamRelay {
                 );
                 return outcome;
             }
-            let processed = if cancelled {
-                // A cancelled partial response is data to preserve, never a
-                // completed instruction stream. In particular, do not execute
-                // embedded cron commands or produce continuation responses.
-                MiddlewareResult {
-                    message: text.to_owned(),
-                    display_message: None,
-                    system_responses: Vec::new(),
+            if failed_terminal {
+                // Error/cancelled partial output is evidence of an interrupted
+                // response, not a completed instruction stream. Preserve the
+                // already-durable raw text row with status=error, but do not
+                // strip/execute embedded cron commands, emit continuations, or
+                // expose it as final-text/writeback material.
+                if suppress_error {
+                    outcome.suppressed_error = Some(event.clone());
                 }
-            } else {
-                self.process_final_text(text).await
-            };
+                return outcome;
+            }
+            let processed = self.process_final_text(text).await;
             let final_text = processed.message.trim().to_owned();
             let hidden = final_text.is_empty();
             if !hidden {
@@ -3814,11 +3824,12 @@ impl StreamRelay {
                     // the active segment and must not rewrite earlier narration.
                 }
             } else if !hidden {
+                let message_id = ConversationService::mint_msg_id();
                 let row = MessageRow {
                     id: 0,
-                    message_id: self.msg_id.clone(),
+                    message_id: message_id.clone(),
                     conversation_id: self.conversation_id.clone(),
-                    msg_id: Some(self.msg_id.clone()),
+                    msg_id: Some(message_id),
                     r#type: "text".into(),
                     content: json!({
                         "content": final_text,
@@ -3831,7 +3842,9 @@ impl StreamRelay {
                     created_at: now_ms(),
                 };
                 match self.repo.insert_message(&row).await {
-                    Ok(()) => outcome.final_text_msg_id = Some(row.message_id.clone()),
+                    Ok(()) => {
+                        outcome.final_text_msg_id = Some(row.message_id.clone());
+                    }
                     Err(e) => {
                         outcome.final_text = None;
                         error!(error = %ErrorChain(&e), "Failed to create final fallback message");
@@ -3893,7 +3906,11 @@ impl StreamRelay {
         data: &nomifun_ai_agent::protocol::events::AgentStatusEventData,
     ) -> bool {
         let id = self.agent_status_message_id().await;
-        let content = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned());
+        let mut content_value = serde_json::to_value(data).unwrap_or_else(|_| json!({}));
+        if let Some(object) = content_value.as_object_mut() {
+            object.insert("turn_id".to_owned(), json!(self.root_turn_id));
+        }
+        let content = content_value.to_string();
         let status = match data.status.as_str() {
             "prepared" => "finish",
             "error" => "error",
@@ -4076,6 +4093,7 @@ impl StreamRelay {
                 "content": segment.buffer,
                 "status": "done",
                 "duration_ms": duration_ms,
+                "turn_id": &self.root_turn_id,
             })
             .to_string(),
             position: Some("left".into()),
@@ -4442,127 +4460,611 @@ impl StreamRelay {
         Ok(value.to_string())
     }
 
-    fn committed_artifact_acp_tool_content(
+
+    async fn claim_generic_artifact_recovery(
         &self,
-        data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-    ) -> Result<String, nomifun_db::DbError> {
-        let has_delivery = data.update.content.as_ref().is_some_and(|items| {
-            items.iter().any(|item| {
-                matches!(
-                    item,
-                    nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                        | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                )
+        data: &ToolCallEventData,
+    ) -> Result<(), DbError> {
+        if data.artifacts.is_empty() {
+            return Ok(());
+        }
+        if self.allows_legacy_unjournaled_artifacts() && self.artifact_workspace.is_none() {
+            // Explicit test-only fixtures exercise relay tracking/correction
+            // semantics with synthetic receipts that have no real workspace.
+            // Production can never enable this branch.
+            return Ok(());
+        }
+        let Some(workspace) = self.artifact_workspace.as_ref() else {
+            return Err(DbError::Conflict(
+                "artifact recovery has no canonical session workspace".to_owned(),
+            ));
+        };
+        let store = ArtifactStore::new(workspace);
+        let records = store
+            .recovery_records()
+            .map_err(|error| DbError::Conflict(error.to_string()))?;
+        let journaled = records
+            .iter()
+            .map(|record| record.receipt.id.as_str())
+            .collect::<HashSet<_>>();
+        let matching_records = records
+            .iter()
+            .filter(|record| {
+                data.artifacts
+                    .iter()
+                    .any(|artifact| artifact.id == record.receipt.id)
             })
-        });
-        if data.update.status != Some(AcpToolCallStatus::Completed) || !has_delivery {
-            return Err(nomifun_db::DbError::Conflict(format!(
-                "ACP tool call '{}' is not a completed artifact delivery",
-                data.update.tool_call_id
+            .collect::<Vec<_>>();
+        let matching = data
+            .artifacts
+            .iter()
+            .filter(|artifact| journaled.contains(artifact.id.as_str()))
+            .count();
+        // Legacy/ACP fixtures may carry verified receipts created before the
+        // recoverable sink path. Production Nomi deferred images are all-or-
+        // nothing journaled; a partial journal set is a hard ownership error.
+        if matching == 0 {
+            if self.allows_legacy_unjournaled_artifacts() {
+                return Ok(());
+            }
+            return Err(DbError::Conflict(format!(
+                "tool call '{}' has no durable artifact recovery journal",
+                data.call_id
             )));
         }
-        let mut value = serde_json::to_value(data)
-            .map_err(|error| nomifun_db::DbError::Conflict(error.to_string()))?;
-        normalize_keys_to_snake_case(&mut value);
-        let object = value.as_object_mut().ok_or_else(|| {
-            nomifun_db::DbError::Conflict(format!(
-                "ACP tool call '{}' did not serialize as an object",
-                data.update.tool_call_id
-            ))
-        })?;
-        object.insert("turn_id".to_owned(), json!(self.root_turn_id));
-        object.insert(ARTIFACT_DELIVERY_COMMITTED_FIELD.to_owned(), json!(true));
-        Ok(value.to_string())
+        if matching != data.artifacts.len() {
+            return Err(DbError::Conflict(format!(
+                "tool call '{}' has an incomplete artifact recovery batch",
+                data.call_id
+            )));
+        }
+        let prepared_for_this_wire = matching_records.len() == data.artifacts.len()
+            && matching_records.iter().all(|record| {
+                matches!(
+                    &record.state,
+                    ArtifactRecoveryState::Prepared { envelope }
+                        if envelope.conversation_id == self.conv_id()
+                            && envelope.wire_msg_id == self.msg_id
+                )
+            });
+        let message_id = match self.try_derived_message_id("tool_call", &data.call_id).await {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                if matching == 0 || prepared_for_this_wire {
+                    let _ = store.rollback_owned_receipts(&data.artifacts);
+                }
+                return Err(error);
+            }
+        };
+        let owner = ArtifactRecoveryOwner {
+            conversation_id: self.conv_id().to_owned(),
+            wire_msg_id: self.msg_id.clone(),
+            root_turn_id: self.root_turn_id.clone(),
+            message_id,
+            message_type: "tool_call".to_owned(),
+            committed_content: self.committed_artifact_tool_content(data)?,
+        };
+        if let Err(error) = store.claim_recovery_receipts(&data.artifacts, &owner) {
+            // Every matching record was still Prepared before this call, so
+            // even a partial journal replacement cannot race a provisional DB
+            // write. Roll back the exact batch rather than leaking a claimed
+            // owner that the relay rejected.
+            if matching == 0 || prepared_for_this_wire {
+                let _ = store.rollback_owned_receipts(&data.artifacts);
+            }
+            return Err(DbError::Conflict(error.to_string()));
+        }
+        Ok(())
+    }
+
+
+
+    /// Recover a receipt-bearing terminal event skipped by broadcast lag. The
+    /// sink journals the complete event before `send`; matching this relay's
+    /// exact conversation+wire makes reconstruction deterministic.
+    async fn merge_prepared_generic_artifact_recoveries(
+        &self,
+        generic: &mut HashMap<String, ToolCallEventData>,
+    ) -> Result<(), DbError> {
+        let Some(workspace) = self.artifact_workspace.as_ref() else {
+            return Ok(());
+        };
+        let records = ArtifactStore::new(workspace)
+            .recovery_records()
+            .map_err(|error| DbError::Conflict(error.to_string()))?;
+        let mut recovered = HashMap::<String, ToolCallEventData>::new();
+        for record in records {
+            let envelope = match record.state {
+                ArtifactRecoveryState::Prepared { envelope }
+                | ArtifactRecoveryState::ClaimedActive { envelope, .. }
+                | ArtifactRecoveryState::CommitAttempting { envelope, .. }
+                | ArtifactRecoveryState::NeedsReconcile { envelope, .. } => envelope,
+                ArtifactRecoveryState::Unprepared
+                | ArtifactRecoveryState::PersistedUnprepared => continue,
+            };
+            if envelope.conversation_id != self.conv_id()
+                || envelope.wire_msg_id != self.msg_id
+                || envelope.event_kind != "tool_call"
+            {
+                continue;
+            }
+            let data: ToolCallEventData = serde_json::from_str(&envelope.event_json)
+                .map_err(|error| DbError::Conflict(format!("invalid artifact recovery event: {error}")))?;
+            if data.status != ToolCallStatus::Completed
+                || !data
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact == &record.receipt)
+            {
+                return Err(DbError::Conflict(format!(
+                    "artifact recovery record '{}' does not match its terminal event",
+                    record.receipt.id
+                )));
+            }
+            recovered.entry(data.call_id.clone()).or_insert(data);
+        }
+        for (call_id, data) in recovered {
+            validate_completed_artifact_contract(&data)
+                .map_err(DbError::Conflict)?;
+            self.claim_generic_artifact_recovery(&data).await?;
+            if !track_bounded(generic, call_id, data, "recovered_artifact_tool_call") {
+                return Err(DbError::Conflict(
+                    "artifact recovery exceeded the terminal tracking limit".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+
+    fn finalize_generic_artifact_recovery(
+        &self,
+        generic: &HashMap<String, ToolCallEventData>,
+    ) {
+        let Some(workspace) = self.artifact_workspace.as_ref() else {
+            return;
+        };
+        let receipts = generic
+            .values()
+            .flat_map(|data| data.artifacts.iter().cloned())
+            .collect::<Vec<_>>();
+        if receipts.is_empty() {
+            return;
+        }
+        if let Err(error) = ArtifactStore::new(workspace).finalize_recovery_receipts(&receipts) {
+            error!(
+                error = %error,
+                receipt_count = receipts.len(),
+                "Durable artifact rows committed but recovery journal finalization failed"
+            );
+            let _ = ArtifactStore::new(workspace)
+                .mark_recovery_receipts_needs_reconcile(&receipts);
+        }
+    }
+
+
+    fn mark_generic_artifact_recovery_needs_reconcile(
+        &self,
+        generic: &HashMap<String, ToolCallEventData>,
+    ) {
+        let Some(workspace) = self.artifact_workspace.as_ref() else {
+            return;
+        };
+        let receipts = generic
+            .values()
+            .flat_map(|data| data.artifacts.iter().cloned())
+            .collect::<Vec<_>>();
+        if receipts.is_empty() {
+            return;
+        }
+        if let Err(error) =
+            ArtifactStore::new(workspace).mark_recovery_receipts_needs_reconcile(&receipts)
+        {
+            error!(
+                error = %error,
+                receipt_count = receipts.len(),
+                "Failed to persist indeterminate artifact recovery ownership"
+            );
+        }
+    }
+
+
+    /// Reconcile crash-visible recovery owners before consuming a new stream.
+    /// Cross-process takeover is authorized only by the exact OS-backed
+    /// receipt lease; wall-clock age and boot ids are never deletion proof.
+    async fn reconcile_pending_artifact_recovery_journal(&self) {
+        let Some(workspace) = self.artifact_workspace.as_ref() else {
+            return;
+        };
+        let store = ArtifactStore::new(workspace);
+        let records = match store.recovery_records() {
+            Ok(records) => records,
+            Err(error) => {
+                error!(error = %error, "Could not read artifact recovery journal");
+                return;
+            }
+        };
+        let mut event_groups = HashMap::<(String, String), Vec<_>>::new();
+        for record in records {
+            if record.source.conversation_id != self.conv_id() {
+                continue;
+            }
+            let event_key = match &record.state {
+                ArtifactRecoveryState::Unprepared
+                | ArtifactRecoveryState::PersistedUnprepared => {
+                    format!("unprepared:{}", record.receipt.id)
+                }
+                ArtifactRecoveryState::Prepared { envelope }
+                | ArtifactRecoveryState::ClaimedActive { envelope, .. }
+                | ArtifactRecoveryState::CommitAttempting { envelope, .. }
+                | ArtifactRecoveryState::NeedsReconcile { envelope, .. } => {
+                    envelope.event_json.clone()
+                }
+            };
+            event_groups
+                .entry((record.source.wire_msg_id.clone(), event_key))
+                .or_default()
+                .push(record);
+        }
+        let mut owner_groups = HashMap::<(String, String), Vec<_>>::new();
+        for ((wire_msg_id, _), records) in event_groups {
+            let owners = records
+                .iter()
+                .filter_map(|record| match &record.state {
+                    ArtifactRecoveryState::ClaimedActive { owner, .. }
+                    | ArtifactRecoveryState::CommitAttempting { owner, .. }
+                    | ArtifactRecoveryState::NeedsReconcile { owner, .. } => Some(owner.clone()),
+                    ArtifactRecoveryState::Unprepared
+                    | ArtifactRecoveryState::PersistedUnprepared
+                    | ArtifactRecoveryState::Prepared { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            // A Prepared event for this exact live wire belongs to the running
+            // relay and is reconstructed at its terminal barrier, not startup.
+            if wire_msg_id == self.msg_id
+                && owners.is_empty()
+                && records.iter().all(|record| record.produced_by_current_boot())
+            {
+                continue;
+            }
+            let mut leases_owned = true;
+            let mut newly_acquired = Vec::new();
+            for record in &records {
+                match store.try_acquire_recovery_lease(record) {
+                    Ok(true) => newly_acquired.push(record.clone()),
+                    Ok(false) => {
+                        leases_owned = false;
+                        break;
+                    }
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            artifact_id = record.receipt.id,
+                            "Could not acquire abandoned artifact recovery lease"
+                        );
+                        leases_owned = false;
+                        break;
+                    }
+                }
+            }
+            if !leases_owned {
+                for record in &newly_acquired {
+                    let _ = store.release_acquired_recovery_lease(record);
+                }
+                continue;
+            }
+            let receipts = records
+                .iter()
+                .map(|record| record.receipt.clone())
+                .collect::<Vec<_>>();
+            if owners.is_empty() {
+                if let Err(error) = store.rollback_owned_receipts(&receipts) {
+                    error!(error = %error, "Failed to roll back abandoned pre-commit artifacts");
+                    Self::release_recovery_record_leases(&store, &records);
+                }
+                continue;
+            }
+            let owner = owners[0].clone();
+            if owners.iter().any(|candidate| candidate != &owner) {
+                error!(wire_msg_id, "Conflicting artifact recovery owners retained for manual reconciliation");
+                Self::release_recovery_record_leases(&store, &records);
+                continue;
+            }
+            // Complete any partial journal claim before relinquishing the
+            // event to the replay owner.
+            if let Err(error) = store.claim_recovery_receipts(&receipts, &owner) {
+                error!(error = %error, wire_msg_id, "Could not complete partial artifact recovery claim");
+                Self::release_recovery_record_leases(&store, &records);
+                continue;
+            }
+            owner_groups
+                .entry((owner.conversation_id.clone(), owner.root_turn_id.clone()))
+                .or_default()
+                .extend(records);
+        }
+
+        for ((conversation_id, root_turn_id), records) in owner_groups {
+            let mut owners = HashMap::<String, ArtifactRecoveryOwner>::new();
+            let mut owner_conflict = false;
+            for record in &records {
+                let owner = match &record.state {
+                    ArtifactRecoveryState::ClaimedActive { owner, .. }
+                    | ArtifactRecoveryState::CommitAttempting { owner, .. }
+                    | ArtifactRecoveryState::NeedsReconcile { owner, .. } => owner,
+                    _ => continue,
+                };
+                if owners
+                    .insert(owner.message_id.clone(), owner.clone())
+                    .is_some_and(|existing| existing != *owner)
+                {
+                    owner_conflict = true;
+                }
+            }
+            if owner_conflict || owners.is_empty() {
+                error!(conversation_id, root_turn_id, "Conflicting artifact recovery commit identities retained");
+                Self::release_recovery_record_leases(&store, &records);
+                continue;
+            }
+            let mut commits = owners
+                .values()
+                .map(|owner| TurnArtifactMessageCommit {
+                    message_id: owner.message_id.clone(),
+                    message_type: owner.message_type.clone(),
+                    content: owner.committed_content.clone(),
+                })
+                .collect::<Vec<_>>();
+            commits.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+            let receipts = records
+                .iter()
+                .map(|record| record.receipt.clone())
+                .collect::<Vec<_>>();
+            // CommitAttempting is a batch fence, not a per-event permission.
+            // If any call in this root turn remained pre-commit, the database
+            // transaction was never entered and the whole batch rolls back.
+            if records.iter().any(|record| {
+                matches!(
+                    record.state,
+                    ArtifactRecoveryState::Unprepared
+                        | ArtifactRecoveryState::PersistedUnprepared
+                        | ArtifactRecoveryState::Prepared { .. }
+                        | ArtifactRecoveryState::ClaimedActive { .. }
+                )
+            }) {
+                if let Err(error) = store.rollback_owned_receipts(&receipts) {
+                    error!(error = %error, conversation_id, root_turn_id, "Failed to roll back incomplete artifact commit fence");
+                    Self::release_recovery_record_leases(&store, &records);
+                }
+                continue;
+            }
+            let _ = store.mark_recovery_receipts_needs_reconcile(&receipts);
+            let initial = self
+                .reconcile_recovery_artifact_commits(
+                    &conversation_id,
+                    &root_turn_id,
+                    &commits,
+                )
+                .await;
+            if initial == ArtifactCommitReconciliation::AllDurable {
+                if receipts.iter().all(|receipt| store.reverify_receipt(receipt).is_ok()) {
+                    if let Err(error) = store.finalize_recovery_receipts(&receipts) {
+                        error!(error = %error, "Failed to finalize recovered artifact journals");
+                        Self::release_recovery_record_leases(&store, &records);
+                    }
+                } else {
+                    error!(conversation_id, root_turn_id, "Durable artifact rows reference unverifiable bytes; retaining recovery journal");
+                    Self::release_recovery_record_leases(&store, &records);
+                }
+                continue;
+            }
+            if !receipts.iter().all(|receipt| store.reverify_receipt(receipt).is_ok()) {
+                if initial == ArtifactCommitReconciliation::DefinitelyNotCommitted {
+                    if store.rollback_owned_receipts(&receipts).is_err() {
+                        Self::release_recovery_record_leases(&store, &records);
+                    }
+                } else {
+                    Self::release_recovery_record_leases(&store, &records);
+                }
+                continue;
+            }
+
+            let replay = self
+                .repo
+                .commit_turn_artifact_messages(
+                    &conversation_id,
+                    &root_turn_id,
+                    &commits,
+                    now_ms(),
+                )
+                .await;
+            if replay.as_ref().is_ok_and(|rows| {
+                Self::returned_artifact_batch_is_exact(
+                    rows,
+                    &commits,
+                    &conversation_id,
+                    &root_turn_id,
+                )
+            }) {
+                if let Err(error) = store.finalize_recovery_receipts(&receipts) {
+                    error!(error = %error, "Failed to finalize replayed artifact journals");
+                    Self::release_recovery_record_leases(&store, &records);
+                }
+                continue;
+            }
+            let after_replay = self
+                .reconcile_recovery_artifact_commits(
+                    &conversation_id,
+                    &root_turn_id,
+                    &commits,
+                )
+                .await;
+            match after_replay {
+                ArtifactCommitReconciliation::AllDurable => {
+                    if receipts.iter().all(|receipt| store.reverify_receipt(receipt).is_ok()) {
+                        if store.finalize_recovery_receipts(&receipts).is_err() {
+                            Self::release_recovery_record_leases(&store, &records);
+                        }
+                    } else {
+                        Self::release_recovery_record_leases(&store, &records);
+                    }
+                }
+                ArtifactCommitReconciliation::DefinitelyNotCommitted => {
+                    if store.rollback_owned_receipts(&receipts).is_err() {
+                        Self::release_recovery_record_leases(&store, &records);
+                    }
+                }
+                ArtifactCommitReconciliation::Indeterminate => {
+                    warn!(conversation_id, root_turn_id, "Artifact recovery replay remains indeterminate; retaining journal");
+                    let _ = store.mark_recovery_receipts_needs_reconcile(&receipts);
+                    Self::release_recovery_record_leases(&store, &records);
+                }
+            }
+        }
+    }
+
+    fn release_recovery_record_leases(
+        store: &ArtifactStore,
+        records: &[nomifun_ai_agent::artifact_store::ArtifactRecoveryRecord],
+    ) {
+        for record in records {
+            if let Err(error) = store.release_acquired_recovery_lease(record) {
+                warn!(
+                    error = %error,
+                    artifact_id = record.receipt.id,
+                    "Could not relinquish retained artifact recovery lease"
+                );
+            }
+        }
+    }
+
+    async fn reconcile_recovery_artifact_commits(
+        &self,
+        conversation_id: &str,
+        root_turn_id: &str,
+        commits: &[TurnArtifactMessageCommit],
+    ) -> ArtifactCommitReconciliation {
+        let mut durable = 0usize;
+        let mut definitely_uncommitted = true;
+        for commit in commits {
+            match self.repo.get_message(conversation_id, &commit.message_id).await {
+                Ok(Some(row))
+                    if Self::finished_artifact_row_matches(
+                        &row,
+                        commit,
+                        conversation_id,
+                        root_turn_id,
+                    ) => durable += 1,
+                Ok(Some(row))
+                    if Self::known_uncommitted_artifact_row(
+                        &row,
+                        commit,
+                        conversation_id,
+                        root_turn_id,
+                    ) => {}
+                Ok(None) => {}
+                Ok(Some(_)) => definitely_uncommitted = false,
+                Err(error) => {
+                    error!(error = %ErrorChain(&error), conversation_id, root_turn_id, "Artifact recovery audit failed");
+                    return ArtifactCommitReconciliation::Indeterminate;
+                }
+            }
+        }
+        if durable == commits.len() {
+            ArtifactCommitReconciliation::AllDurable
+        } else if durable == 0 && definitely_uncommitted {
+            ArtifactCommitReconciliation::DefinitelyNotCommitted
+        } else {
+            ArtifactCommitReconciliation::Indeterminate
+        }
     }
 
     async fn commit_pending_artifact_deliveries(
         &self,
         generic: &HashMap<String, ToolCallEventData>,
-        acp: &HashMap<
-            String,
-            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        >,
-    ) -> Result<(), nomifun_db::DbError> {
-        let has_local_receipts = generic.values().any(|data| !data.artifacts.is_empty())
-            || acp.values().any(|data| {
-                data.update.content.as_ref().is_some_and(|items| {
-                    items.iter().any(|item| {
-                        matches!(
-                            item,
-                            nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                        )
-                    })
-                })
-            });
+    ) -> Result<usize, ArtifactCommitFailure> {
+        let committed_artifact_count = generic
+            .values()
+            .map(|data| data.artifacts.len())
+            .sum::<usize>();
+        let has_local_receipts = generic.values().any(|data| !data.artifacts.is_empty());
         if has_local_receipts {
-            let workspace = self.artifact_workspace.as_ref().ok_or_else(|| {
-                nomifun_db::DbError::Conflict(
-                    "artifact delivery has no canonical session workspace for final verification".to_owned(),
-                )
-            })?;
+            let workspace = self
+                .artifact_workspace
+                .as_ref()
+                .ok_or_else(|| {
+                    nomifun_db::DbError::Conflict(
+                        "artifact delivery has no canonical session workspace for final verification"
+                            .to_owned(),
+                    )
+                })
+                .map_err(ArtifactCommitFailure::before_commit)?;
             let store = ArtifactStore::new(workspace);
             for data in generic.values() {
                 for artifact in &data.artifacts {
                     store.reverify_receipt(artifact).map_err(|error| {
-                        nomifun_db::DbError::Conflict(format!(
-                            "tool call '{}' artifact '{}' failed final verification: {error}",
-                            data.call_id, artifact.id
+                        ArtifactCommitFailure::before_commit(nomifun_db::DbError::Conflict(
+                            format!(
+                                "tool call '{}' artifact '{}' failed final verification: {error}",
+                                data.call_id, artifact.id
+                            ),
                         ))
                     })?;
-                }
-            }
-            for data in acp.values() {
-                for item in data.update.content.iter().flatten() {
-                    if let nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact {
-                        artifact,
-                        ..
-                    } = item
-                    {
-                        store.reverify_receipt(artifact).map_err(|error| {
-                            nomifun_db::DbError::Conflict(format!(
-                                "ACP tool call '{}' artifact '{}' failed final verification: {error}",
-                                data.update.tool_call_id, artifact.id
-                            ))
-                        })?;
-                    }
                 }
             }
         }
 
         let mut generic_calls = generic.values().collect::<Vec<_>>();
         generic_calls.sort_by(|left, right| left.call_id.cmp(&right.call_id));
-        let mut acp_calls = acp.values().collect::<Vec<_>>();
-        acp_calls.sort_by(|left, right| {
-            left.update
-                .tool_call_id
-                .cmp(&right.update.tool_call_id)
-        });
 
-        let mut commits = Vec::with_capacity(generic_calls.len() + acp_calls.len());
+        let mut commits = Vec::with_capacity(generic_calls.len());
         for data in generic_calls {
             commits.push(TurnArtifactMessageCommit {
                 message_id: self
                     .try_derived_message_id("tool_call", &data.call_id)
-                    .await?,
+                    .await
+                    .map_err(ArtifactCommitFailure::before_commit)?,
                 message_type: "tool_call".to_owned(),
-                content: self.committed_artifact_tool_content(data)?,
-            });
-        }
-        for data in acp_calls {
-            commits.push(TurnArtifactMessageCommit {
-                message_id: self
-                    .try_derived_message_id("acp_tool_call", &data.update.tool_call_id)
-                    .await?,
-                message_type: "acp_tool_call".to_owned(),
-                content: self.committed_artifact_acp_tool_content(data)?,
+                content: self
+                    .committed_artifact_tool_content(data)
+                    .map_err(ArtifactCommitFailure::before_commit)?,
             });
         }
 
-        let expected_ids = commits
-            .iter()
-            .map(|message| message.message_id.as_str())
-            .collect::<HashSet<_>>();
-        let committed = self
+        // Linearize successful-turn intent before entering COMMIT. A crash in
+        // ClaimedActive is still a failed/incomplete turn and must roll back;
+        // only this durable fence authorizes recovery replay.
+        if let Some(workspace) = self.artifact_workspace.as_ref() {
+            let receipts = generic
+                .values()
+                .flat_map(|data| data.artifacts.iter().cloned())
+                .collect::<Vec<_>>();
+            let store = ArtifactStore::new(workspace);
+            let skip_legacy_fence = if self.allows_legacy_unjournaled_artifacts() {
+                let journaled = store
+                    .recovery_records()
+                    .map_err(|error| {
+                        ArtifactCommitFailure::before_commit(nomifun_db::DbError::Conflict(
+                            error.to_string(),
+                        ))
+                    })?
+                    .into_iter()
+                    .map(|record| record.receipt.id)
+                    .collect::<HashSet<_>>();
+                receipts.iter().all(|receipt| !journaled.contains(&receipt.id))
+            } else {
+                false
+            };
+            if !skip_legacy_fence {
+                store
+                    .mark_recovery_receipts_commit_attempting(&receipts)
+                    .map_err(|error| {
+                        ArtifactCommitFailure::before_commit(nomifun_db::DbError::Conflict(
+                            format!("artifact commit intent could not be persisted: {error}"),
+                        ))
+                    })?;
+            }
+        }
+
+        let commit_result = self
             .repo
             .commit_turn_artifact_messages(
                 self.conv_id(),
@@ -4570,17 +5072,201 @@ impl StreamRelay {
                 &commits,
                 now_ms(),
             )
-            .await?;
-        if committed.len() != commits.len()
-            || committed
-                .iter()
-                .any(|row| !expected_ids.contains(row.message_id.as_str()))
-        {
-            return Err(nomifun_db::DbError::Conflict(
+            .await;
+        let commit_error = match commit_result {
+            Ok(committed)
+                if Self::returned_artifact_batch_is_exact(&committed, &commits, self.conv_id(), &self.root_turn_id) =>
+            {
+                return Ok(committed_artifact_count);
+            }
+            Ok(_) => nomifun_db::DbError::Conflict(
                 "artifact commit returned an incomplete or mismatched durable batch".to_owned(),
-            ));
+            ),
+            Err(error) => error,
+        };
+
+        // A COMMIT error can be an acknowledgement failure after SQLite made
+        // the transaction durable. Never delete bytes based on that ambiguous
+        // return value alone: query every exact terminal row. All rows durable
+        // recovers success, no durable rows with only known provisional state
+        // permits rollback, and every partial/query-unknown result retains the
+        // snapshots for recovery rather than risking a dangling durable receipt.
+        let reconciliation = self.reconcile_artifact_commit(&commits).await;
+        if reconciliation == ArtifactCommitReconciliation::AllDurable {
+            warn!(
+                error = %ErrorChain(&commit_error),
+                "Artifact COMMIT acknowledgement was inconsistent, but every exact row is durable"
+            );
+            return Ok(committed_artifact_count);
         }
-        Ok(())
+        Err(ArtifactCommitFailure::after_reconciliation(
+            commit_error,
+            reconciliation,
+        ))
+    }
+
+    fn returned_artifact_batch_is_exact(
+        rows: &[MessageRow],
+        commits: &[TurnArtifactMessageCommit],
+        conversation_id: &str,
+        turn_message_id: &str,
+    ) -> bool {
+        rows.len() == commits.len()
+            && commits.iter().all(|commit| {
+                rows.iter()
+                    .filter(|row| {
+                        Self::finished_artifact_row_matches(
+                            row,
+                            commit,
+                            conversation_id,
+                            turn_message_id,
+                        )
+                    })
+                    .count()
+                    == 1
+            })
+    }
+
+    fn finished_artifact_row_matches(
+        row: &MessageRow,
+        commit: &TurnArtifactMessageCommit,
+        conversation_id: &str,
+        turn_message_id: &str,
+    ) -> bool {
+        row.message_id == commit.message_id
+            && row.conversation_id == conversation_id
+            && row.msg_id.as_deref() == Some(turn_message_id)
+            && row.r#type == commit.message_type
+            && row.content == commit.content
+            && row.position.as_deref() == Some("left")
+            && row.status.as_deref() == Some("finish")
+            && !row.hidden
+    }
+
+    fn known_uncommitted_artifact_row(
+        row: &MessageRow,
+        commit: &TurnArtifactMessageCommit,
+        conversation_id: &str,
+        turn_message_id: &str,
+    ) -> bool {
+        let Some(stored_content) = serde_json::from_str::<Value>(&row.content).ok() else {
+            return false;
+        };
+        let Some(candidate_content) = serde_json::from_str::<Value>(&commit.content).ok() else {
+            return false;
+        };
+        let Some(stored_call_id) = Self::artifact_commit_call_identity(&row.r#type, &stored_content)
+        else {
+            return false;
+        };
+        let Some(candidate_call_id) =
+            Self::artifact_commit_call_identity(&commit.message_type, &candidate_content)
+        else {
+            return false;
+        };
+        row.message_id == commit.message_id
+            && row.conversation_id == conversation_id
+            && row.msg_id.as_deref() == Some(turn_message_id)
+            && row.r#type == commit.message_type
+            && row.position.as_deref() == Some("left")
+            // Only the relay's exact phase-one lifecycle is proof that no
+            // receipt is durable. Error/unknown/conflicting rows deliberately
+            // remain indeterminate and retain the physical snapshots.
+            && row.status.as_deref() == Some("work")
+            && !row.hidden
+            && stored_content.get("turn_id").and_then(Value::as_str) == Some(turn_message_id)
+            && stored_content
+                .get(ARTIFACT_DELIVERY_COMMITTED_FIELD)
+                .and_then(Value::as_bool)
+                != Some(true)
+            && stored_call_id == candidate_call_id
+    }
+
+    fn artifact_commit_call_identity<'a>(message_type: &str, content: &'a Value) -> Option<&'a str> {
+        let identity = match message_type {
+            "tool_call" => content.get("call_id").and_then(Value::as_str),
+            _ => None,
+        }?;
+        let identity = identity.trim();
+        (!identity.is_empty()).then_some(identity)
+    }
+
+    async fn reconcile_artifact_commit(
+        &self,
+        commits: &[TurnArtifactMessageCommit],
+    ) -> ArtifactCommitReconciliation {
+        let mut durable = 0usize;
+        let mut all_other_rows_are_known_uncommitted = true;
+        for commit in commits {
+            let row = match self.repo.get_message(self.conv_id(), &commit.message_id).await {
+                Ok(row) => row,
+                Err(error) => {
+                    error!(
+                        message_id = %commit.message_id,
+                        error = %ErrorChain(&error),
+                        "Could not reconcile an ambiguous artifact COMMIT"
+                    );
+                    return ArtifactCommitReconciliation::Indeterminate;
+                }
+            };
+            match row {
+                Some(row)
+                    if Self::finished_artifact_row_matches(
+                        &row,
+                        commit,
+                        self.conv_id(),
+                        &self.root_turn_id,
+                    ) =>
+                {
+                    durable += 1;
+                }
+                Some(row)
+                    if Self::known_uncommitted_artifact_row(
+                        &row,
+                        commit,
+                        self.conv_id(),
+                        &self.root_turn_id,
+                    ) => {}
+                None => {}
+                Some(_) => all_other_rows_are_known_uncommitted = false,
+            }
+        }
+
+        if durable == commits.len() {
+            ArtifactCommitReconciliation::AllDurable
+        } else if durable == 0 && all_other_rows_are_known_uncommitted {
+            ArtifactCommitReconciliation::DefinitelyNotCommitted
+        } else {
+            ArtifactCommitReconciliation::Indeterminate
+        }
+    }
+
+    fn rollback_completed_artifact_receipts(
+        &self,
+        generic: &HashMap<String, ToolCallEventData>,
+    ) {
+        let receipts = generic
+            .values()
+            .flat_map(|data| data.artifacts.iter().cloned())
+            .collect::<Vec<PersistedArtifact>>();
+        if receipts.is_empty() {
+            return;
+        }
+
+        let Some(workspace) = self.artifact_workspace.as_ref() else {
+            error!(
+                receipt_count = receipts.len(),
+                "Cannot safely roll back provisional artifacts without the canonical session workspace"
+            );
+            return;
+        };
+        if let Err(error) = ArtifactStore::new(workspace).rollback_owned_receipts(&receipts) {
+            error!(
+                receipt_count = receipts.len(),
+                error = %ErrorChain(&error),
+                "Strict rollback of provisional artifact snapshots failed"
+            );
+        }
     }
 
     fn broadcast_committed_artifact_tool_calls(
@@ -4594,23 +5280,6 @@ impl StreamRelay {
         }
     }
 
-    fn broadcast_committed_artifact_acp_tool_calls(
-        &self,
-        completed: &HashMap<
-            String,
-            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        >,
-    ) {
-        let mut completed = completed.values().collect::<Vec<_>>();
-        completed.sort_by(|left, right| {
-            left.update
-                .tool_call_id
-                .cmp(&right.update.tool_call_id)
-        });
-        for data in completed {
-            self.forward_to_websocket(&AgentStreamEvent::AcpToolCall(data.clone()));
-        }
-    }
 
     fn plan_terminal_status(event: &AgentStreamEvent) -> &'static str {
         match event {
@@ -4698,78 +5367,9 @@ impl StreamRelay {
         self.persist_failed_tool_calls(&failed).await;
     }
 
-    fn take_failed_acp_tool_calls(
-        active_tool_calls: &mut HashMap<
-            String,
-            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        >,
-        reason: &str,
-    ) -> Vec<nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData> {
-        if active_tool_calls.len() > MAX_TERMINAL_ACTIVE_ITEMS {
-            warn!(count = active_tool_calls.len(), "Truncating active ACP tool calls during terminal cleanup");
-        }
-        active_tool_calls
-            .drain()
-            .take(MAX_TERMINAL_ACTIVE_ITEMS)
-            .map(|(_, mut data)| {
-                let output = if data.update.status == Some(AcpToolCallStatus::Completed) {
-                    format!(
-                        "The turn ended without a valid completed delivery for this tool: {reason}"
-                    )
-                } else {
-                    format!("The turn ended before this tool completed: {reason}")
-                };
-                data.update.session_update = AcpToolCallSessionUpdateKind::ToolCallUpdate;
-                data.update.status = Some(AcpToolCallStatus::Failed);
-                data.update.raw_output = Some(json!(output));
-                if let Some(content) = data.update.content.as_mut() {
-                    content.retain(|item| {
-                        !matches!(
-                            item,
-                            nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact {
-                                ..
-                            } | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink {
-                                ..
-                            }
-                        )
-                    });
-                }
-                data
-            })
-            .collect()
-    }
 
-    fn broadcast_failed_acp_tool_calls(
-        &self,
-        failed: &[nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData],
-    ) {
-        for data in failed {
-            let event = AgentStreamEvent::AcpToolCall(data.clone());
-            self.forward_to_websocket(&event);
-        }
-    }
 
-    async fn persist_failed_acp_tool_calls(
-        &self,
-        failed: &[nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData],
-    ) {
-        for data in failed {
-            self.persist_acp_tool_call(&data).await;
-        }
-    }
 
-    async fn fail_active_acp_tool_calls(
-        &self,
-        active_tool_calls: &mut HashMap<
-            String,
-            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        >,
-        reason: &str,
-    ) {
-        let failed = Self::take_failed_acp_tool_calls(active_tool_calls, reason);
-        self.broadcast_failed_acp_tool_calls(&failed);
-        self.persist_failed_acp_tool_calls(&failed).await;
-    }
 
     async fn fail_active_tool_groups(
         &self,
@@ -4808,161 +5408,10 @@ impl StreamRelay {
         }
     }
 
-    /// Persist an ACP (Claude CLI) tool call event.
-    /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
-    #[tracing::instrument(skip_all)]
-    async fn persist_acp_tool_call(&self, data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData) {
-        let _ = self.persist_acp_tool_call_projection(data, None).await;
-    }
 
-    async fn persist_provisional_artifact_acp_tool_call(
-        &self,
-        data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-    ) -> bool {
-        let provisional = Self::provisional_artifact_acp_tool_call(data);
-        self.persist_acp_tool_call_projection(&provisional, Some(false))
-            .await
-    }
 
-    fn provisional_artifact_acp_tool_call(
-        data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-    ) -> nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData {
-        let mut provisional = data.clone();
-        provisional.update.status = Some(AcpToolCallStatus::InProgress);
-        provisional.update.raw_output = Some(json!(ARTIFACT_DELIVERY_PENDING_OUTPUT));
-        if let Some(content) = provisional.update.content.as_mut() {
-            content.retain(|item| {
-                !matches!(
-                    item,
-                    nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact { .. }
-                        | nomifun_ai_agent::protocol::events::AcpToolCallContentItem::ResourceLink { .. }
-                )
-            });
-        }
-        provisional
-    }
 
-    async fn persist_acp_tool_call_projection(
-        &self,
-        data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
-        artifact_delivery_committed: Option<bool>,
-    ) -> bool {
-        let tool_call_id = &data.update.tool_call_id;
-        if tool_call_id.trim().is_empty() {
-            warn!("Skipping ACP tool call persistence because tool_call_id is empty");
-            return false;
-        }
-        let message_id = self.acp_tool_message_id(tool_call_id).await;
-        let status = match data.update.status {
-            Some(AcpToolCallStatus::Pending) | None => "work",
-            Some(AcpToolCallStatus::InProgress) => "work",
-            Some(AcpToolCallStatus::Completed) => "finish",
-            Some(AcpToolCallStatus::Failed) => "error",
-        };
 
-        let mut value = serde_json::to_value(data).unwrap_or_default();
-        normalize_keys_to_snake_case(&mut value);
-        if let Some(object) = value.as_object_mut() {
-            object.insert("turn_id".to_owned(), json!(self.root_turn_id));
-            if let Some(committed) = artifact_delivery_committed {
-                object.insert(ARTIFACT_DELIVERY_COMMITTED_FIELD.to_owned(), json!(committed));
-            }
-        }
-        if data.update.status != Some(AcpToolCallStatus::Completed)
-            && let Some(content) = value
-                .get_mut("update")
-                .and_then(|update| update.as_object_mut())
-                .and_then(|update| update.get_mut("content"))
-                .and_then(serde_json::Value::as_array_mut)
-        {
-            // A progress/failed frame may contain partial bytes or a remote
-            // link, but those are not successful durable output. Keep text,
-            // diffs, terminal diagnostics and artifact_error items only.
-            content.retain(|item| {
-                !matches!(
-                    item.get("type").and_then(serde_json::Value::as_str),
-                    Some("artifact" | "resource_link")
-                )
-            });
-        }
-        let content = value.to_string();
-
-        let existing = match self.repo.get_message(self.conv_id(), &message_id).await {
-            Ok(existing) => existing,
-            Err(e) => {
-                error!(
-                    tool_call_id,
-                    status,
-                    error = %ErrorChain(&e),
-                    "Failed to load ACP tool call before persistence"
-                );
-                return false;
-            }
-        };
-        if let Some(existing_row) = existing {
-            let existing_artifact_committed = serde_json::from_str::<Value>(&existing_row.content)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get(ARTIFACT_DELIVERY_COMMITTED_FIELD)
-                        .and_then(Value::as_bool)
-                })
-                == Some(true);
-            let terminal_conflict = match (existing_row.status.as_deref(), status) {
-                (Some("finish"), "finish" | "error") | (Some("error"), "error") => false,
-                (Some("finish"), _)
-                    if artifact_delivery_committed == Some(false)
-                        && !existing_artifact_committed =>
-                {
-                    false
-                }
-                (Some("finish" | "error"), _) => true,
-                _ => false,
-            };
-            if terminal_conflict {
-                warn!(
-                    tool_call_id,
-                    stored_status = ?existing_row.status,
-                    incoming_status = status,
-                    "Ignoring ACP tool transition away from persisted terminal state"
-                );
-                return false;
-            }
-            let merged_content = Self::merge_acp_tool_call_content(&existing_row.content, &value);
-            let update = nomifun_db::MessageRowUpdate {
-                content: Some(merged_content),
-                status: Some(Some(status.to_owned())),
-                hidden: None,
-            };
-            if let Err(e) = self.repo.update_message(&message_id, &update).await {
-                error!(error = %ErrorChain(&e), "Failed to update acp_tool_call message");
-                return false;
-            }
-            return true;
-        }
-
-        let row = MessageRow {
-            id: 0,
-            message_id: message_id.clone(),
-            conversation_id: self.conversation_id.clone(),
-            msg_id: Some(self.root_turn_id.clone()),
-            r#type: "acp_tool_call".into(),
-            content,
-            position: Some("left".into()),
-            status: Some(status.to_owned()),
-            hidden: false,
-            created_at: now_ms(),
-        };
-        if let Err(e) = self.repo.insert_message(&row).await {
-            error!(error = %ErrorChain(&e), "Failed to persist acp_tool_call message");
-            return false;
-        }
-        true
-    }
-
-    async fn acp_tool_message_id(&self, tool_call_id: &str) -> String {
-        self.derived_message_id("acp_tool_call", tool_call_id).await
-    }
 
     /// Merge two JSON content strings: overlays non-null fields from `new_json`
     /// onto `existing_json`, preserving fields only present in the original.
@@ -4979,42 +5428,6 @@ impl StreamRelay {
         base.to_string()
     }
 
-    /// Merge an AcpToolCall update into the existing DB record.
-    /// Reads the stored content, overlays non-null fields from the update,
-    /// preserving fields like `raw_input` that the update event omits.
-    fn merge_acp_tool_call_content(existing_content: &str, update_value: &serde_json::Value) -> String {
-        let mut base: serde_json::Value = serde_json::from_str(existing_content).unwrap_or_default();
-        if let (Some(base_object), Some(update_object)) = (base.as_object_mut(), update_value.as_object()) {
-            for (key, value) in update_object {
-                if key != "update" && !value.is_null() {
-                    base_object.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        if let (Some(base_update), Some(new_update)) = (
-            base.get_mut("update").and_then(|v| v.as_object_mut()),
-            update_value.get("update").and_then(|v| v.as_object()),
-        ) {
-            for (key, val) in new_update {
-                if !val.is_null() {
-                    base_update.insert(key.clone(), val.clone());
-                }
-            }
-            if new_update.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                && let Some(content) = base_update
-                    .get_mut("content")
-                    .and_then(serde_json::Value::as_array_mut)
-            {
-                content.retain(|item| {
-                    !matches!(
-                        item.get("type").and_then(serde_json::Value::as_str),
-                        Some("artifact" | "resource_link")
-                    )
-                });
-            }
-        }
-        base.to_string()
-    }
 
     /// Persist a tool_group event (array of tool summaries).
     #[tracing::instrument(skip_all)]
@@ -5371,6 +5784,8 @@ mod tests {
     const TEST_ASSISTANT_MESSAGE_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678941";
     const TEST_TURN_A: &str = "0190f5fe-7c00-7a00-8abc-012345678942";
     const TEST_TURN_B: &str = "0190f5fe-7c00-7a00-8abc-012345678943";
+    const ONE_PIXEL_PNG: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
     const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678944";
 
     fn test_conversation_id() -> String {
@@ -5518,8 +5933,6 @@ mod tests {
     fn persisted_png_artifact(
         workspace: &std::path::Path,
     ) -> nomifun_ai_agent::artifact_store::PersistedArtifact {
-        const ONE_PIXEL_PNG: &str =
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
         ArtifactStore::new(workspace)
             .persist_inline(
                 nomifun_ai_agent::artifact_store::ArtifactKind::Image,
@@ -6188,6 +6601,164 @@ mod tests {
     // ── run() async tests ─────────────────────────────────────────
 
     #[tokio::test]
+    async fn turn_root_preflight_precedes_children_and_visible_segments_use_distinct_ids() {
+        use nomifun_ai_agent::protocol::events::AgentStatusEventData;
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(32));
+        let (tx, _) = broadcast::channel(32);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_A);
+
+        relay
+            .ensure_turn_root_persisted()
+            .await
+            .expect("preflight persists the logical root");
+        relay
+            .ensure_turn_root_persisted()
+            .await
+            .expect("same-relay preflight is idempotent");
+
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AgentStatus(AgentStatusEventData {
+            backend: "nomi".into(),
+            status: "preparing".into(),
+            agent_name: Some("Nomi".into()),
+            session_id: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "ready".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.committed_artifact_count, 0);
+
+        let rows = repo.inserts.lock().unwrap().clone();
+        let root_index = rows
+            .iter()
+            .position(|row| row.message_id == TEST_TURN_A)
+            .expect("logical root row");
+        let root = &rows[root_index];
+        assert_eq!(root.r#type, "turn_root");
+        assert_eq!(root.msg_id.as_deref(), Some(TEST_TURN_A));
+        assert!(root.hidden);
+        assert_eq!(
+            serde_json::from_str::<Value>(&root.content).unwrap()["kind"],
+            "turn_root"
+        );
+
+        let status_index = rows
+            .iter()
+            .position(|row| row.r#type == "agent_status")
+            .expect("agent status child row");
+        assert!(root_index < status_index);
+        assert_eq!(rows[status_index].msg_id.as_deref(), Some(TEST_TURN_A));
+
+        let text = rows
+            .iter()
+            .find(|row| row.r#type == "text")
+            .expect("visible text segment");
+        assert_ne!(text.message_id, TEST_TURN_A);
+        assert_ne!(text.message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(text.msg_id.as_deref(), Some(text.message_id.as_str()));
+        assert_eq!(
+            outcome.final_text_msg_id.as_deref(),
+            Some(text.message_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_root_preflight_accepts_a_legacy_visible_root_but_rejects_wrong_ownership() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        repo.inserts.lock().unwrap().push(MessageRow {
+            id: 0,
+            message_id: TEST_TURN_A.to_owned(),
+            conversation_id: conversation_id.clone(),
+            msg_id: Some(TEST_TURN_A.to_owned()),
+            r#type: "text".to_owned(),
+            content: json!({ "content": "legacy", "turn_id": TEST_TURN_A }).to_string(),
+            position: Some("left".to_owned()),
+            status: Some("finish".to_owned()),
+            hidden: false,
+            created_at: now_ms(),
+        });
+        let relay = StreamRelay::new(
+            conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_A);
+        relay
+            .ensure_turn_root_persisted()
+            .await
+            .expect("pre-upgrade text root remains a valid owner");
+        assert_eq!(
+            repo.inserts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.message_id == TEST_TURN_A)
+                .count(),
+            1
+        );
+
+        let wrong_repo = Arc::new(RecordingRepo::new());
+        wrong_repo.inserts.lock().unwrap().push(MessageRow {
+            id: 0,
+            message_id: TEST_TURN_B.to_owned(),
+            conversation_id: test_conversation_id(),
+            msg_id: Some(TEST_TURN_B.to_owned()),
+            r#type: "text".to_owned(),
+            content: json!({ "content": "user-owned collision" }).to_string(),
+            position: Some("right".to_owned()),
+            status: Some("finish".to_owned()),
+            hidden: false,
+            created_at: now_ms(),
+        });
+        let wrong_bus = Arc::new(TestUserEventBus::new(8));
+        let mut wrong_events = wrong_bus.subscribe();
+        let conflict_relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            wrong_repo.clone(),
+            wrong_bus,
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_B);
+        let conflict = conflict_relay
+        .ensure_turn_root_persisted()
+        .await
+        .expect_err("a right-side message cannot become an assistant turn root");
+        assert!(matches!(conflict, DbError::Conflict(_)));
+        let outcome = conflict_relay.into_turn_root_failure_outcome(conflict);
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert_eq!(wrong_repo.inserts.lock().unwrap().len(), 1);
+        let event = wrong_events.try_recv().expect("preflight failure terminal event");
+        assert_eq!(event.data["type"], "error");
+        assert_eq!(event.data["turn_id"], TEST_TURN_B);
+    }
+
+    #[tokio::test]
     async fn run_text_then_finish_persists_message() {
         let repo = Arc::new(RecordingRepo::new());
         let bus = Arc::new(TestUserEventBus::new(64));
@@ -6227,7 +6798,9 @@ mod tests {
         assert_eq!(inserts.len(), 1);
         let msg = &inserts[0];
         assert_eq!(msg.conversation_id, conversation_id);
-        assert_eq!(msg.message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_ne!(msg.message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(msg.msg_id.as_deref(), Some(msg.message_id.as_str()));
+        assert_eq!(outcome.final_text_msg_id.as_deref(), Some(msg.message_id.as_str()));
         assert_eq!(msg.r#type, "text");
         assert_eq!(msg.status.as_deref(), Some("finish"));
 
@@ -6302,9 +6875,13 @@ mod tests {
         let outcome = relay.consume(rx).await;
 
         assert_eq!(outcome.terminal, RelayTerminal::Finish);
-        assert_eq!(outcome.final_text_msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1, "the failed work insert must be retried as the terminal row");
+        assert_eq!(
+            outcome.final_text_msg_id.as_deref(),
+            Some(inserts[0].message_id.as_str())
+        );
+        assert_ne!(inserts[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
         assert_eq!(inserts[0].status.as_deref(), Some("finish"));
         let content: Value = serde_json::from_str(&inserts[0].content).unwrap();
         assert_eq!(content["content"], "x".repeat(FLUSH_INTERVAL as usize));
@@ -6340,15 +6917,15 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
 
-        assert_eq!(
-            outcome.final_text_msg_id.as_deref(),
-            Some(TEST_ASSISTANT_MESSAGE_ID)
-        );
         let inserts = repo.take_inserts();
         assert_eq!(
             inserts.len(),
             1,
             "a committed-but-unacknowledged insert must be reconciled, not duplicated"
+        );
+        assert_eq!(
+            outcome.final_text_msg_id.as_deref(),
+            Some(inserts[0].message_id.as_str())
         );
         let updates = repo.take_updates();
         assert_eq!(updates.len(), 2);
@@ -6486,13 +7063,16 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
 
-        assert_eq!(outcome.final_text_msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1, "the work row must not be inserted a second time");
+        assert_eq!(
+            outcome.final_text_msg_id.as_deref(),
+            Some(inserts[0].message_id.as_str())
+        );
         assert_eq!(inserts[0].status.as_deref(), Some("work"));
         let updates = repo.take_updates();
         assert_eq!(updates.len(), 1, "terminal finalization should retry exactly once");
-        assert_eq!(updates[0].0, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(updates[0].0, inserts[0].message_id);
         assert_eq!(
             updates[0].1.status.as_ref().and_then(|status| status.as_deref()),
             Some("finish")
@@ -6576,6 +7156,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).expect("create test workspace");
         let artifact = persisted_png_artifact(&workspace);
+        let artifact_path = PathBuf::from(&artifact.path);
+        assert!(artifact_path.is_file());
         let relay = StreamRelay::new(
             test_conversation_id(),
             TEST_TURN_A.into(),
@@ -6584,7 +7166,8 @@ mod tests {
             bus,
             None,
         )
-        .with_artifact_workspace(workspace.clone());
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
 
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -6645,6 +7228,10 @@ mod tests {
         assert_eq!(tool_statuses.last().map(String::as_str), Some("error"));
         assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
         assert_eq!(stream_types.last(), Some(&json!("error")));
+        assert!(
+            !artifact_path.exists(),
+            "assistant persistence failure must roll back the provisional snapshot"
+        );
         std::fs::remove_dir_all(workspace).expect("remove test workspace");
     }
 
@@ -7193,7 +7780,8 @@ mod tests {
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy("later provider error", None)))
             .unwrap();
 
-        relay.consume(rx).await;
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.committed_artifact_count, 0);
 
         let source_id = repo
             .take_inserts()
@@ -7306,7 +7894,7 @@ mod tests {
         let inserts = repo.take_inserts();
         let text_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "text").collect();
         assert_eq!(text_msgs.len(), 2, "text should split across tool boundaries");
-        assert_eq!(text_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_ne!(text_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
         assert_ne!(text_msgs[0].message_id, text_msgs[1].message_id);
 
         let mut text_event_msg_ids = Vec::new();
@@ -7316,7 +7904,8 @@ mod tests {
             }
         }
         assert_eq!(text_event_msg_ids.len(), 2);
-        assert_eq!(text_event_msg_ids[0], TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(text_event_msg_ids[0], text_msgs[0].message_id);
+        assert_eq!(text_event_msg_ids[1], text_msgs[1].message_id);
         assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
     }
 
@@ -7464,6 +8053,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_partial_text_skips_middleware_and_does_not_claim_final_projection() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            Some(Arc::new(MockCronService)),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "partial [CRON_LIST]".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+            "provider failed after partial output",
+            None,
+        )))
+        .unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert!(outcome.final_text.is_none());
+        assert!(outcome.final_text_msg_id.is_none());
+        assert!(outcome.system_responses.is_empty());
+
+        let inserts = repo.take_inserts();
+        let text = inserts
+            .iter()
+            .find(|row| row.r#type == "text")
+            .expect("raw partial text row");
+        let persisted: Value = serde_json::from_str(&text.content).unwrap();
+        assert_eq!(text.status.as_deref(), Some("error"));
+        assert_eq!(persisted["content"], "partial [CRON_LIST]");
+
+        let terminal = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .find(|event| event.name == "message.stream" && event.data["type"] == "error")
+            .expect("partial provider error terminal");
+        assert!(
+            terminal.data.get("final_text_authoritative").is_none(),
+            "an Error terminal must not claim a completed middleware projection"
+        );
+        assert!(terminal.data.get("final_text_msg_id").is_none());
+    }
+
+    #[tokio::test]
     async fn run_tool_call_then_error_is_post_response() {        // Plan D4 (review #4): a turn that forwarded/persisted a ToolCall and
         // THEN hit a provider fault must report `emitted_response == true`, so
         // the failover seam refuses to switch — re-running the turn would
@@ -7505,6 +8143,7 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
         assert!(outcome.terminal.is_error());
+        assert_eq!(outcome.committed_artifact_count, 0);
         // A tool action already ran this turn → NOT pre-response → never failed over.
         assert!(
             outcome.emitted_response,
@@ -7736,6 +8375,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_recovery_same_process_next_turn_rolls_back_unenveloped_receipt() {
+        let conversation_id = test_conversation_id();
+        let old_wire_id = MessageId::new().into_string();
+        let new_wire_id = MessageId::new().into_string();
+        let repo = Arc::new(RecordingRepo::new());
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-recovery-handoff-unprepared-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = ArtifactStore::new(&workspace);
+        let source = ArtifactRecoverySource {
+            conversation_id: conversation_id.clone(),
+            wire_msg_id: old_wire_id.clone(),
+        };
+        let artifact = store
+            .persist_inline_and_existing_batch_recoverable(
+                [(nomifun_ai_agent::artifact_store::ArtifactKind::Image, "image/png", ONE_PIXEL_PNG)],
+                std::iter::empty::<&std::path::Path>(),
+                &source,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let artifact_path = PathBuf::from(&artifact.path);
+
+        let (old_tx, _) = broadcast::channel(8);
+        let old_rx = old_tx.subscribe();
+        old_tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        StreamRelay::new(
+            conversation_id.clone(),
+            old_wire_id,
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_A)
+        .with_artifact_workspace(workspace.clone())
+        .consume(old_rx)
+        .await;
+        assert!(artifact_path.is_file());
+
+        let (new_tx, _) = broadcast::channel(8);
+        let new_rx = new_tx.subscribe();
+        new_tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        StreamRelay::new(
+            conversation_id,
+            new_wire_id,
+            TEST_USER_ID.into(),
+            repo,
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_B)
+        .with_artifact_workspace(workspace.clone())
+        .consume(new_rx)
+        .await;
+
+        assert!(!artifact_path.exists());
+        assert!(store.recovery_records().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn artifact_recovery_same_process_next_turn_reconciles_needs_state() {
+        let conversation_id = test_conversation_id();
+        let old_wire_id = MessageId::new().into_string();
+        let new_wire_id = MessageId::new().into_string();
+        let repo = Arc::new(RecordingRepo::new());
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-recovery-handoff-needs-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = ArtifactStore::new(&workspace);
+        let source = ArtifactRecoverySource {
+            conversation_id: conversation_id.clone(),
+            wire_msg_id: old_wire_id.clone(),
+        };
+        let artifact = store
+            .persist_inline_and_existing_batch_recoverable(
+                [(nomifun_ai_agent::artifact_store::ArtifactKind::Image, "image/png", ONE_PIXEL_PNG)],
+                std::iter::empty::<&std::path::Path>(),
+                &source,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let committed_content = json!({
+            "call_id": "recovered-image",
+            "name": "image_gen",
+            "status": "completed",
+            "artifacts": [artifact.clone()],
+            "turn_id": TEST_TURN_A,
+            "artifact_delivery_committed": true,
+        })
+        .to_string();
+        let envelope = ArtifactRecoveryEnvelope {
+            conversation_id: conversation_id.clone(),
+            wire_msg_id: old_wire_id.clone(),
+            event_kind: "tool_call".to_owned(),
+            event_json: committed_content.clone(),
+        };
+        store
+            .prepare_recovery_receipts(std::slice::from_ref(&artifact), &envelope)
+            .unwrap();
+        store
+            .claim_recovery_receipts(
+                std::slice::from_ref(&artifact),
+                &ArtifactRecoveryOwner {
+                    conversation_id: conversation_id.clone(),
+                    wire_msg_id: old_wire_id.clone(),
+                    root_turn_id: TEST_TURN_A.to_owned(),
+                    message_id: TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+                    message_type: "tool_call".to_owned(),
+                    committed_content,
+                },
+            )
+            .unwrap();
+        store
+            .mark_recovery_receipts_commit_attempting(std::slice::from_ref(&artifact))
+            .unwrap();
+        store
+            .mark_recovery_receipts_needs_reconcile(std::slice::from_ref(&artifact))
+            .unwrap();
+
+        let (old_tx, _) = broadcast::channel(8);
+        let old_rx = old_tx.subscribe();
+        old_tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        StreamRelay::new(
+            conversation_id.clone(),
+            old_wire_id,
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_A)
+        .with_artifact_workspace(workspace.clone())
+        .consume(old_rx)
+        .await;
+
+        let (new_tx, _) = broadcast::channel(8);
+        let new_rx = new_tx.subscribe();
+        new_tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        StreamRelay::new(
+            conversation_id,
+            new_wire_id,
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        )
+        .with_root_turn_id(TEST_TURN_B)
+        .with_artifact_workspace(workspace.clone())
+        .consume(new_rx)
+        .await;
+
+        assert!(PathBuf::from(&artifact.path).is_file());
+        assert!(store.recovery_records().unwrap().is_empty());
+        assert!(repo.artifact_commit_attempts() >= 1);
+        assert!(repo
+            .take_inserts()
+            .iter()
+            .any(|row| row.message_id == TEST_ASSISTANT_MESSAGE_ID
+                && row.status.as_deref() == Some("finish")));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn run_keeps_completed_artifact_after_successful_turn_finish() {
         use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
@@ -7757,7 +8575,8 @@ mod tests {
             bus,
             None,
         )
-        .with_artifact_workspace(workspace.clone());
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "artifact-success".into(),
@@ -7773,7 +8592,8 @@ mod tests {
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 
-        relay.consume(rx).await;
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.committed_artifact_count, 1);
 
         let row = repo
             .take_inserts()
@@ -7827,6 +8647,14 @@ mod tests {
         let bus = Arc::new(TestUserEventBus::new(64));
         let mut ws_rx = bus.subscribe();
         let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-commit-failure-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
+        let artifact_path = PathBuf::from(&artifact.path);
+        assert!(artifact_path.is_file());
         let relay = StreamRelay::new(
             test_conversation_id(),
             TEST_TURN_A.into(),
@@ -7834,7 +8662,9 @@ mod tests {
             repo.clone(),
             bus,
             None,
-        );
+        )
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "artifact-commit-fails".into(),
@@ -7844,7 +8674,7 @@ mod tests {
             input: None,
             output: Some("generated".into()),
             description: None,
-            artifacts: vec![test_artifact("commit-fails")],
+            artifacts: vec![artifact],
             retry: None,
         }))
         .unwrap();
@@ -7856,6 +8686,7 @@ mod tests {
             outcome.terminal.code(),
             Some(AgentErrorCode::NomifunStateInconsistent)
         );
+        assert_eq!(outcome.committed_artifact_count, 0);
 
         let row = repo
             .take_inserts()
@@ -7884,6 +8715,247 @@ mod tests {
         assert_eq!(tool_statuses, ["running", "error"]);
         assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
         assert_eq!(stream_types.last(), Some(&json!("error")));
+        assert_eq!(repo.artifact_commit_attempts(), 1);
+        assert!(
+            !artifact_path.exists(),
+            "a definitively failed artifact transaction must roll back the provisional snapshot"
+        );
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
+    }
+
+    #[tokio::test]
+    async fn artifact_reverification_failure_rolls_back_before_database_commit() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-reverify-failure-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
+        let artifact_path = PathBuf::from(&artifact.path);
+        std::fs::write(&artifact_path, b"tampered after receipt publication")
+            .expect("tamper provisional artifact");
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_TURN_A.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(64)),
+            None,
+        )
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "artifact-reverify-fails".into(),
+            name: "ImageGeneration".into(),
+            args: json!({"prompt": "cat"}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("generated".into()),
+            description: None,
+            artifacts: vec![artifact],
+            retry: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert_eq!(repo.artifact_commit_attempts(), 0);
+        assert!(
+            !artifact_path.exists(),
+            "pre-COMMIT verification failure must roll back the owned provisional snapshot"
+        );
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
+    }
+
+    #[tokio::test]
+    async fn lost_artifact_commit_ack_recovers_exact_durable_rows_without_rollback() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        repo.commit_artifact_rows_then_error();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-lost-ack-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
+        let artifact_path = PathBuf::from(&artifact.path);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_TURN_A.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        )
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "artifact-commit-lost-ack".into(),
+            name: "ImageGeneration".into(),
+            args: json!({"prompt": "cat"}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("generated".into()),
+            description: None,
+            artifacts: vec![artifact],
+            retry: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.committed_artifact_count, 1);
+        assert_eq!(repo.artifact_commit_attempts(), 1);
+        assert!(
+            artifact_path.is_file(),
+            "an exact durable artifact row owns its snapshot even when the COMMIT acknowledgement is lost"
+        );
+        let mut tool_statuses = Vec::new();
+        let mut stream_types = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name != "message.stream" {
+                continue;
+            }
+            stream_types.push(event.data["type"].clone());
+            if event.data["type"] == "tool_call"
+                && let Some(status) = event.data["data"]["status"].as_str()
+            {
+                tool_statuses.push(status.to_owned());
+            }
+        }
+        assert_eq!(tool_statuses, ["running", "completed"]);
+        assert_eq!(stream_types.last(), Some(&json!("finish")));
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
+    }
+
+    #[tokio::test]
+    async fn unknown_artifact_commit_state_retains_provisional_snapshot() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_artifact_commit_with_unknown_reconciliation();
+        let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-unknown-commit-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
+        let artifact_path = PathBuf::from(&artifact.path);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_TURN_A.into(),
+            TEST_USER_ID.into(),
+            repo,
+            Arc::new(TestUserEventBus::new(64)),
+            None,
+        )
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "artifact-commit-unknown".into(),
+            name: "ImageGeneration".into(),
+            args: json!({"prompt": "cat"}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("generated".into()),
+            description: None,
+            artifacts: vec![artifact],
+            retry: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert_eq!(outcome.committed_artifact_count, 0);
+        assert!(
+            artifact_path.is_file(),
+            "query-unknown COMMIT ownership must retain the snapshot for recovery"
+        );
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
+    }
+
+    #[tokio::test]
+    async fn partial_artifact_commit_state_retains_every_snapshot() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        repo.commit_first_artifact_row_then_error();
+        let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-partial-commit-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let first = persisted_png_artifact(&workspace);
+        let second = persisted_png_artifact(&workspace);
+        let paths = [PathBuf::from(&first.path), PathBuf::from(&second.path)];
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_TURN_A.into(),
+            TEST_USER_ID.into(),
+            repo,
+            Arc::new(TestUserEventBus::new(64)),
+            None,
+        )
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
+        let rx = tx.subscribe();
+        for (call_id, artifact) in [("artifact-partial-a", first), ("artifact-partial-b", second)] {
+            tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: call_id.into(),
+                name: "ImageGeneration".into(),
+                args: json!({"prompt": "cat"}),
+                status: ToolCallStatus::Completed,
+                input: None,
+                output: Some("generated".into()),
+                description: None,
+                artifacts: vec![artifact],
+                retry: None,
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert_eq!(outcome.committed_artifact_count, 0);
+        assert!(
+            paths.iter().all(|path| path.is_file()),
+            "partial durable ownership must retain the entire batch for recovery"
+        );
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
     }
 
     #[tokio::test(start_paused = true)]
@@ -7909,7 +8981,8 @@ mod tests {
             bus,
             None,
         )
-        .with_artifact_workspace(workspace.clone());
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "artifact-commit-times-out".into(),
@@ -8038,6 +9111,14 @@ mod tests {
         let bus = Arc::new(TestUserEventBus::new(64));
         let mut ws_rx = bus.subscribe();
         let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-terminal-error-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
+        let artifact_path = PathBuf::from(&artifact.path);
+        assert!(artifact_path.is_file());
         let relay = StreamRelay::new(
             test_conversation_id(),
             TEST_TURN_A.into(),
@@ -8045,7 +9126,9 @@ mod tests {
             repo.clone(),
             bus,
             None,
-        );
+        )
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "artifact-then-error".into(),
@@ -8055,7 +9138,7 @@ mod tests {
             input: None,
             output: Some("generated".into()),
             description: None,
-            artifacts: vec![test_artifact("retracted")],
+            artifacts: vec![artifact],
             retry: None,
         }))
         .unwrap();
@@ -8109,6 +9192,11 @@ mod tests {
             Some(&json!("error")),
             "the enclosing terminal must be published after artifact retraction"
         );
+        assert!(
+            !artifact_path.exists(),
+            "an unsuccessful enclosing turn must roll back its provisional snapshot"
+        );
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
     }
 
     #[tokio::test(start_paused = true)]
@@ -8126,7 +9214,8 @@ mod tests {
             repo.clone(),
             bus,
             None,
-        );
+        )
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "artifact-before-wedged-db".into(),
@@ -8201,14 +9290,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_retracts_completed_acp_artifact_when_enclosing_turn_errors() {
-        use nomifun_ai_agent::protocol::events::{
-            AcpToolCallContentItem,
-            tool_call::{
-                AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-                AcpToolCallUpdateData,
-            },
-        };
+    async fn channel_close_retracts_completed_generic_artifacts_before_terminal() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
         let repo = Arc::new(RecordingRepo::new());
         let bus = Arc::new(TestUserEventBus::new(64));
@@ -8221,111 +9304,8 @@ mod tests {
             repo.clone(),
             bus,
             None,
-        );
-        let rx = tx.subscribe();
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "session-artifact".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "acp-artifact-then-error".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: Some("Generate image".into()),
-                kind: None,
-                raw_input: None,
-                raw_output: Some(json!("generated")),
-                content: Some(vec![AcpToolCallContentItem::Artifact {
-                    artifact: test_artifact("acp-retracted"),
-                    source_uri: None,
-                }]),
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
-            "provider failed after ACP artifact delivery",
-            None,
-        )))
-        .unwrap();
-
-        relay.consume(rx).await;
-
-        let row = repo
-            .take_inserts()
-            .into_iter()
-            .find(|row| row.r#type == "acp_tool_call")
-            .expect("completed ACP artifact tool is persisted provisionally");
-        assert_eq!(row.status.as_deref(), Some("work"));
-        let provisional: serde_json::Value = serde_json::from_str(&row.content).unwrap();
-        assert_eq!(provisional["update"]["status"], "in_progress");
-        assert!(
-            provisional["update"]["content"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-        );
-        assert_eq!(provisional[ARTIFACT_DELIVERY_COMMITTED_FIELD], false);
-        let updates = repo.take_updates();
-        let correction = updates
-            .iter()
-            .rev()
-            .find(|(id, _)| id == &row.message_id)
-            .expect("global turn error must correct the completed ACP artifact row");
-        assert_eq!(
-            correction.1.status.as_ref().map(|status| status.as_deref()),
-            Some(Some("error"))
-        );
-        let content: serde_json::Value =
-            serde_json::from_str(correction.1.content.as_deref().expect("corrected content")).unwrap();
-        assert_eq!(content["update"]["status"], "failed");
-        assert!(
-            content["update"]["content"]
-                .as_array()
-                .is_some_and(Vec::is_empty),
-            "failed ACP projection must remove artifact/resource-link delivery blocks"
-        );
-
-        let mut last_acp = None;
-        let mut stream_types = Vec::new();
-        while let Ok(event) = ws_rx.try_recv() {
-            if event.name == "message.stream" {
-                stream_types.push(event.data["type"].clone());
-                if event.data["type"] == "acp_tool_call" {
-                    last_acp = Some(event.data);
-                }
-            }
-        }
-        let last_acp = last_acp.expect("live UI receives the terminal ACP artifact correction");
-        assert_eq!(last_acp["data"]["update"]["status"], "failed");
-        assert!(
-            last_acp["data"]["update"]["content"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-        );
-        assert_eq!(stream_types.last(), Some(&json!("error")));
-    }
-
-    #[tokio::test]
-    async fn channel_close_retracts_completed_generic_and_acp_artifacts_before_terminal() {
-        use nomifun_ai_agent::protocol::events::{
-            AcpToolCallContentItem,
-            tool_call::{
-                AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-                AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus,
-            },
-        };
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(64));
-        let mut ws_rx = bus.subscribe();
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_TURN_A.into(),
-            TEST_USER_ID.into(),
-            repo.clone(),
-            bus,
-            None,
-        );
+        )
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "generic-before-close".into(),
@@ -8337,25 +9317,6 @@ mod tests {
             description: None,
             artifacts: vec![test_artifact("generic-close")],
             retry: None,
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "session-close".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "acp-before-close".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: Some("Generate image".into()),
-                kind: None,
-                raw_input: None,
-                raw_output: Some(json!("generated")),
-                content: Some(vec![AcpToolCallContentItem::Artifact {
-                    artifact: test_artifact("acp-close"),
-                    source_uri: None,
-                }]),
-                locations: None,
-            },
-            meta: None,
         }))
         .unwrap();
         drop(tx);
@@ -8370,24 +9331,16 @@ mod tests {
             .expect("generic artifact row")
             .message_id
             .clone();
-        let acp_id = rows
-            .iter()
-            .find(|row| row.r#type == "acp_tool_call")
-            .expect("ACP artifact row")
-            .message_id
-            .clone();
         let updates = repo.take_updates();
-        for id in [generic_id, acp_id] {
-            let update = updates
-                .iter()
-                .rev()
-                .find(|(updated_id, _)| updated_id == &id)
-                .expect("closed stream must retract every completed artifact lifecycle");
-            assert_eq!(
-                update.1.status.as_ref().map(|status| status.as_deref()),
-                Some(Some("error"))
-            );
-        }
+        let update = updates
+            .iter()
+            .rev()
+            .find(|(updated_id, _)| updated_id == &generic_id)
+            .expect("closed stream must retract every completed artifact lifecycle");
+        assert_eq!(
+            update.1.status.as_ref().map(|status| status.as_deref()),
+            Some(Some("error"))
+        );
 
         let mut stream_types = Vec::new();
         while let Ok(event) = ws_rx.try_recv() {
@@ -8403,14 +9356,6 @@ mod tests {
                 .count(),
             2,
             "completed generic tool plus its error correction are both visible"
-        );
-        assert_eq!(
-            stream_types
-                .iter()
-                .filter(|event_type| **event_type == json!("acp_tool_call"))
-                .count(),
-            2,
-            "completed ACP tool plus its error correction are both visible"
         );
     }
 
@@ -8429,7 +9374,8 @@ mod tests {
             repo.clone(),
             bus,
             None,
-        );
+        )
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
         for index in 0..=MAX_TERMINAL_ACTIVE_ITEMS {
             tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -8484,76 +9430,6 @@ mod tests {
                 .count(),
             MAX_TERMINAL_ACTIVE_ITEMS
         );
-    }
-
-    #[tokio::test]
-    async fn acp_artifact_tracking_limit_fails_closed_without_an_untracked_success() {
-        use nomifun_ai_agent::protocol::events::{
-            AcpToolCallContentItem,
-            tool_call::{
-                AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-                AcpToolCallUpdateData,
-            },
-        };
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(4096));
-        let mut ws_rx = bus.subscribe();
-        let (tx, _) = broadcast::channel(1024);
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_TURN_A.into(),
-            TEST_USER_ID.into(),
-            repo,
-            bus,
-            None,
-        );
-        let rx = tx.subscribe();
-        for index in 0..=MAX_TERMINAL_ACTIVE_ITEMS {
-            tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-                session_id: "session-overflow".into(),
-                update: AcpToolCallUpdateData {
-                    session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                    tool_call_id: format!("acp-artifact-{index}"),
-                    status: Some(AcpToolCallStatus::Completed),
-                    title: Some("Generate image".into()),
-                    kind: None,
-                    raw_input: None,
-                    raw_output: Some(json!("generated")),
-                    content: Some(vec![AcpToolCallContentItem::Artifact {
-                        artifact: test_artifact(&format!("acp-artifact-{index}")),
-                        source_uri: None,
-                    }]),
-                    locations: None,
-                },
-                meta: None,
-            }))
-            .unwrap();
-        }
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
-
-        let outcome = relay.consume(rx).await;
-        assert!(outcome.terminal.is_error());
-
-        let mut final_statuses = HashMap::new();
-        let mut stream_types = Vec::new();
-        while let Ok(event) = ws_rx.try_recv() {
-            if event.name != "message.stream" {
-                continue;
-            }
-            stream_types.push(event.data["type"].clone());
-            if event.data["type"] == "acp_tool_call"
-                && let (Some(call_id), Some(status)) = (
-                    event.data["data"]["update"]["tool_call_id"].as_str(),
-                    event.data["data"]["update"]["status"].as_str(),
-                )
-            {
-                final_statuses.insert(call_id.to_owned(), status.to_owned());
-            }
-        }
-        assert_eq!(final_statuses.len(), MAX_TERMINAL_ACTIVE_ITEMS + 1);
-        assert!(final_statuses.values().all(|status| status == "failed"));
-        assert_eq!(stream_types.last(), Some(&json!("error")));
     }
 
     #[tokio::test]
@@ -8922,7 +9798,8 @@ mod tests {
         let inserts = repo.take_inserts();
         let thinking_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "thinking").collect();
         assert_eq!(thinking_msgs.len(), 2, "thinking should split across tool boundaries");
-        assert_eq!(thinking_msgs[0].msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
+        assert_ne!(thinking_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(thinking_msgs[0].msg_id.as_deref(), Some(thinking_msgs[0].message_id.as_str()));
         assert_ne!(thinking_msgs[0].msg_id, thinking_msgs[1].msg_id);
 
         let mut done_msg_ids = Vec::new();
@@ -8932,7 +9809,8 @@ mod tests {
             }
         }
         assert_eq!(done_msg_ids.len(), 2);
-        assert_eq!(done_msg_ids[0], TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(done_msg_ids[0], thinking_msgs[0].message_id);
+        assert_eq!(done_msg_ids[1], thinking_msgs[1].message_id);
         assert_ne!(done_msg_ids[0], done_msg_ids[1]);
     }
 
@@ -8975,12 +9853,15 @@ mod tests {
 
         assert_eq!(thinking_msgs.len(), 1);
         assert_eq!(text_msgs.len(), 1);
-        assert_eq!(thinking_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_ne!(thinking_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_ne!(text_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
         assert_ne!(thinking_msgs[0].message_id, text_msgs[0].message_id);
 
         let mut text_msg_ids = Vec::new();
         let mut thinking_done_ids = Vec::new();
+        let mut ws_events = Vec::new();
         while let Ok(evt) = ws_rx.try_recv() {
+            ws_events.push(evt.clone());
             if evt.name != "message.stream" {
                 continue;
             }
@@ -8992,7 +9873,7 @@ mod tests {
             }
         }
 
-        assert_eq!(thinking_done_ids, vec![TEST_ASSISTANT_MESSAGE_ID.to_string()]);
+        assert_eq!(thinking_done_ids, vec![thinking_msgs[0].message_id.clone()]);
         assert_eq!(text_msg_ids.len(), 1);
         assert_ne!(text_msg_ids[0], TEST_ASSISTANT_MESSAGE_ID);
         assert_eq!(
@@ -9000,6 +9881,18 @@ mod tests {
             Some(text_msg_ids[0].as_str()),
             "turn-final post-processing should target the final assistant text segment, not the thinking segment"
         );
+
+        let terminal = ws_events
+            .iter()
+            .find(|event| event.name == "message.stream" && event.data["type"] == "finish")
+            .unwrap_or_else(|| panic!("terminal finish frame; events={ws_events:?}"));
+        assert_eq!(terminal.data["msg_id"], TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(
+            terminal.data["final_text_msg_id"],
+            text_msg_ids[0].as_str(),
+            "terminal wire identity and final text segment identity are distinct"
+        );
+        assert_eq!(terminal.data["final_text_authoritative"], true);
     }
 
     #[tokio::test]
@@ -9050,6 +9943,11 @@ mod tests {
             .find(|event| event.name == "message.stream" && event.data["type"] == "error")
             .expect("unexpected channel closure must be visible as a terminal error");
         assert_eq!(live_error.data["msg_id"], error.message_id);
+        assert!(
+            live_error.data.get("final_text_authoritative").is_none(),
+            "channel closure must not claim a completed final-text projection"
+        );
+        assert!(live_error.data.get("final_text_msg_id").is_none());
     }
 
     #[tokio::test]
@@ -9083,6 +9981,16 @@ mod tests {
         while let Ok(evt) = ws_rx.try_recv() {
             ws_events.push(evt);
         }
+
+        let finish = ws_events
+            .iter()
+            .find(|event| event.name == "message.stream" && event.data["type"] == "finish")
+            .expect("normal finish terminal");
+        assert_eq!(finish.data["final_text_authoritative"], true);
+        assert!(
+            finish.data.get("final_text_msg_id").is_none(),
+            "an empty successful response has no visible final-text owner"
+        );
 
         // Should have turn.completed event
         let turn_event = ws_events.iter().find(|e| e.name == "turn.completed");
@@ -9162,6 +10070,14 @@ mod tests {
             .find(|event| event.name == "message.stream" && event.data["type"] == "finish")
             .expect("cancel must surface a terminal stream event");
         assert_eq!(finish.data["data"]["stop_reason"], "cancelled");
+        assert!(
+            finish.data.get("final_text_authoritative").is_none(),
+            "a cancellation terminal must not claim backend final-text authority"
+        );
+        assert!(
+            finish.data.get("final_text_msg_id").is_none(),
+            "a cancellation terminal must not point at a projected final-text row"
+        );
         assert!(
             ws_events
                 .iter()
@@ -9803,10 +10719,12 @@ mod tests {
 
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
+        let text_message_id = &inserts[0].message_id;
+        assert_ne!(text_message_id, TEST_ASSISTANT_MESSAGE_ID);
         let updates = repo.take_updates();
         let final_update = updates
             .iter()
-            .find(|(id, update)| id == TEST_ASSISTANT_MESSAGE_ID && update.content.is_some())
+            .find(|(id, update)| id == text_message_id && update.content.is_some())
             .expect("expected cleaned final text update");
         let content: serde_json::Value = serde_json::from_str(final_update.1.content.as_deref().unwrap()).unwrap();
         assert_eq!(content["content"].as_str().map(str::trim), Some("Hello"));
@@ -10075,433 +10993,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_acp_tool_call_inserts_then_updates() {
-        use nomifun_ai_agent::protocol::events::tool_call::{
-            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
-        };
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(64));
-        let (tx, _) = broadcast::channel(64);
-
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_ASSISTANT_MESSAGE_ID.into(),
-            TEST_USER_ID.into(),
-            repo.clone(),
-            bus.clone(),
-            None,
-        );
-
-        let rx = tx.subscribe();
-
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "sess-1".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCall,
-                tool_call_id: "atc-001".into(),
-                status: Some(AcpToolCallStatus::InProgress),
-                title: Some("Bash".into()),
-                kind: None,
-                raw_input: Some(json!({"command": "mv /tmp/a /tmp/b", "description": "Move file"})),
-                raw_output: None,
-                content: None,
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "sess-1".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "atc-001".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: None,
-                kind: None,
-                raw_input: None,
-                raw_output: Some(json!("Exit code: 0\nSTDOUT:\nSTDERR:")),
-                content: None,
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
-
-        relay.consume(rx).await;
-
-        let inserts = repo.take_inserts();
-        let acp_msg = inserts.iter().find(|m| m.r#type == "acp_tool_call");
-        assert!(acp_msg.is_some());
-        let msg = acp_msg.unwrap();
-        MessageId::parse(&msg.message_id).expect("ACP tool row has a canonical message ID");
-        assert_eq!(msg.msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
-        assert_eq!(msg.status.as_deref(), Some("work"));
-
-        let updates = repo.take_updates();
-        let acp_update = updates
-            .iter()
-            .find(|(id, _)| id == &msg.message_id);
-        assert!(acp_update.is_some());
-        let (_, upd) = acp_update.unwrap();
-        assert_eq!(upd.status, Some(Some("finish".to_owned())));
-
-        // Verify merge: raw_input from ToolCall is preserved, raw_output from ToolCallUpdate is added
-        let merged: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
-        let update_obj = merged.get("update").unwrap();
-        assert!(
-            update_obj.get("raw_input").is_some(),
-            "raw_input must be preserved after merge"
-        );
-        assert_eq!(
-            update_obj
-                .get("raw_input")
-                .unwrap()
-                .get("command")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "mv /tmp/a /tmp/b"
-        );
-        assert!(
-            update_obj.get("raw_output").is_some(),
-            "raw_output must be present after merge"
-        );
-    }
-
-    #[tokio::test]
-    async fn external_acp_export_title_cannot_complete_without_a_verified_artifact() {
-        use nomifun_ai_agent::protocol::events::tool_call::{
-            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-            AcpToolCallUpdateData,
-        };
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(64));
-        let mut ws_rx = bus.subscribe();
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_TURN_A.into(),
-            TEST_USER_ID.into(),
-            repo.clone(),
-            bus,
-            None,
-        );
-        let rx = tx.subscribe();
-
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "external-session".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCall,
-                tool_call_id: "external-export".into(),
-                status: Some(AcpToolCallStatus::InProgress),
-                title: Some("export_pdf".into()),
-                kind: None,
-                raw_input: Some(json!({"output_path": "report.pdf"})),
-                raw_output: None,
-                content: None,
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-        // External runtimes commonly omit repeated title/input metadata on the
-        // terminal delta. The active identity must remain authoritative.
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "external-session".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "external-export".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: None,
-                kind: None,
-                raw_input: None,
-                raw_output: Some(json!({"ok": true})),
-                content: None,
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
-            .unwrap();
-
-        let outcome = relay.consume(rx).await;
-        assert!(outcome.terminal.is_error());
-
-        let row = repo
-            .take_inserts()
-            .into_iter()
-            .find(|row| row.r#type == "acp_tool_call")
-            .expect("external ACP tool row");
-        let updates = repo.take_updates();
-        let (_, terminal) = updates
-            .iter()
-            .rev()
-            .find(|(id, _)| id == &row.message_id)
-            .expect("external ACP terminal correction");
-        assert_eq!(
-            terminal.status.as_ref().and_then(|status| status.as_deref()),
-            Some("error")
-        );
-        let content: Value =
-            serde_json::from_str(terminal.content.as_deref().expect("ACP correction content"))
-                .unwrap();
-        assert_eq!(content["update"]["status"], "failed");
-        assert!(content["update"]["raw_output"]
-            .as_str()
-            .is_some_and(|message| message.contains("required verified artifacts")));
-
-        let mut saw_finish = false;
-        while let Ok(event) = ws_rx.try_recv() {
-            saw_finish |= event.name == "message.stream" && event.data["type"] == "finish";
-        }
-        assert!(!saw_finish);
-    }
-
-    #[tokio::test]
-    async fn external_acp_duplicate_receipt_cannot_satisfy_requested_image_count() {
-        use nomifun_ai_agent::protocol::events::{
-            AcpToolCallContentItem,
-            tool_call::{
-                AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-                AcpToolCallUpdateData,
-            },
-        };
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(64));
-        let mut ws_rx = bus.subscribe();
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_TURN_A.into(),
-            TEST_USER_ID.into(),
-            repo.clone(),
-            bus,
-            None,
-        );
-        let rx = tx.subscribe();
-
-        let first = test_artifact("external-duplicate");
-        let mut duplicate = first.clone();
-        duplicate.id = PersistedArtifactId::new().into_string();
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "external-session".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "external-image-count".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: Some("image_gen".into()),
-                kind: None,
-                raw_input: Some(json!({"prompt": "two cats", "count": 2})),
-                raw_output: Some(json!({"ok": true})),
-                content: Some(vec![
-                    AcpToolCallContentItem::Artifact {
-                        artifact: first,
-                        source_uri: None,
-                    },
-                    AcpToolCallContentItem::Artifact {
-                        artifact: duplicate,
-                        source_uri: None,
-                    },
-                ]),
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
-            .unwrap();
-
-        let outcome = relay.consume(rx).await;
-        assert!(outcome.terminal.is_error());
-
-        let row = repo
-            .take_inserts()
-            .into_iter()
-            .find(|row| row.r#type == "acp_tool_call")
-            .expect("failed external ACP count row");
-        assert_eq!(row.status.as_deref(), Some("error"));
-        let content: Value = serde_json::from_str(&row.content).unwrap();
-        assert_eq!(content["update"]["status"], "failed");
-        assert_eq!(content["update"]["content"], json!([]));
-        assert!(content["update"]["raw_output"]
-            .as_str()
-            .is_some_and(|message| message.contains("same canonical artifact path")));
-
-        let mut saw_completed = false;
-        let mut saw_finish = false;
-        while let Ok(event) = ws_rx.try_recv() {
-            if event.name != "message.stream" {
-                continue;
-            }
-            saw_completed |= event.data["type"] == "acp_tool_call"
-                && event.data["data"]["update"]["status"] == "completed";
-            saw_finish |= event.data["type"] == "finish";
-        }
-        assert!(!saw_completed);
-        assert!(!saw_finish);
-    }
-
-    #[test]
-    fn external_acp_receipt_ids_are_validated_without_tool_identity() {
-        use nomifun_ai_agent::protocol::events::{
-            AcpToolCallContentItem,
-            tool_call::{
-                AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-                AcpToolCallUpdateData,
-            },
-        };
-
-        let first = test_artifact("identity-free-first");
-        let mut duplicate_id = test_artifact("identity-free-second");
-        duplicate_id.id = first.id.clone();
-        let result = validate_completed_acp_artifact_contract(&AcpToolCallEventData {
-            session_id: "external-session".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "identity-free-receipts".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: None,
-                kind: None,
-                raw_input: None,
-                raw_output: None,
-                content: Some(vec![
-                    AcpToolCallContentItem::Artifact {
-                        artifact: first,
-                        source_uri: None,
-                    },
-                    AcpToolCallContentItem::Artifact {
-                        artifact: duplicate_id,
-                        source_uri: None,
-                    },
-                ]),
-                locations: None,
-            },
-            meta: None,
-        });
-
-        assert!(result.unwrap_err().contains("same artifact id more than once"));
-    }
-
-    #[tokio::test]
-    async fn run_acp_terminal_update_without_start_is_upserted() {
-        use nomifun_ai_agent::protocol::events::tool_call::{
-            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
-        };
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(64));
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_TURN_A.into(),
-            TEST_USER_ID.into(),
-            repo.clone(),
-            bus,
-            None,
-        );
-        let rx = tx.subscribe();
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "sess-1".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "atc-001".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: Some("Bash".into()),
-                kind: None,
-                raw_input: None,
-                raw_output: Some(json!("Exit code: 0")),
-                content: None,
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
-
-        relay.consume(rx).await;
-
-        let inserts = repo.take_inserts();
-        let row = inserts
-            .iter()
-            .find(|row| row.r#type == "acp_tool_call")
-            .expect("terminal ACP update must survive a missing start event");
-        MessageId::parse(&row.message_id).expect("ACP tool row has a canonical message ID");
-        assert_eq!(row.status.as_deref(), Some("finish"));
-        let content: serde_json::Value = serde_json::from_str(&row.content).unwrap();
-        assert_eq!(content["turn_id"], TEST_TURN_A);
-    }
-
-    #[tokio::test]
-    async fn run_marks_active_acp_tool_failed_when_turn_is_truncated() {
-        use nomifun_ai_agent::protocol::events::{TurnStopReason, tool_call::{
-            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
-        }};
-
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(TestUserEventBus::new(64));
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            test_conversation_id(),
-            TEST_TURN_A.into(),
-            TEST_USER_ID.into(),
-            repo.clone(),
-            bus,
-            None,
-        );
-        let rx = tx.subscribe();
-        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "sess-1".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCall,
-                tool_call_id: "atc-001".into(),
-                status: Some(AcpToolCallStatus::InProgress),
-                title: Some("Bash".into()),
-                kind: None,
-                raw_input: Some(json!({"command": "sleep 10"})),
-                raw_output: None,
-                content: None,
-                locations: None,
-            },
-            meta: None,
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Finish(FinishEventData {
-            session_id: None,
-            stop_reason: Some(TurnStopReason::MaxTokens),
-        }))
-        .unwrap();
-
-        relay.consume(rx).await;
-
-        let tool_message_id = repo
-            .take_inserts()
-            .into_iter()
-            .find(|row| row.r#type == "acp_tool_call")
-            .expect("ACP tool must be persisted")
-            .message_id;
-        MessageId::parse(&tool_message_id).expect("ACP tool row has a canonical message ID");
-        let updates = repo.take_updates();
-        let (_, update) = updates
-            .iter()
-            .find(|(message_id, _)| message_id == &tool_message_id)
-            .expect("active ACP tool must be terminalized");
-        assert_eq!(update.status.as_ref().map(|s| s.as_deref()), Some(Some("error")));
-        let content: serde_json::Value = serde_json::from_str(update.content.as_deref().unwrap()).unwrap();
-        assert_eq!(content["update"]["status"], "failed");
-        assert_eq!(
-            content["update"]["raw_output"],
-            "The turn ended before this tool completed: max_tokens"
-        );
-    }
-
-    #[tokio::test]
     async fn run_tool_group_persists_message() {
         use nomifun_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
 
@@ -10674,7 +11165,8 @@ mod tests {
             bus,
             None,
         )
-        .with_artifact_workspace(workspace.clone());
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
 
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -10758,7 +11250,8 @@ mod tests {
             bus,
             None,
         )
-        .with_artifact_workspace(workspace.clone());
+        .with_artifact_workspace(workspace.clone())
+        .with_test_legacy_unjournaled_artifacts();
         let rx = tx.subscribe();
 
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -10972,6 +11465,10 @@ mod tests {
         fail_conversation_updates: AtomicBool,
         fail_message_correlations: AtomicBool,
         fail_artifact_commits: AtomicBool,
+        fail_artifact_reconciliation_read: AtomicBool,
+        fail_next_message_read: AtomicBool,
+        commit_artifact_rows_then_error: AtomicBool,
+        commit_first_artifact_row_then_error: AtomicBool,
         block_artifact_commits: AtomicBool,
         artifact_commit_attempts: AtomicUsize,
     }
@@ -10998,6 +11495,10 @@ mod tests {
                 fail_conversation_updates: AtomicBool::new(false),
                 fail_message_correlations: AtomicBool::new(false),
                 fail_artifact_commits: AtomicBool::new(false),
+                fail_artifact_reconciliation_read: AtomicBool::new(false),
+                fail_next_message_read: AtomicBool::new(false),
+                commit_artifact_rows_then_error: AtomicBool::new(false),
+                commit_first_artifact_row_then_error: AtomicBool::new(false),
                 block_artifact_commits: AtomicBool::new(false),
                 artifact_commit_attempts: AtomicUsize::new(0),
             }
@@ -11067,6 +11568,23 @@ mod tests {
                 .store(true, AtomicOrdering::SeqCst);
         }
 
+        fn fail_artifact_commit_with_unknown_reconciliation(&self) {
+            self.fail_artifact_reconciliation_read
+                .store(true, AtomicOrdering::SeqCst);
+            self.fail_artifact_commits
+                .store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn commit_artifact_rows_then_error(&self) {
+            self.commit_artifact_rows_then_error
+                .store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn commit_first_artifact_row_then_error(&self) {
+            self.commit_first_artifact_row_then_error
+                .store(true, AtomicOrdering::SeqCst);
+        }
+
         fn block_artifact_commits(&self) {
             self.block_artifact_commits
                 .store(true, AtomicOrdering::SeqCst);
@@ -11086,7 +11604,11 @@ mod tests {
         }
 
         fn take_inserts(&self) -> Vec<MessageRow> {
-            std::mem::take(&mut self.inserts.lock().unwrap())
+            let mut inserts = self.inserts.lock().unwrap();
+            std::mem::take(&mut *inserts)
+                .into_iter()
+                .filter(|row| !(matches!(row.r#type.as_str(), "turn_root" | "system") && row.hidden))
+                .collect()
         }
 
         #[allow(dead_code)]
@@ -11177,6 +11699,14 @@ mod tests {
             })
         }
         async fn get_message(&self, _conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {
+            if self
+                .fail_next_message_read
+                .swap(false, AtomicOrdering::SeqCst)
+            {
+                return Err(DbError::Init(
+                    "injected artifact reconciliation read failure".to_owned(),
+                ));
+            }
             Ok(self
                 .inserts
                 .lock()
@@ -11186,35 +11716,41 @@ mod tests {
                 .cloned())
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
-            self.message_insert_attempts
-                .fetch_add(1, AtomicOrdering::SeqCst);
-            while self.block_message_inserts.load(AtomicOrdering::SeqCst) {
-                let notified = self.message_insert_notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if !self.block_message_inserts.load(AtomicOrdering::SeqCst) {
-                    break;
+            let structural_turn_root = matches!(row.r#type.as_str(), "turn_root" | "system")
+                && row.hidden
+                && row.msg_id.as_deref() == Some(row.message_id.as_str());
+            if !structural_turn_root {
+                self.message_insert_attempts
+                    .fetch_add(1, AtomicOrdering::SeqCst);
+                while self.block_message_inserts.load(AtomicOrdering::SeqCst) {
+                    let notified = self.message_insert_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !self.block_message_inserts.load(AtomicOrdering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
                 }
-                notified.await;
+                if self
+                    .commit_next_message_insert_then_error
+                    .swap(false, AtomicOrdering::SeqCst)
+                {
+                    self.inserts.lock().unwrap().push(row.clone());
+                    return Err(DbError::Init(
+                        "injected committed-but-unacknowledged message insert".to_owned(),
+                    ));
+                }
+                if self.fail_message_inserts.load(AtomicOrdering::SeqCst) {
+                    return Err(DbError::Conflict("injected message insert failure".to_owned()));
+                }
+                if self.fail_next_message_insert.swap(false, AtomicOrdering::SeqCst) {
+                    return Err(DbError::Conflict("injected message insert failure".to_owned()));
+                }
             }
-            if self
-                .commit_next_message_insert_then_error
-                .swap(false, AtomicOrdering::SeqCst)
-            {
-                self.inserts.lock().unwrap().push(row.clone());
-                return Err(DbError::Init(
-                    "injected committed-but-unacknowledged message insert".to_owned(),
-                ));
-            }
-            if self.fail_message_inserts.load(AtomicOrdering::SeqCst) {
-                return Err(DbError::Conflict("injected message insert failure".to_owned()));
-            }
-            if self.fail_next_message_insert.swap(false, AtomicOrdering::SeqCst) {
-                return Err(DbError::Conflict("injected message insert failure".to_owned()));
-            }
-            if self
-                .reject_duplicate_message_inserts
-                .load(AtomicOrdering::SeqCst)
+            if (structural_turn_root
+                || self
+                    .reject_duplicate_message_inserts
+                    .load(AtomicOrdering::SeqCst))
                 && self
                     .inserts
                     .lock()
@@ -11240,10 +11776,23 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             if self.fail_artifact_commits.load(AtomicOrdering::SeqCst) {
+                if self
+                    .fail_artifact_reconciliation_read
+                    .load(AtomicOrdering::SeqCst)
+                {
+                    self.fail_next_message_read
+                        .store(true, AtomicOrdering::SeqCst);
+                }
                 return Err(DbError::Conflict(
                     "injected atomic artifact commit failure".to_owned(),
                 ));
             }
+            let commit_then_error = self
+                .commit_artifact_rows_then_error
+                .swap(false, AtomicOrdering::SeqCst);
+            let partial_commit_then_error = self
+                .commit_first_artifact_row_then_error
+                .swap(false, AtomicOrdering::SeqCst);
 
             let mut inserts = self.inserts.lock().unwrap();
             let mut updates = self.updates.lock().unwrap();
@@ -11259,6 +11808,18 @@ mod tests {
                             .to_owned(),
                     ));
                 }
+            }
+            if partial_commit_then_error {
+                let message = messages.first().expect("artifact commit batch is not empty");
+                let row = inserts
+                    .iter_mut()
+                    .find(|row| row.message_id == message.message_id)
+                    .expect("provisional artifact row exists");
+                row.content.clone_from(&message.content);
+                row.status = Some("finish".to_owned());
+                return Err(DbError::Init(
+                    "injected partial artifact commit with lost acknowledgement".to_owned(),
+                ));
             }
             let mut committed = Vec::with_capacity(messages.len());
             for message in messages {
@@ -11291,6 +11852,23 @@ mod tests {
                     inserts.push(row.clone());
                     committed.push(row);
                 }
+            }
+            if commit_then_error {
+                // Model a transaction that became durable before its caller
+                // received an acknowledgement. The relay must recover this as
+                // success by querying every exact finished row and must retain
+                // the physical artifact snapshots.
+                for message in messages {
+                    let row = inserts
+                        .iter_mut()
+                        .find(|row| row.message_id == message.message_id)
+                        .expect("committed artifact row exists");
+                    row.content.clone_from(&message.content);
+                    row.status = Some("finish".to_owned());
+                }
+                return Err(DbError::Init(
+                    "injected durable artifact commit with lost acknowledgement".to_owned(),
+                ));
             }
             Ok(committed)
         }

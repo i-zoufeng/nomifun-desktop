@@ -4,8 +4,6 @@ use nomifun_api_types::{
 };
 use nomifun_common::AppError;
 
-use super::error::AcpError;
-
 const MAX_DETAIL_CHARS: usize = 1000;
 
 #[derive(Debug, Clone)]
@@ -240,111 +238,6 @@ impl std::error::Error for AgentSendError {}
 impl From<AppError> for AgentSendError {
     fn from(err: AppError) -> Self {
         Self::from_app_error(err)
-    }
-}
-
-impl From<AcpError> for AgentSendError {
-    fn from(err: AcpError) -> Self {
-        let detail = err.to_string();
-        match &err {
-            AcpError::SpawnFailed { .. } => Self::new(
-                "The selected Agent executable could not be started",
-                AgentErrorCode::UserAgentNotInstalled,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                false,
-                false,
-                resolution(
-                    AgentErrorResolutionKind::CheckAgentInstallation,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
-            ),
-            AcpError::StartupCrash { .. } | AcpError::InitTimeout { .. } => Self::new(
-                "The selected Agent failed to start",
-                AgentErrorCode::UserAgentStartupFailed,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                true,
-                false,
-                resolution(
-                    AgentErrorResolutionKind::CheckAgentInstallation,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
-            ),
-            AcpError::Disconnected { .. } => Self::new(
-                "The selected Agent disconnected",
-                AgentErrorCode::UserAgentDisconnected,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                true,
-                false,
-                resolution(
-                    AgentErrorResolutionKind::ReconnectAgent,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
-            ),
-            AcpError::AuthRequired => Self::new(
-                "The selected Agent requires authentication",
-                AgentErrorCode::UserAgentAuthRequired,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                false,
-                false,
-                resolution(
-                    AgentErrorResolutionKind::CheckAgentLogin,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
-            ),
-            AcpError::SessionNotFound { .. } => Self::new(
-                "The Agent session was not found",
-                AgentErrorCode::UserAgentSessionNotFound,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                true,
-                false,
-                resolution(
-                    AgentErrorResolutionKind::StartNewSession,
-                    Some(AgentErrorResolutionTarget::NewConversation),
-                ),
-            ),
-            AcpError::MethodNotFound { .. } => Self::new(
-                "The selected Agent does not support this operation",
-                AgentErrorCode::UserAgentUnsupportedMethod,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                false,
-                false,
-                resolution(
-                    AgentErrorResolutionKind::CheckAgentVersion,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
-            ),
-            AcpError::InvalidParams { .. } => Self::new(
-                "The selected Agent rejected the request parameters",
-                AgentErrorCode::UserAgentInvalidParams,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                false,
-                true,
-                resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
-                ),
-            ),
-            AcpError::NotConnected => Self::new(
-                "Nomi lost its Agent protocol connection",
-                AgentErrorCode::NomifunInternalError,
-                AgentErrorOwnership::Nomifun,
-                Some(detail),
-                true,
-                true,
-                resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
-                ),
-            ),
-            AcpError::AgentInternal { .. } => classify_upstream_detail(&detail),
-        }
     }
 }
 
@@ -634,6 +527,20 @@ fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
             None,
         ));
     }
+    // A clean HTTP EOF without the provider protocol's terminal marker is an
+    // upstream truncation, not evidence that the configured endpoint cannot
+    // be reached. Keep this ahead of generic timeout/network matching so the
+    // typed provider error cannot be misdirected to Base URL settings if its
+    // diagnostic happens to mention a transport detail.
+    if lower.contains("provider stream truncated") {
+        return Some(provider_error(
+            "The model provider returned a truncated response",
+            AgentErrorCode::UserLlmProviderGatewayError,
+            true,
+            AgentErrorResolutionKind::Retry,
+            None,
+        ));
+    }
     if contains_any(lower, &["504", "timeout", "deadline exceeded", "gateway timeout"]) {
         return Some(provider_error(
             "The model provider did not respond in time",
@@ -909,25 +816,7 @@ fn redact_secret_words(line: &str) -> String {
 }
 
 fn redact_url_queries(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|word| {
-            if (word.starts_with("http://") || word.starts_with("https://")) && word.contains('?') {
-                let end_punct = word
-                    .chars()
-                    .last()
-                    .filter(|c| matches!(c, '.' | ',' | ';' | ')' | ']'))
-                    .map(|c| c.to_string())
-                    .unwrap_or_default();
-                let trimmed = word.trim_end_matches(['.', ',', ';', ')', ']']);
-                let base = trimmed.split_once('?').map(|(base, _)| base).unwrap_or(trimmed);
-                format!("{base}?<redacted>{end_punct}")
-            } else {
-                word.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    nomifun_net::secret_redaction::redact_url_queries(input)
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -1022,12 +911,20 @@ mod tests {
             "Nomi agent error: API error: OpenAI-compatible provider emitted non-usage data after finish_reason",
             "Nomi agent error: API error: OpenAI-compatible provider returned a tool call with a missing function name (call `call_123`)",
             "Nomi agent error: API error: provider stream protocol violation: tool progress 'Write' (call-123) was not advertised in this request",
+            "Nomi agent error: API error: Provider stream truncated: OpenAI-compatible stream ended before finish_reason",
         ] {
             let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
             assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderGatewayError));
             assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
             assert_eq!(err.stream_error().retryable, Some(true));
             assert_eq!(err.stream_error().feedback_recommended, Some(false));
+            assert_eq!(
+                err.stream_error()
+                    .resolution
+                    .and_then(|resolution| resolution.target),
+                None,
+                "protocol/truncation errors must not send the user to Base URL settings"
+            );
         }
     }
 
@@ -1055,6 +952,12 @@ mod tests {
         assert_eq!(
             redact_url_queries("GET https://example.com/v1?api_key=sk-secret"),
             "GET https://example.com/v1?<redacted>"
+        );
+        assert_eq!(
+            redact_url_queries(
+                r#"Post "https://chatgpt.com/backend-api/codex/responses?access_token=sk-secret": EOF"#
+            ),
+            r#"Post "https://chatgpt.com/backend-api/codex/responses?<redacted>": EOF"#
         );
     }
 
@@ -1364,17 +1267,6 @@ mod tests {
         assert_eq!(app_err.stream_error().feedback_recommended, Some(true));
         assert_eq!(
             app_err.stream_error().resolution.map(|value| value.kind),
-            Some(AgentErrorResolutionKind::SendFeedback)
-        );
-
-        let acp_err = AgentSendError::from(AcpError::InvalidParams {
-            message: "malformed request".into(),
-        });
-        assert_eq!(acp_err.code(), Some(AgentErrorCode::UserAgentInvalidParams));
-        assert_eq!(acp_err.stream_error().retryable, Some(false));
-        assert_eq!(acp_err.stream_error().feedback_recommended, Some(true));
-        assert_eq!(
-            acp_err.stream_error().resolution.map(|value| value.kind),
             Some(AgentErrorResolutionKind::SendFeedback)
         );
     }

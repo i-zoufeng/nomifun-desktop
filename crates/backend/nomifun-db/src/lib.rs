@@ -41,12 +41,16 @@ pub use models::{
     NewCsAgentRow,
 };
 pub use models::{
-    NewProviderModel, ProviderConnectionRow, ProviderModelRow, ProviderModelUpdate,
+    NewProviderModel, NewProviderModelCapability, ProviderConnectionRow,
+    ProviderModelCapabilityRow, ProviderModelRow,
     UpsertProviderConnectionParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::customer_service::{
     CsDialogueKey, ICustomerServiceRepository, UpdateCsAgentParams,
+};
+pub use repository::customer_service_search::{
+    CsNoteSearchHit, NoteMatchChannel, backfill_note_search_text, fts_rebuild, note_search_text,
 };
 pub use repository::SqliteCustomerServiceRepository;
 pub use repository::conversation::{
@@ -67,7 +71,6 @@ pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::miniapp::{CreateMiniAppParams, IMiniAppRepository, UpdateMiniAppParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
-pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::ssh_host::{
     CreateSshHostParams, ISshHostRepository, UpdateSshHostParams,
 };
@@ -88,31 +91,32 @@ pub use repository::{
     NewAgentExecutionTemplateParticipant, UpdateAgentExecutionTemplateParams,
     LoopRepeatResetParams,
     RetryAgentExecutionStep, SettleAgentExecutionAttemptParams, UpdateAgentExecutionParams,
-    CreateAcpSessionParams, CreateTerminalParams, IAcpSessionRepository,
+    CreateTerminalParams,
     IAgentMetadataRepository, IAttachmentRepository, ChannelInboundClaim,
     IChannelRepository, PENDING_PROMPT_EXPIRY_MS, PENDING_PROMPT_QUEUE_LIMIT,
-    PendingPromptEnqueue, SettleChannelInboundReceiptParams,
-    IClientPreferenceRepository, ICompanionTokenRepository,
+    PairingApprovalOutcome, PendingPromptEnqueue, SettleChannelInboundReceiptParams,
+    IClientPreferenceRepository, ICompanionTokenRepository, KNOWLEDGE_RETRIEVAL_KEY,
     IConversationRepository, ICronRepository, IIdmmInterventionRepository,
     IdmmActionReservationKey, IdmmActionReserveResult, IdmmActionSettleResult,
     IdmmActionSettlement, IdmmActionTurnIdentity, IKnowledgeRepository,
     IMcpServerRepository, IOAuthTokenRepository,
-    IProviderConnectionRepository, IProviderModelRepository, IProviderRepository,
-    IRemoteAgentRepository, IRequirementRepository, ISettingsRepository, ISkillTagRepository,
+    IProviderConnectionRepository, IProviderModelCapabilityRepository, IProviderModelRepository,
+    IProviderRepository,
+    IRequirementRepository, ISettingsRepository, ISkillTagRepository,
     ITagSettingRepository, ITerminalRepository, IUserRepository, IWebhookRepository,
     ListRequirementsParams, RequirementClaim, RequirementClaimResolution,
     MAX_IDMM_ACTION_FAILURE_REASON_CHARS, PER_TARGET_CAP, PER_USER_ACTIVITY_CAP,
-    PersistedSessionState, ReserveIdmmActionParams,
-    SaveRuntimeStateParams,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAttachmentRepository,
+    ReserveIdmmActionParams,
+    SqliteAgentMetadataRepository, SqliteAttachmentRepository,
     SqliteAgentExecutionRepository,
     SqliteAgentExecutionTemplateRepository,
     SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteCompanionTokenRepository,
     SqliteConversationRepository, SqliteCronRepository,
     SqliteIdmmInterventionRepository, SqliteKnowledgeRepository, SqliteMcpServerRepository,
     SqliteOAuthTokenRepository,
-    SqliteProviderConnectionRepository, SqliteProviderModelRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteRequirementRepository, SqliteSettingsRepository,
+    SqliteProviderConnectionRepository, SqliteProviderModelCapabilityRepository,
+    SqliteProviderModelRepository, SqliteProviderRepository,
+    SqliteRequirementRepository, SqliteSettingsRepository,
     SqliteSkillTagRepository, SqliteTagSettingRepository, SqliteTerminalRepository,
     SqliteUserRepository, SqliteWebhookRepository, TerminalTurnAdmissionClaim,
     TerminalTurnAdmissionKey, TerminalTurnAdmissionScope, TerminalTurnEffectsStart,

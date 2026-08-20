@@ -34,18 +34,53 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
-pub const CLAUDE_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
-pub const GEMINI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000103";
-
-pub fn acp_extra() -> serde_json::Value {
-    serde_json::json!({
-        "agent_id": GEMINI_AGENT_ID,
-    })
+/// Produce real encrypted-at-rest fixture credentials whose plaintext follows
+/// the canonical typed credential-object contract.
+pub fn encrypted_bearer_credentials() -> String {
+    nomifun_common::encrypt_string(r#"{"api_keys":["test-only"]}"#, &[0x42; 32]).unwrap()
 }
 
-pub fn acp_extra_with_workspace(workspace: impl Into<String>) -> serde_json::Value {
+/// Idempotently seed one enabled model with an exact Chat capability.
+///
+/// The protocol is explicit so App E2E fixtures exercise the same normalized,
+/// task-scoped authority as production.
+pub async fn seed_openai_chat_model(
+    pool: &nomifun_db::SqlitePool,
+    provider_id: &str,
+    model: &str,
+) {
+    nomifun_db::sqlx::query(
+        "INSERT OR IGNORE INTO provider_models \
+         (provider_id, model, enabled, sort_order, description, created_at, updated_at) \
+         VALUES (?, ?, 1, 0, NULL, 1, 1)",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await
+    .unwrap();
+    nomifun_db::sqlx::query(
+        "INSERT OR IGNORE INTO provider_model_capabilities \
+         (provider_id, model, task, traits, protocol, connection_role, \
+          allow_cross_origin_credentials, provider_params, created_at, updated_at) \
+         VALUES (?, ?, 'chat', '[]', 'openai.chat_text', 'default', 0, '{}', 1, 1)",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// `extra` for a nomi conversation that does not pin a workspace. The backend
+/// auto-provisions a managed workspace under the work dir when this is empty.
+pub fn nomi_extra() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// `extra` for a nomi conversation bound to an explicit workspace path.
+pub fn nomi_extra_with_workspace(workspace: impl Into<String>) -> serde_json::Value {
     serde_json::json!({
-        "agent_id": GEMINI_AGENT_ID,
         "workspace": workspace.into(),
     })
 }
@@ -182,7 +217,7 @@ struct NoopMockAgent {
 #[async_trait::async_trait]
 impl AgentRuntimeControl for NoopMockAgent {
     fn agent_type(&self) -> nomifun_common::AgentType {
-        nomifun_common::AgentType::Acp
+        nomifun_common::AgentType::Nomi
     }
     fn conversation_id(&self) -> &str {
         &self.conversation_id

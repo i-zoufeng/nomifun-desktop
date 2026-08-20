@@ -15,14 +15,14 @@ export interface SlashCommandListAvailabilityInput {
 /**
  * Determines whether the slash command autocomplete list should be enabled.
  *
- * Slash commands are supported by ACP and nomi agent types. The backend's
+ * Slash commands are supported by the nomi agent type. The backend's
  * `/slash-commands` endpoint returns an empty list for other agent types
- * (openclaw-gateway / nanobot / remote), so calling it from those is waste
+ * for a runtime without a slash-command catalog, so calling it there is waste
  * (and additionally 404s when the agent has not been warmed up yet).
  *
  * @param input - Conversation type and status information
  * @returns true if slash commands should be enabled
  */
 export function isSlashCommandListEnabled(input: SlashCommandListAvailabilityInput): boolean {
-  return input.conversation_type === 'acp' || input.conversation_type === 'nomi';
+  return input.conversation_type === 'nomi';
 }

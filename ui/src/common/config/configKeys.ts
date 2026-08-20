@@ -1,38 +1,17 @@
-import type { AcpInitializeResult, AcpSessionConfigOption, AcpSessionModes } from '@/common/types/platform/acpTypes';
 import type { SpeechToTextConfig, TextToSpeechConfig } from '@/common/types/provider/speech';
 import type { ICssTheme } from '@/common/config/storage';
 import type { CompanionId, ProviderId } from '@/common/types/ids';
 
-// `headless` (default) and `external` are the two supported user policies;
-// `embedded` remains in the read type only so installations can migrate the
-// removed viewer's persisted value. New product code persists only
-// `headless` or `external`.
-export type BrowserDisplayMode = 'embedded' | 'external' | 'headless';
+// `auto` (default), `headless` and `external` are the three supported user
+// policies; `embedded` remains in the read type only so installations can
+// migrate the removed viewer's persisted value. New product code persists only
+// `auto`, `headless` or `external`.
+export type BrowserDisplayMode = 'embedded' | 'external' | 'headless' | 'auto';
 
 export type ConfigKeyMap = {
   'google.config': {
     proxy?: string;
   };
-  'codex.config':
-    | { cli_path?: string; yoloMode?: boolean; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access' }
-    | undefined;
-  'acp.config': {
-    [backend: string]: {
-      auth_methodId?: string;
-      authToken?: string;
-      lastAuthTime?: number;
-      cli_path?: string;
-      yoloMode?: boolean;
-      preferredMode?: string;
-      preferredModelId?: string;
-      promptTimeout?: number;
-    };
-  };
-  'acp.promptTimeout': number | undefined;
-  'acp.agentIdleTimeout': number | undefined;
-  'acp.cachedInitializeResult': Record<string, AcpInitializeResult> | undefined;
-  'acp.cached_config_options': Record<string, AcpSessionConfigOption[]> | undefined;
-  'acp.cachedModes': Record<string, AcpSessionModes> | undefined;
   language: string;
   theme: string;
   colorScheme: string;
@@ -53,7 +32,10 @@ export type ConfigKeyMap = {
   // generators (autogen / description.generate / description.polish). Empty
   // value = let the backend fall back to its own default completer model.
   'knowledge.autogenModel': { provider_id: ProviderId; model: string } | undefined;
-  'tools.imageGenerationModel': { provider_id: ProviderId; model: string; switch?: boolean };
+  // Install-wide default for the native image-generation task. Missing means
+  // the backend may choose from the available image models (for example by
+  // round-robin); there is no separate tool enable switch.
+  'models.default.imageGeneration': { provider_id: ProviderId; model: string } | undefined;
   'tools.speechToText': SpeechToTextConfig | undefined;
   // Install-wide speech-synthesis default. Registered backend-side as a REQUIRED
   // Provider reference (nomifun-db client_preference), so an absent key — not a
@@ -78,15 +60,18 @@ export type ConfigKeyMap = {
   // Read by the backend agent factory per session.
   'agent.browserUse': boolean | undefined;
   // Application-level browser default visibility policy. New installs persist
-  // `headless` (silent Agent browsing); the user may explicitly choose
-  // `external` (default-visible Primary). Historical `embedded`, unversioned,
-  // and legacy `agent.browserUse.silent` state all fail closed to `headless`.
-  // Agent tool input can never select the mode.
+  // `auto` (the host resolves visibility per lane, staying silent for routine
+  // work); the user may pin `headless` (never visible) or `external`
+  // (default-visible Primary). Historical `embedded`, unversioned, and legacy
+  // `agent.browserUse.silent` state all fail closed to `auto`, which still
+  // launches silently. Agent tool input can only declare intent, never select
+  // the mode.
   'agent.browserUse.displayMode': BrowserDisplayMode | undefined;
-  // Lineage marker for an explicit visibility policy. Only v2 plus a valid
-  // displayMode may be shown as a trusted local fallback; the live owner API
-  // remains authoritative.
-  'agent.browserUse.displayModeVersion': 2 | undefined;
+  // Lineage marker for an explicit visibility policy. Only the current version
+  // plus a valid displayMode is authoritative as a local fallback; a v2 marker
+  // is still recognized so an explicit `external` survives migration. The live
+  // owner API remains authoritative.
+  'agent.browserUse.displayModeVersion': 2 | 3 | undefined;
   // Legacy compatibility read only. New settings code must not write this key.
   // Visibility migration no longer derives an external window from this key.
   // Elastic crawl/replica/isolated hosts choose headless execution internally.

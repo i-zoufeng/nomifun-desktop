@@ -22,7 +22,6 @@ const TEST_USER_B: &str = "0190f5fe-7c00-7a00-8abc-012345678914";
 const TEST_USER_SECONDARY: &str = "0190f5fe-7c00-7a00-8abc-012345678915";
 const TEST_COMPANION: &str = "0190f5fe-7c00-7a00-8abc-012345678921";
 const TEST_PROVIDER: &str = "0190f5fe-7c00-7a00-8abc-012345678931";
-const TEST_CODEX_AGENT: &str = "0190f5fe-7c00-7a00-8000-000000000102";
 
 use serde_json::{Value, json};
 
@@ -139,26 +138,19 @@ async fn seed_user_and_conversation_with_extra(
 /// `nomi_cron_create` auto-filling a model-less nomi conversation) can
 /// complete their fallback chain.
 async fn seed_provider(services: &nomifun_app::AppServices, provider_id: &str, model: &str) {
+    let credentials_encrypted = common::encrypted_bearer_credentials();
     sqlx::query(
         "INSERT OR IGNORE INTO providers \
-         (provider_id, platform, name, base_url, api_key_encrypted, enabled, created_at, updated_at) \
-         VALUES (?, 'openai', ?, 'http://127.0.0.1:1', 'k', 1, 0, 0)",
+         (provider_id, platform, name, base_url, auth_scheme, credentials_encrypted, enabled, created_at, updated_at) \
+         VALUES (?, 'openai', ?, 'http://127.0.0.1:1', 'bearer', ?, 1, 0, 0)",
     )
     .bind(provider_id)
     .bind(format!("Provider {provider_id}"))
+    .bind(&credentials_encrypted)
     .execute(services.database.pool())
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT OR IGNORE INTO provider_models \
-         (provider_id, model, enabled, sort_order, tasks, traits, params, source, created_at, updated_at) \
-         VALUES (?, ?, 1, 0, '[]', '[]', '{}', 'inferred', 0, 0)",
-    )
-    .bind(provider_id)
-    .bind(model)
-    .execute(services.database.pool())
-    .await
-    .unwrap();
+    common::seed_openai_chat_model(services.database.pool(), provider_id, model).await;
 }
 
 fn result_of(body: &Value) -> &Value {
@@ -302,7 +294,7 @@ async fn gw_plain_conversation_cannot_create_a_top_level_conversation() {
             "nomi_create_conversation",
             TEST_CONV_1,
             services.authoritative_user_id.as_ref(),
-            json!({"name": "must not exist", "agent_type": "acp", "backend": "codex"}),
+            json!({"name": "must not exist"}),
         )
         .await;
     assert_eq!(error_of(&body), "session_capability_denied");
@@ -317,6 +309,10 @@ async fn gw_plain_conversation_cannot_create_a_top_level_conversation() {
 #[tokio::test]
 async fn gw_companion_can_create_a_top_level_conversation() {
     let (_app, services) = build_app().await;
+    // Every conversation now runs on nomi, so creation always resolves a
+    // provider/model pair through the fallback chain — a model-less desktop is
+    // refused before the capability check can be observed.
+    seed_provider(&services, TEST_PROVIDER, "test-model").await;
     let gw = Gateway::from_services(&services);
 
     let body = gw
@@ -325,17 +321,12 @@ async fn gw_companion_can_create_a_top_level_conversation() {
             TEST_COMPANION_CALLER,
             services.authoritative_user_id.as_ref(),
             Some(TEST_COMPANION),
-            json!({
-                "name": "伙伴创建的会话",
-                "agent_type": "acp",
-                "agent_id": TEST_CODEX_AGENT,
-                "backend": "codex"
-            }),
+            json!({ "name": "伙伴创建的会话" }),
         )
         .await;
     let created = result_of(&body);
     assert_eq!(created["name"], json!("伙伴创建的会话"));
-    assert_eq!(created["agent_type"], json!("acp"));
+    assert_eq!(created["agent_type"], json!("nomi"));
 
     let persisted: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversations WHERE name = '伙伴创建的会话'",

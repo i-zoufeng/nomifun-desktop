@@ -77,7 +77,7 @@ bun run dev
 日志——这就是嵌入式后端。渲染端会读取 `window.__backendPort`（由 Tauri
 外壳作为 init script 注入），因此 SPA 始终知道 `/api` 该往哪里调用。
 
-![以开发模式运行的 nomifun-desktop 与嵌入式后端](../images/gs-02-desktop-dev.png)
+![NomiFun 桌面工作台](../images/getting-started/zh/desktop-home.png)
 
 ### 构建 Release 二进制
 
@@ -152,7 +152,7 @@ listening on 127.0.0.1:8787  auth=required  dist=../../ui/dist
 在浏览器中打开 `http://127.0.0.1:8787`。首次访问会被引导到设置页——
 你输入的用户名与密码**将成为初始管理员账户**。此后所有人都需要登录。
 
-![浏览器中的首次启动管理员设置](../images/gs-03-web-first-run-setup.png)
+![当前 WebUI 认证入口](../images/gs-03-web-first-run-setup.png)
 
 ### 常用参数
 
@@ -190,8 +190,8 @@ nomifun-web \
 [`nomifun/nomifun-web`](https://hub.docker.com/repository/docker/nomifun/nomifun-web)。
 它是一个**无 GUI**镜像：在 `debian:bookworm-slim` 上的 SPA + `nomifun-web` +
 `bun`。仓库也附带一份多阶段 `Dockerfile` 与一份 `docker-compose.yml`，
-用于从源码本地构建。下面示例使用已发布的 `v0.3.4` tag；后续有新版本时，
-可按 Docker Hub 页面替换。
+用于从源码本地构建。下面示例使用 Docker Hub 发布的稳定滚动标签 `latest`。
+如需可复现部署，请固定明确版本或镜像 digest。
 
 ### 使用官方镜像快速上手
 
@@ -201,7 +201,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8787:8787 \
   -v nomifun-data:/data \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 # 然后访问 http://<server-ip>:8787
 ```
 
@@ -215,7 +215,7 @@ docker run -d \
   -v nomifun-data:/data \
   -e NOMIFUN_ADMIN_USERNAME=admin \
   -e NOMIFUN_ADMIN_PASSWORD='change-me-to-something-strong' \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 ```
 
 ### 用 Compose 从源码本地构建

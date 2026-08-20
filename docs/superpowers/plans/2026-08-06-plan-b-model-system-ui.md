@@ -1,5 +1,8 @@
 # Plan B — 模型体系与 UI Implementation Plan
 
+> [!CAUTION]
+> **模型体系与 UI 部分已被 2026-08-11 现行规范替代。** 本文只保留为历史执行计划，不再约束模型管理实现；尤其不得继续执行其中“旧模型表不改”、客户端任务投影、旧选择接口或“不得修复既有债务”等指令。当前单一能力源、九模态统一编辑器、后端协议 manifest、自由模型 ID 和每模态 transport 配置以[《模型供应商 × 模态官方接口核验矩阵（2026-08-11）》](../../specs/2026-08-11-provider-modality-official-matrix.zh.md)为准。本文其余历史正文未重写。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把伙伴档案扩成五类模型槽位、给 TTS 补上全局偏好与配置面、把模型管理页从「供应商为主」翻成「模态为主」，并在伙伴远程 Tab 加出「机器人连接」专项。
@@ -10,7 +13,7 @@
 
 ## Global Constraints
 
-- Git 署名：绝不让 AI 出现在 author / committer / co-author；绝不加 `Co-authored-by` / `Generated-by` / `Assisted-by` 等 trailer；不得 `--no-verify`；作者固定 `RiKa0-0 <2206491416@qq.com>`（仓库 `git config` 已是该值，直接 `git commit` 即可）。
+- Git 署名：绝不让 AI 出现在 author / committer / co-author；绝不加 `Co-authored-by` / `Generated-by` / `Assisted-by` 等 trailer；不得 `--no-verify`；作者固定 `NomiFun Contributor <nomifun@users.noreply.github.com>`（仓库 `git config` 已是该值，直接 `git commit` 即可）。
 - 绝不在 `.github/workflows/` 下创建任何文件。
 - commit message 用英文 conventional commits；本计划正文中文，代码 / 标识符 / commit message 英文。
 - 本仓库 Linux 全量测试有 14 个既有失败。任务内**只跑目标包 / 目标文件**的测试，绝不跑 `bun run test` / `cargo test` 全量。

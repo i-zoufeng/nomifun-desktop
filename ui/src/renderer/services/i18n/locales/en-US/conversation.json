@@ -202,10 +202,6 @@
         "title": "Agent handshake timed out",
         "body": "The selected agent did not finish its startup handshake in time. The first launch may need to download the agent runtime (tens of MB) — check your network/proxy, then retry; retrying resumes cleanly."
       },
-      "USER_AGENT_ACP_INIT_FAILED": {
-        "title": "Agent protocol initialization failed",
-        "body": "The app could not initialize the Agent Client Protocol session with this agent. Check the agent version and reconnect."
-      },
       "USER_AGENT_PROTOCOL_MISMATCH": {
         "title": "Agent protocol versions are incompatible",
         "body": "The selected agent is using an incompatible protocol version. Update the agent or switch to a compatible one."
@@ -396,7 +392,8 @@
   "chat": {
     "noModelSelected": "No model selected for current session, cannot send message",
     "modelHealedToDefault": "Switched to your default model {{model}}",
-    "visionModelHint": "The selected model {{model}} may not support image input; image attachments may be ignored or fail.",
+    "visionModelBlocked": "The selected model {{model}} does not declare vision input. Choose a chat model marked Vision input, or remove the image attachment before sending.",
+    "visionCapabilityUnavailable": "Model capabilities could not be verified. Wait for the model list to load and try again, or remove the image attachment.",
     "sendMessageTo": "Send message to {{model}}",
     "processing": "Processing...",
     "quotaExceededTitle": "Model quota reached",
@@ -538,7 +535,7 @@
   "notFound": "Conversation not found or has been deleted",
   "steer": {
     "button": "Send now (interject into the running reply)",
-    "fallbackQueued": "This engine can't interject mid-reply — added to the queue instead."
+    "fallbackQueued": "Couldn't interject into the running reply — added to the queue instead, with your attachments."
   },
   "stop": {
     "failed": "Failed to stop the current task. Please try again."

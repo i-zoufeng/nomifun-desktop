@@ -1,7 +1,7 @@
 //! Integration tests for `POST /api/system/work-dir` — durably binding a
 //! changed root to a one-shot fresh dataset before the next boot.
 
-use std::sync::Arc;
+mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -9,13 +9,23 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
-use nomifun_db::{
-    SqliteClientPreferenceRepository, SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
-};
-use nomifun_system::{
-    ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService, SettingsService,
-    SystemRouterState, VersionCheckService, system_routes,
-};
+use nomifun_db::init_database_memory;
+use nomifun_system::{VersionCheckService, system_routes};
+
+/// Compare work-dir paths through one normalization.
+///
+/// On Windows `std::fs::canonicalize` returns a `\?\` verbatim path while the
+/// persisted reset request stores the plain one, so asserting the stored value
+/// equals `canonicalize(...)` output compares two spellings of the same
+/// directory and fails. Normalizing both sides states the intent — same
+/// directory — without depending on which spelling each side happens to use.
+fn same_dir(left: Option<&std::path::Path>, right: &std::path::Path) -> bool {
+    fn norm(path: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+    left.map(norm) == Some(norm(right))
+}
+
 
 const TEST_KEY: [u8; 32] = [0x42; 32];
 
@@ -70,36 +80,17 @@ async fn setup_with_work_and_cli_override(
     work_dir_is_cli_override: bool,
 ) -> axum::Router {
     let db = init_database_memory().await.unwrap();
-    let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
     let http_client = reqwest::Client::new();
-    let state = SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
-        client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
-        provider_service: ProviderService::new(
-            provider_repo.clone(),
-            Arc::new(nomifun_db::SqliteProviderModelRepository::new(db.pool().clone())),
-            TEST_KEY,
-        ),
-        provider_connection_service: nomifun_system::ProviderConnectionService::new(
-            std::sync::Arc::new(nomifun_db::SqliteProviderConnectionRepository::new(db.pool().clone())),
-            provider_repo.clone(),
-            TEST_KEY,
-        ),
-        model_fetch_service: ModelFetchService::new(provider_repo.clone(), TEST_KEY, http_client.clone()),
-        model_profile_service: nomifun_system::ModelProfileService::new(std::sync::Arc::new(
-            nomifun_db::SqliteProviderModelRepository::new(db.pool().clone()),
-        )),
-        provider_model_service: nomifun_system::ProviderModelService::new(
-            std::sync::Arc::new(nomifun_db::SqliteProviderModelRepository::new(db.pool().clone())),
-            provider_repo.clone(),
-        ),
-        managed_model_service: None,
-        protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
-        version_check_service: VersionCheckService::new(http_client, "1.0.0".to_owned()),
+    let state = common::build_system_state(
+        &db,
+        TEST_KEY,
+        http_client.clone(),
+        VersionCheckService::new(http_client, "1.0.0".to_owned()),
+        None,
+        data_dir,
         work_dir,
         work_dir_is_cli_override,
-        data_dir,
-    };
+    );
     system_routes(state)
 }
 
@@ -134,11 +125,12 @@ async fn explicit_factory_reset_binds_the_live_work_root_without_parsing_a_damag
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
+    assert!(same_dir(
         nomifun_common::factory_reset::requested_v3_reset_work_dir(&data_dir)
-            .unwrap(),
-        Some(std::fs::canonicalize(&work_dir).unwrap())
-    );
+            .unwrap()
+            .as_deref(),
+        &work_dir
+    ));
 
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&work_dir);
@@ -162,12 +154,12 @@ async fn valid_work_dir_change_creates_target_and_arms_one_shot_reset() {
     // next boot. The config is committed only after the locked reset applies.
     assert!(target.is_dir(), "target work dir should have been created");
     let canonical_target = std::fs::canonicalize(&target).unwrap();
-    assert_eq!(
+    assert!(same_dir(
         nomifun_common::factory_reset::requested_v3_reset_work_dir(&data_dir)
             .unwrap()
             .as_deref(),
-        Some(canonical_target.as_path())
-    );
+        &canonical_target
+    ));
     assert!(
         nomifun_common::dir_config::persisted_work_dir(&data_dir).is_none()
     );
@@ -210,12 +202,12 @@ async fn finalized_dataset_change_arms_one_shot_reset_instead_of_rebinding_recei
         nomifun_common::dir_config::persisted_work_dir(&data_dir).is_none(),
         "target config is committed during locked pre-boot reset preparation"
     );
-    assert_eq!(
+    assert!(same_dir(
         nomifun_common::factory_reset::requested_v3_reset_work_dir(&data_dir)
             .unwrap()
             .as_deref(),
-        Some(canonical_target.as_path())
-    );
+        &canonical_target
+    ));
     assert_eq!(
         nomifun_common::factory_reset::inspect_v3_dataset_receipt(
             &data_dir,
@@ -286,12 +278,12 @@ async fn pending_change_cannot_be_retargeted_before_restart() {
         .await
         .unwrap();
     assert_eq!(second_resp.status(), StatusCode::CONFLICT);
-    assert_eq!(
+    assert!(same_dir(
         nomifun_common::factory_reset::requested_v3_reset_work_dir(&data_dir)
             .unwrap()
             .as_deref(),
-        Some(std::fs::canonicalize(&first).unwrap().as_path())
-    );
+        &first
+    ));
 
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&first_root);

@@ -272,11 +272,9 @@ pub struct SearchMessagesQuery {
 
 /// Full conversation object returned in API responses.
 ///
-/// `model` is the canonical top-level field **only for `AgentType::Nomi`**.
-/// For every other agent type, `model` is always `None` here and the client
-/// should read agent-specific model/mode fields out of `extra` (e.g. ACP uses
-/// `extra.current_model_id` / `extra.current_mode_id`). See
-/// `docs/superpowers/specs/2026-05-12-conversation-type-aware-model-design.md`.
+/// `model` is the canonical top-level field for the conversation's
+/// provider/model binding. It is the only place a model is read from; the
+/// retired engines' per-session `extra.current_model_id` side channel is gone.
 ///
 /// `Option<T>` fields use `skip_serializing_if = "Option::is_none"` so the
 /// serialized JSON omits the key entirely when the value is absent. This
@@ -493,7 +491,9 @@ where
             if day.len() == 8 && day.bytes().all(|byte| byte.is_ascii_digit()) {
                 Ok(day)
             } else {
-                Err(serde::de::Error::custom("day must be a YYYYMMDD calendar day"))
+                Err(serde::de::Error::custom(
+                    "day must be a YYYYMMDD calendar day",
+                ))
             }
         })
         .transpose()
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn deserialize_create_request_full() {
         let raw = json!({
-            "type": "acp",
+            "type": "nomi",
             "name": "Code Review",
             "model": { "provider_id": PROVIDER_ID_1, "model": "claude-sonnet-4-20250514" },
             "source": "nomifun",
@@ -557,7 +557,7 @@ mod tests {
             "extra": { "workspace": "/project" }
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, AgentType::Nomi);
         assert_eq!(req.name.as_deref(), Some("Code Review"));
         assert_eq!(req.model.unwrap().model, "claude-sonnet-4-20250514");
         assert_eq!(req.source, Some(ConversationSource::Nomifun));
@@ -568,12 +568,12 @@ mod tests {
     #[test]
     fn deserialize_create_request_minimal() {
         let raw = json!({
-            "type": "acp",
+            "type": "nomi",
             "model": { "provider_id": PROVIDER_ID_1, "model": "m1" },
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, AgentType::Nomi);
         assert!(req.name.is_none());
         assert!(req.source.is_none());
         assert!(req.channel_chat_id.is_none());
@@ -645,11 +645,11 @@ mod tests {
     #[test]
     fn deserialize_create_request_without_model() {
         let raw = json!({
-            "type": "acp",
+            "type": "nomi",
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, AgentType::Nomi);
         assert!(req.model.is_none());
     }
 
@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn deserialize_create_request_missing_extra() {
         let raw = json!({
-            "type": "acp",
+            "type": "nomi",
             "model": { "provider_id": PROVIDER_ID_1, "model": "m1" }
         });
         assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
@@ -818,13 +818,13 @@ mod tests {
     fn deserialize_clone_request() {
         let raw = json!({
             "conversation": {
-                "type": "acp",
+                "type": "nomi",
                 "model": { "provider_id": PROVIDER_ID_1, "model": "m1" },
                 "extra": {}
             }
         });
         let req: CloneConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.conversation.r#type, AgentType::Acp);
+        assert_eq!(req.conversation.r#type, AgentType::Nomi);
     }
 
     // ── ListConversationsQuery ──────────────────────────────────────
@@ -897,9 +897,7 @@ mod tests {
                 serde_json::from_value::<ListMessagesQuery>(json!({ "cursor": cursor })).is_err()
             );
         }
-        assert!(
-            serde_json::from_value::<ListMessagesQuery>(json!({ "cursor": "" })).is_ok()
-        );
+        assert!(serde_json::from_value::<ListMessagesQuery>(json!({ "cursor": "" })).is_ok());
     }
 
     // ── SearchMessagesQuery ─────────────────────────────────────────
@@ -926,7 +924,7 @@ mod tests {
         let resp = ConversationResponse {
             conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
             name: "Test".into(),
-            r#type: AgentType::Acp,
+            r#type: AgentType::Nomi,
             model: Some(ProviderWithModel {
                 provider_id: PROVIDER_ID_1.into(),
                 model: "m1".into(),
@@ -958,7 +956,7 @@ mod tests {
             "0190f5fe-7c00-7a00-8abc-012345678901"
         );
         assert!(json.get("id").is_none());
-        assert_eq!(json["type"], "acp");
+        assert_eq!(json["type"], "nomi");
         assert_eq!(json["status"], "pending");
         assert_eq!(json["source"], "nomifun");
         assert_eq!(json["created_at"], 1712345678000_i64);
@@ -974,7 +972,10 @@ mod tests {
         assert!(json.get("createdAt").is_none());
         assert!(json.get("pinnedAt").is_none());
         // Null-valued Option fields must be omitted from JSON.
-        assert!(json.get("pinned_at").is_none(), "pinned_at None should be omitted");
+        assert!(
+            json.get("pinned_at").is_none(),
+            "pinned_at None should be omitted"
+        );
         assert!(
             json.get("channel_chat_id").is_none(),
             "channel_chat_id None should be omitted"
@@ -986,7 +987,7 @@ mod tests {
         let resp = ConversationResponse {
             conversation_id: "0190f5fe-7c00-7a00-8abc-012345678902".into(),
             name: "Test".into(),
-            r#type: AgentType::Acp,
+            r#type: AgentType::Nomi,
             model: None,
             status: ConversationStatus::Pending,
             runtime: None,
@@ -1010,8 +1011,14 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("model").is_none(), "model None should be omitted");
-        assert!(json.get("source").is_none(), "source None should be omitted");
-        assert!(json.get("pinned_at").is_none(), "pinned_at None should be omitted");
+        assert!(
+            json.get("source").is_none(),
+            "source None should be omitted"
+        );
+        assert!(
+            json.get("pinned_at").is_none(),
+            "pinned_at None should be omitted"
+        );
         assert!(
             json.get("channel_chat_id").is_none(),
             "channel_chat_id None should be omitted"
@@ -1022,7 +1029,7 @@ mod tests {
             "0190f5fe-7c00-7a00-8abc-012345678902"
         );
         assert!(json.get("id").is_none());
-        assert_eq!(json["type"], "acp");
+        assert_eq!(json["type"], "nomi");
         assert_eq!(json["pinned"], false);
     }
 
@@ -1031,7 +1038,7 @@ mod tests {
         let resp = ConversationResponse {
             conversation_id: "0190f5fe-7c00-7a00-8abc-012345678903".into(),
             name: "Round".into(),
-            r#type: AgentType::Acp,
+            r#type: AgentType::Nomi,
             model: None,
             status: ConversationStatus::Running,
             runtime: None,
@@ -1066,7 +1073,7 @@ mod tests {
         let raw = json!({
             "id": "0190f5fe-7c00-7a00-8abc-012345678903",
             "name": "Legacy",
-            "type": "acp",
+            "type": "nomi",
             "status": "running",
             "pinned": false,
             "delegation_policy": "automatic",
@@ -1083,7 +1090,7 @@ mod tests {
         let valid = json!({
             "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678903",
             "name": "Conversation",
-            "type": "acp",
+            "type": "nomi",
             "status": "running",
             "pinned": false,
             "delegation_policy": "automatic",
@@ -1123,7 +1130,10 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["message_id"], MESSAGE_ID_1);
         assert!(json.get("id").is_none());
-        assert_eq!(json["conversation_id"], "0190f5fe-7c00-7a00-8abc-012345678901");
+        assert_eq!(
+            json["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678901"
+        );
         assert_eq!(json["msg_id"], MESSAGE_ID_2);
         assert_eq!(json["type"], "text");
         assert_eq!(json["position"], "right");
@@ -1182,7 +1192,7 @@ mod tests {
             conversation: ConversationResponse {
                 conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
                 name: "Code Review".into(),
-                r#type: AgentType::Acp,
+                r#type: AgentType::Nomi,
                 model: None,
                 status: ConversationStatus::Finished,
                 runtime: None,
@@ -1232,7 +1242,7 @@ mod tests {
             conversation: ConversationResponse {
                 conversation_id: "0190f5fe-7c00-7a00-8abc-012345678903".into(),
                 name: "Search Test".into(),
-                r#type: AgentType::Acp,
+                r#type: AgentType::Nomi,
                 model: None,
                 status: ConversationStatus::Finished,
                 runtime: None,
@@ -1312,7 +1322,7 @@ mod tests {
             items: vec![ConversationResponse {
                 conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
                 name: "Test".into(),
-                r#type: AgentType::Acp,
+                r#type: AgentType::Nomi,
                 model: None,
                 status: ConversationStatus::Pending,
                 runtime: None,
@@ -1366,7 +1376,7 @@ mod tests {
                 conversation: ConversationResponse {
                     conversation_id: "0190f5fe-7c00-7a00-8abc-012345678903".into(),
                     name: "Conv".into(),
-                    r#type: AgentType::Acp,
+                    r#type: AgentType::Nomi,
                     model: None,
                     status: ConversationStatus::Finished,
                     runtime: None,

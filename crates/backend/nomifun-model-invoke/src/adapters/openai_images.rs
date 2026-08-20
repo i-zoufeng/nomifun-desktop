@@ -21,10 +21,16 @@ use serde_json::{Value, json};
 use crate::adapter::ProtocolAdapter;
 use crate::call::ResolvedCall;
 use crate::error::{InvokeError, InvokeErrorKind};
-use crate::transport::{decode_b64, error_from_response, post_json, post_multipart};
+use crate::transport::{
+    ImageResponseBudget, MAX_IMAGE_RESPONSE_IMAGES, error_from_response,
+    inline_image_response_body_limit, post_json, post_multipart, read_json_capped,
+    validate_image_request_count,
+};
 use crate::types::{
     ImageEditRequest, ImageGenRequest, ProducedAsset, ProducedData, TaskOutcome, TaskRequest, TaskResult,
 };
+
+use super::{json_request_body, scalar_request_fields};
 
 /// Generous per-call ceiling: image generation is often multi-second.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -59,7 +65,8 @@ async fn submit_generations(
     call: &ResolvedCall,
     req: &ImageGenRequest,
 ) -> Result<TaskOutcome, InvokeError> {
-    let url = call.dispatch_target().url;
+    let expected_images = validate_image_request_count(req.count)?;
+    let url = call.endpoint_url()?;
     let mut body = json!({
         "model": call.model,
         "prompt": req.prompt,
@@ -80,13 +87,33 @@ async fn submit_generations(
             body[key] = v.clone();
         }
     }
+    if let Some(seed) = req.extra.get("seed").filter(|seed| !seed.is_null()) {
+        let seed = seed
+            .as_u64()
+            .filter(|seed| *seed <= u64::from(u32::MAX))
+            .ok_or_else(|| {
+                InvokeError::new(
+                    InvokeErrorKind::InvalidParams,
+                    "openai.images seed must be an integer from 0 to 4294967295",
+                )
+            })?;
+        body["seed"] = Value::from(seed);
+    }
+    let body = json_request_body(&call.model_params, &req.extra, body)?;
 
     let resp = post_json(http, &url, REQUEST_TIMEOUT, &call.connection.auth, &body).await?;
     if !resp.status().is_success() {
         return Err(error_from_response(resp).await);
     }
-    let value: Value = resp.json().await.map_err(|e| InvokeError::parse(format!("invalid images JSON: {e}")))?;
-    Ok(TaskOutcome::Done(TaskResult::Assets(parse_images_response(&value)?)))
+    let value: Value = read_json_capped(
+        resp,
+        inline_image_response_body_limit(expected_images),
+        "images",
+    )
+    .await?;
+    Ok(TaskOutcome::Done(TaskResult::Assets(
+        parse_images_response_limited(&value, expected_images)?,
+    )))
 }
 
 async fn submit_edits(
@@ -94,7 +121,8 @@ async fn submit_edits(
     call: &ResolvedCall,
     req: &ImageEditRequest,
 ) -> Result<TaskOutcome, InvokeError> {
-    let url = call.dispatch_target().url;
+    let expected_images = validate_image_request_count(req.count)?;
+    let url = call.endpoint_url()?;
 
     let images: Vec<_> = req.inputs.iter().filter(|i| i.role != "mask").collect();
     if images.is_empty() {
@@ -106,15 +134,23 @@ async fn submit_edits(
     // Single image → `image`; multiple → `image[]` (gpt-image-1 multi-ref).
     let image_field = if images.len() == 1 { "image" } else { "image[]" };
 
+    let mut text_fields = scalar_request_fields(&call.model_params, &req.extra)?;
+    for binary_field in ["image", "image[]", "mask"] {
+        text_fields.remove(binary_field);
+    }
+    text_fields.insert("model".into(), call.model.clone());
+    text_fields.insert("prompt".into(), req.prompt.clone());
+    text_fields.insert("n".into(), req.count.to_string());
+    if let Some(size) = &req.size {
+        text_fields.insert("size".into(), size.clone());
+    }
+
     // Built per attempt: multipart forms cannot be cloned, and rotation may
     // need to resend.
     let build_form = || -> Result<Form, InvokeError> {
-        let mut form = Form::new()
-            .text("model", call.model.clone())
-            .text("prompt", req.prompt.clone())
-            .text("n", req.count.to_string());
-        if let Some(size) = &req.size {
-            form = form.text("size", size.clone());
+        let mut form = Form::new();
+        for (key, value) in &text_fields {
+            form = form.text(key.clone(), value.clone());
         }
         for (idx, input) in images.iter().enumerate() {
             let part = Part::bytes(input.bytes.clone())
@@ -137,14 +173,28 @@ async fn submit_edits(
     if !resp.status().is_success() {
         return Err(error_from_response(resp).await);
     }
-    let value: Value = resp.json().await.map_err(|e| InvokeError::parse(format!("invalid images JSON: {e}")))?;
-    Ok(TaskOutcome::Done(TaskResult::Assets(parse_images_response(&value)?)))
+    let value: Value = read_json_capped(
+        resp,
+        inline_image_response_body_limit(expected_images),
+        "images",
+    )
+    .await?;
+    Ok(TaskOutcome::Done(TaskResult::Assets(
+        parse_images_response_limited(&value, expected_images)?,
+    )))
 }
 
 /// Parse an OpenAI images response body (`{ data: [ { b64_json?, url? } ] }`)
 /// into artifacts, preferring inline base64 over a URL. Pure — unit tested with
 /// fixtures.
 pub(crate) fn parse_images_response(value: &Value) -> Result<Vec<ProducedAsset>, InvokeError> {
+    parse_images_response_limited(value, MAX_IMAGE_RESPONSE_IMAGES)
+}
+
+pub(crate) fn parse_images_response_limited(
+    value: &Value,
+    max_images: usize,
+) -> Result<Vec<ProducedAsset>, InvokeError> {
     let data = value
         .get("data")
         .and_then(|v| v.as_array())
@@ -152,19 +202,38 @@ pub(crate) fn parse_images_response(value: &Value) -> Result<Vec<ProducedAsset>,
     if data.is_empty() {
         return Err(InvokeError::parse("images response 'data' array is empty"));
     }
+    let mut budget = ImageResponseBudget::new(max_images)?;
+    // Reject an oversized batch before decoding even its first inline member.
+    budget.ensure_additional_count(data.len(), "images response")?;
     let mut out = Vec::with_capacity(data.len());
-    for item in data {
+    for (index, item) in data.iter().enumerate() {
         if let Some(b64) = item.get("b64_json").and_then(|v| v.as_str()) {
-            let bytes =
-                decode_b64(b64).ok_or_else(|| InvokeError::parse("images b64_json is not valid base64"))?;
-            out.push(ProducedAsset { data: ProducedData::Bytes(bytes), mime: Some("image/png".into()) });
+            let bytes = budget.decode_base64(b64, &format!("images data[{index}].b64_json"))?;
+            out.push(ProducedAsset {
+                data: ProducedData::Bytes(bytes),
+                // OpenAI-compatible providers may honor output_format=jpeg or
+                // webp. Never invent PNG from the transport field name: carry
+                // a real MIME declaration when supplied and otherwise let the
+                // downstream verified artifact path sniff the bytes.
+                mime: response_image_mime(item),
+            });
         } else if let Some(url) = item.get("url").and_then(|v| v.as_str()) {
+            budget.accept_url("images response")?;
             out.push(ProducedAsset { data: ProducedData::Url(url.to_string()), mime: None });
         } else {
             return Err(InvokeError::parse("images data item has neither b64_json nor url"));
         }
     }
     Ok(out)
+}
+
+fn response_image_mime(item: &Value) -> Option<String> {
+    ["mime_type", "mimeType", "content_type", "contentType", "mime"]
+        .into_iter()
+        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|mime| !mime.is_empty())
+        .map(str::to_string)
 }
 
 fn ext_for_mime(mime: &str) -> &'static str {
@@ -182,13 +251,26 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::adapters::test_support::call;
+    use crate::adapters::test_support::call_with_endpoint;
     use crate::types::InputAsset;
+
+    fn image_call(base_url: &str, model: &str, endpoint: &str, request: TaskRequest) -> ResolvedCall {
+        let base_url = format!("{}/v1", base_url.trim_end_matches('/'));
+        call_with_endpoint(&base_url, model, "openai.images", endpoint, request)
+    }
+
+    fn generation_call(base_url: &str, model: &str, request: TaskRequest) -> ResolvedCall {
+        image_call(base_url, model, "/images/generations", request)
+    }
+
+    fn edit_call(base_url: &str, model: &str, request: TaskRequest) -> ResolvedCall {
+        image_call(base_url, model, "/images/edits", request)
+    }
 
     // -- ported pure-parser fixtures ---------------------------------------
 
     #[test]
-    fn parse_b64_response() {
+    fn image_contract_response_limits_preserve_real_mime_and_leave_unknown_for_sniffing() {
         // "aGk=" is base64("hi").
         let v = json!({"data": [{"b64_json": "aGk="}]});
         let out = parse_images_response(&v).unwrap();
@@ -197,7 +279,13 @@ mod tests {
             ProducedData::Bytes(b) => assert_eq!(b, b"hi"),
             _ => panic!("expected bytes"),
         }
-        assert_eq!(out[0].mime.as_deref(), Some("image/png"));
+        assert_eq!(out[0].mime, None, "unknown output formats must be sniffed downstream");
+
+        let typed = parse_images_response(&json!({
+            "data": [{"b64_json": "aGk=", "mime_type": "image/webp"}]
+        }))
+        .unwrap();
+        assert_eq!(typed[0].mime.as_deref(), Some("image/webp"));
     }
 
     #[test]
@@ -219,6 +307,18 @@ mod tests {
             let err = parse_images_response(&bad).unwrap_err();
             assert_eq!(err.kind, InvokeErrorKind::ParseError, "input {bad}");
         }
+    }
+
+    #[test]
+    fn image_contract_response_limits_reject_too_many_items_before_decoding_inline_data() {
+        let value = json!({
+            "data": (0..=MAX_IMAGE_RESPONSE_IMAGES)
+                .map(|_| json!({"b64_json": "not valid base64"}))
+                .collect::<Vec<_>>()
+        });
+        let error = parse_images_response(&value).unwrap_err();
+        assert_eq!(error.kind, InvokeErrorKind::ProviderError);
+        assert!(error.message.contains("returned 9 images"), "{}", error.message);
     }
 
     #[test]
@@ -247,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generations_posts_typed_json_body_and_decodes_b64() {
+    async fn image_contract_openai_posts_seed_and_decodes_b64_without_invented_mime() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/generations"))
@@ -259,18 +359,22 @@ mod tests {
                 "response_format": "b64_json",
                 "size": "512x512",
                 "quality": "high",
+                "seed": 42,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"b64_json": "aGk="}]})))
             .expect(1)
             .mount(&server)
             .await;
 
-        let call = call(&server.uri(), "gpt-image-1", gen_request(Some("512x512"), Some("high")));
+        let mut request = gen_request(Some("512x512"), Some("high"));
+        let TaskRequest::ImageGeneration(image_request) = &mut request else { unreachable!() };
+        image_request.extra = json!({"seed": 42});
+        let call = generation_call(&server.uri(), "gpt-image-1", request);
         let out = OpenAiImagesAdapter.submit(&reqwest::Client::new(), &call).await.unwrap();
         let TaskOutcome::Done(TaskResult::Assets(assets)) = out else { panic!("expected Done(Assets)") };
         assert_eq!(assets.len(), 1);
         assert!(matches!(&assets[0].data, ProducedData::Bytes(b) if b == b"hi"));
-        assert_eq!(assets[0].mime.as_deref(), Some("image/png"));
+        assert_eq!(assets[0].mime, None, "the adapter must not invent PNG MIME");
     }
 
     #[tokio::test]
@@ -282,7 +386,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let call = call(&server.uri(), "gpt-image-1", gen_request(None, None));
+        let call = generation_call(&server.uri(), "gpt-image-1", gen_request(None, None));
         OpenAiImagesAdapter.submit(&reqwest::Client::new(), &call).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
@@ -318,7 +422,7 @@ mod tests {
             ],
             extra: json!({}),
         });
-        let call = call(&server.uri(), "gpt-image-1", request);
+        let call = edit_call(&server.uri(), "gpt-image-1", request);
         let out = OpenAiImagesAdapter.submit(&reqwest::Client::new(), &call).await.unwrap();
         assert!(matches!(out, TaskOutcome::Done(TaskResult::Assets(a)) if a.len() == 1));
     }
@@ -341,7 +445,7 @@ mod tests {
             inputs: vec![image_input("image", b"img-a", "image/png")],
             extra: json!({}),
         });
-        let call = call(&server.uri(), "gpt-image-1", request);
+        let call = edit_call(&server.uri(), "gpt-image-1", request);
         OpenAiImagesAdapter.submit(&reqwest::Client::new(), &call).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
@@ -358,7 +462,7 @@ mod tests {
             inputs: vec![image_input("mask", b"mask-bytes", "image/png")],
             extra: json!({}),
         });
-        let call = call("http://127.0.0.1:9", "gpt-image-1", request);
+        let call = edit_call("http://127.0.0.1:9", "gpt-image-1", request);
         let err = OpenAiImagesAdapter.submit(&reqwest::Client::new(), &call).await.unwrap_err();
         assert_eq!(err.kind, InvokeErrorKind::InvalidParams);
     }
@@ -372,7 +476,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let call = call(&server.uri(), "gpt-image-1", gen_request(None, None));
+        let call = generation_call(&server.uri(), "gpt-image-1", gen_request(None, None));
         let err = OpenAiImagesAdapter.submit(&reqwest::Client::new(), &call).await.unwrap_err();
         assert_eq!(err.kind, InvokeErrorKind::Auth);
         assert_eq!(err.http_status, Some(401));

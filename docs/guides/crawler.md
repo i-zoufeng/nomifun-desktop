@@ -104,6 +104,6 @@ times is otherwise left alone on purpose.
 ## Where it lives
 
 - Backend: [`crates/backend/nomifun-crawl/`](../../crates/backend/nomifun-crawl/)
-- Schema: [`031_crawl_jobs_and_tasks.sql`](../../crates/backend/nomifun-db/migrations/031_crawl_jobs_and_tasks.sql)
+- Schema: [`036_crawl_jobs_and_tasks.sql`](../../crates/backend/nomifun-db/migrations/036_crawl_jobs_and_tasks.sql)
 - Frontend: [`ui/src/renderer/pages/crawl/`](../../ui/src/renderer/pages/crawl/)
 - Design notes: [`docs/specs/2026-08-05-distributed-crawler-design.zh.md`](../specs/2026-08-05-distributed-crawler-design.zh.md)

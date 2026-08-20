@@ -199,6 +199,103 @@ async fn openai_gateway_does_not_schema_retry_an_unrelated_500() {
     server.verify().await;
 }
 
+/// A gateway that serves its web UI at a near-miss path answers `200 OK` with
+/// HTML. That used to be fed to the SSE reader, which dropped every non-`data:`
+/// line and reported a truncated stream — a retryable error, so one click became
+/// three POSTs to the wrong URL and the user was told the model misbehaved.
+#[tokio::test]
+async fn html_success_is_reported_as_a_wrong_address_after_exactly_one_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(
+                "<!doctype html><html lang=\"zh-CN\"><head><title>Gateway</title></head></html>",
+                "text/html",
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = OpenAIProvider::new(
+        "test-key",
+        &server.uri(),
+        ProviderCompat::openai_defaults(),
+    );
+    let error = provider.stream(&make_request()).await.unwrap_err();
+    assert!(
+        matches!(error, ProviderError::NonApiResponse { .. }),
+        "expected a wrong-address diagnosis, got {error:?}"
+    );
+    assert!(!error.is_retryable(), "a wrong URL must not be retried");
+    // `expect(1)` above is the assertion that matters: no amplification.
+    server.verify().await;
+}
+
+/// A genuine truncated stream must still be retried, so the wrong-address case
+/// and the transient-failure case stay distinguishable. Errors raised after the
+/// stream opens are delivered as `LlmEvent::Error`, not as a `stream()` failure.
+#[tokio::test]
+async fn a_real_truncated_sse_stream_is_still_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+            "text/event-stream",
+        ))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider = OpenAIProvider::new(
+        "test-key",
+        &server.uri(),
+        ProviderCompat::openai_defaults(),
+    );
+    let events = collect_events(provider.stream(&make_request()).await.unwrap()).await;
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Error(message) => Some(message.clone()),
+            _ => None,
+        })
+        .expect("a truncated stream must surface an error event");
+    assert!(
+        error.contains("truncated"),
+        "a body that did produce SSE events is a truncation: {error}"
+    );
+    // `expect(3)` is the assertion that matters: truncation still retries.
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn openai_chat_error_never_exposes_raw_or_percent_encoded_runtime_key() {
+    let server = MockServer::start().await;
+    let secret = "agent-key/+?=value";
+    let encoded = "agent-key%2F%2B%3F%3Dvalue";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {secret}")))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "Authorization: Bearer {secret}; api_key={encoded}"
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(
+        secret,
+        &server.uri(),
+        ProviderCompat::openai_defaults(),
+    );
+    let rendered = provider.stream(&make_request()).await.unwrap_err().to_string();
+
+    assert!(!rendered.contains(secret), "raw key leaked: {rendered}");
+    assert!(!rendered.contains(encoded), "encoded key leaked: {rendered}");
+    assert!(rendered.contains("[REDACTED]"));
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn openai_gateway_does_not_remember_a_failed_sanitized_resend() {
     let server = MockServer::start().await;
@@ -830,6 +927,212 @@ async fn test_openai_multi_key_rotates_after_auth_failure() {
     server.verify().await;
 }
 
+#[tokio::test]
+async fn openai_extra_body_preserves_unknown_fields_but_typed_fields_win() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            build_sse_body(&[
+                &json!({"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}).to_string(),
+                &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string(),
+            ]),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut compat = ProviderCompat::openai_defaults();
+    compat.extra_body = Some(
+        json!({
+            "temperature": 0.35,
+            "future_options": {"mode": "fast"},
+            "model": "must-not-win",
+            "messages": [{"role": "user", "content": "must-not-win"}],
+            "max_tokens": 1,
+            "tools": [{"type":"function","function":{"name":"must-not-survive"}}],
+            "reasoning_effort": "must-not-survive"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let provider = OpenAIProvider::new("test-key", &server.uri(), compat);
+    collect_events(provider.stream(&make_request()).await.unwrap()).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["temperature"], 0.35);
+    assert_eq!(body["future_options"]["mode"], "fast");
+    assert_eq!(body["model"], "gpt-4o");
+    assert_eq!(body["messages"][0]["content"], "You are a test assistant.");
+    assert_eq!(body["max_tokens"], 512);
+    assert_eq!(body["stream"], true);
+    assert!(body.get("tools").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+/// A mid-turn steer reaches the model on the wire.
+///
+/// The engine appends user steering as a trailing Text block on the tool-result
+/// message. Asserting on the serialized HTTP body (not just `build_messages`)
+/// is what proves the correction actually leaves the process: the previous
+/// serializer dropped it after the durable receipt had already been recorded as
+/// delivered, so the next provider pass obeyed the superseded instruction with
+/// no error anywhere.
+#[tokio::test]
+async fn steer_on_a_tool_result_message_reaches_the_provider_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            build_sse_body(&[
+                &json!({"choices":[{"delta":{"content":"STEER_OK"},"finish_reason":null}]})
+                    .to_string(),
+                &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string(),
+            ]),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut request = make_request();
+    request.messages = vec![
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "run the sleep command".to_string(),
+            }],
+        ),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "Bash".to_string(),
+                input: json!({ "command": "sleep 60" }),
+                extra: None,
+            }],
+        ),
+        // The shape the engine builds at steering "point A".
+        Message::new(
+            Role::User,
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "slept 60s".to_string(),
+                    is_error: false,
+                    images: vec![],
+                },
+                ContentBlock::Text {
+                    text: "stop waiting, just reply STEER_OK".to_string(),
+                },
+            ],
+        ),
+    ];
+
+    let provider = OpenAIProvider::new("test-key", &server.uri(), ProviderCompat::openai_defaults());
+    collect_events(provider.stream(&request).await.unwrap()).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let sent = serde_json::to_string(&body["messages"]).unwrap();
+    assert!(
+        sent.contains("stop waiting, just reply STEER_OK"),
+        "the steer must be present in the request payload: {sent}"
+    );
+
+    let wire = body["messages"].as_array().unwrap();
+    let tool_index = wire
+        .iter()
+        .position(|m| m["role"] == "tool")
+        .expect("the tool result is on the wire");
+    let steer = &wire[tool_index + 1];
+    assert_eq!(
+        steer["role"], "user",
+        "the steer follows the answered tool call: {sent}"
+    );
+    assert_eq!(steer["content"], "stop waiting, just reply STEER_OK");
+    assert_eq!(
+        wire[tool_index]["tool_call_id"], "call_1",
+        "the assistant tool call is still answered before any other role"
+    );
+}
+
+/// The loop-stagnation guard's corrective nudge reaches the model on the wire.
+///
+/// The guard shares the trailing-Text slot with steering, so the same drop
+/// silently disarmed it on every OpenAI-compatible provider: the model was
+/// never told to stop repeating a failing call, and only the (also-dropped)
+/// abort text stood between that and burning the whole turn budget.
+#[tokio::test]
+async fn a_loop_guard_nudge_on_a_tool_result_message_reaches_the_provider_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            build_sse_body(&[
+                &json!({"choices":[{"delta":{"content":"changing approach"},"finish_reason":null}]})
+                    .to_string(),
+                &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string(),
+            ]),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let nudge = "Loop guard: recent tool turns are making no progress";
+    let mut request = make_request();
+    request.messages = vec![
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "fix the build".to_string(),
+            }],
+        ),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "Bash".to_string(),
+                input: json!({ "command": "bun test" }),
+                extra: None,
+            }],
+        ),
+        Message::new(
+            Role::User,
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "same failure again".to_string(),
+                    is_error: true,
+                    images: vec![],
+                },
+                ContentBlock::Text {
+                    text: nudge.to_string(),
+                },
+            ],
+        ),
+    ];
+
+    let provider = OpenAIProvider::new("test-key", &server.uri(), ProviderCompat::openai_defaults());
+    collect_events(provider.stream(&request).await.unwrap()).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let sent = serde_json::to_string(&body["messages"]).unwrap();
+    assert!(
+        sent.contains(nudge),
+        "the loop-guard nudge must reach the model: {sent}"
+    );
+    assert!(
+        sent.contains("[tool error] same failure again"),
+        "the failing result keeps its error marker: {sent}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // test_openai_rate_limited
 // ---------------------------------------------------------------------------
@@ -996,4 +1299,45 @@ async fn test_openai_stream_empty_content_delta_skipped() {
         LlmEvent::Done { stop_reason, .. } => assert_eq!(*stop_reason, StopReason::EndTurn),
         e => panic!("expected Done, got: {:?}", e),
     }
+}
+
+#[tokio::test]
+async fn openai_accepts_a_fully_resolved_custom_capability_endpoint() {
+    let server = MockServer::start().await;
+    let chunk = json!({
+        "choices": [{
+            "delta": { "content": "custom endpoint" },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 2, "completion_tokens": 2 }
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path("/tenant/chat"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(build_sse_body(&[&chunk]), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(
+        "test-key",
+        &format!("{}/tenant/chat?api-version=2026-08-11", server.uri()),
+        ProviderCompat {
+            api_path: Some(String::new()),
+            ..ProviderCompat::openai_defaults()
+        },
+    );
+    let events = collect_events(provider.stream(&make_request()).await.unwrap()).await;
+
+    assert!(events.iter().any(
+        |event| matches!(event, LlmEvent::TextDelta(text) if text == "custom endpoint")
+    ));
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].url.path(), "/tenant/chat");
+    assert_eq!(received[0].url.query(), Some("api-version=2026-08-11"));
 }

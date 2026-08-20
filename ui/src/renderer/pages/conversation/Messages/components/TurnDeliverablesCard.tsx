@@ -32,7 +32,11 @@ import {
 import classNames from 'classnames';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { TurnDeliverableItem } from '../turnDeliverablesModel';
+import {
+  isVerifiedImageDeliverable,
+  type TurnDeliverableItem,
+} from '../turnDeliverablesModel';
+import VerifiedImageArtifactCard from './VerifiedImageArtifactCard';
 
 const DEFAULT_VISIBLE_COUNT = 3;
 const DIRECTORY_PATH_COLOR = 'color-mix(in srgb, var(--text-secondary) 82%, var(--bg-base))';
@@ -286,61 +290,130 @@ const DeliverableRow: React.FC<{
  * completed turn, rendered right below that turn's final assistant reply.
  * Renders nothing while availability is being confirmed and nothing when no
  * trustworthy deliverable remains — an empty card must never appear.
+ *
+ * `partial` marks a turn whose file events may extend past the loaded history
+ * window. The card is a projection over hydrated messages, so a turn with more
+ * tool events than the window silently lost items after a reload (an observed
+ * turn showed 4 files live and 3 after refresh, while the workspace Changes
+ * panel — which reads a snapshot rather than messages — still showed 4). A count
+ * that cannot be trusted must not be presented as a settled total.
  */
 const TurnDeliverablesCard: React.FC<{
   items: TurnDeliverableItem[];
   workspace?: string;
-}> = ({ items, workspace }) => {
+  partial?: boolean;
+}> = ({ items, workspace, partial = false }) => {
   const { t } = useTranslation();
   const { pending, available } = useTurnDeliverableAvailability(items, workspace);
   const [showAll, setShowAll] = useState(false);
+  const [showAllImages, setShowAllImages] = useState(false);
 
   if (pending || available.length === 0) return null;
 
-  const visible = showAll ? available : available.slice(0, DEFAULT_VISIBLE_COUNT);
-  const hiddenCount = available.length - visible.length;
+  const verifiedImages = available.filter(isVerifiedImageDeliverable);
+  const fileDeliverables = available.filter((item) => !isVerifiedImageDeliverable(item));
+  const visibleImages = showAllImages
+    ? verifiedImages
+    : verifiedImages.slice(0, DEFAULT_VISIBLE_COUNT);
+  const hiddenImageCount = verifiedImages.length - visibleImages.length;
+  const visible = showAll ? fileDeliverables : fileDeliverables.slice(0, DEFAULT_VISIBLE_COUNT);
+  const hiddenCount = fileDeliverables.length - visible.length;
 
   return (
     <div
       data-testid='turn-deliverables-card'
+      data-partial={partial ? 'true' : undefined}
       className='w-full box-border rounded-8px overflow-hidden border border-solid border-[var(--aou-2)]'
     >
       <div className='flex items-center gap-8px px-12px py-8px select-none'>
         <span className='w-8px h-8px rounded-full shrink-0' style={{ backgroundColor: diffColors.addition }}></span>
         <span className='text-14px text-t-primary font-medium'>
-          {t('messages.turnDeliverables.title', {
-            count: available.length,
-            defaultValue: 'Generated {{count}} files',
-          })}
+          {partial
+            ? t('messages.turnDeliverables.partialTitle', {
+                count: available.length,
+                defaultValue: 'Showing {{count}} changed files from this turn (scroll up to load the rest)',
+              })
+            : verifiedImages.length === available.length
+              ? t('messages.turnDeliverables.imagesTitle', {
+                  count: verifiedImages.length,
+                  defaultValue: 'Generated {{count}} images',
+                })
+              : verifiedImages.length > 0
+                ? t('messages.turnDeliverables.mixedTitle', {
+                    count: available.length,
+                    defaultValue: 'Generated {{count}} items',
+                  })
+                : t('messages.turnDeliverables.title', {
+                    count: fileDeliverables.length,
+                    defaultValue: 'Generated {{count}} files',
+                  })}
         </span>
       </div>
 
-      <div className='w-full bg-2'>
-        {visible.map((item) => (
-          <DeliverableRow key={item.absolutePath ?? item.relativePath} item={item} />
-        ))}
-        {(hiddenCount > 0 || showAll) && (
-          <button
-            type='button'
-            aria-expanded={showAll}
-            className='w-full flex items-center gap-8px px-12px py-6px text-13px text-t-secondary cursor-pointer bg-transparent border-none hover:bg-3 transition-colors'
-            onClick={() => setShowAll(!showAll)}
-          >
-            <Down
-              theme='outline'
-              size='14'
-              fill={iconColors.secondary}
-              className={classNames('transition-transform duration-200', showAll && 'rotate-180')}
-            />
-            {showAll
-              ? t('messages.turnDeliverables.showLess', { defaultValue: 'Show less' })
-              : t('messages.turnDeliverables.showMore', {
-                  count: hiddenCount,
-                  defaultValue: 'Show {{count}} more files',
-                })}
-          </button>
-        )}
-      </div>
+      {verifiedImages.length > 0 && (
+        <div
+          data-testid='turn-deliverables-images'
+          className={classNames(
+            'grid grid-cols-1 gap-8px px-12px pb-12px',
+            verifiedImages.length > 1 && 'md:grid-cols-2'
+          )}
+        >
+          {visibleImages.map((item) => (
+            <VerifiedImageArtifactCard key={item.artifactId} item={item} workspace={workspace} />
+          ))}
+        </div>
+      )}
+
+      {verifiedImages.length > 0 && (hiddenImageCount > 0 || showAllImages) && (
+        <button
+          type='button'
+          aria-expanded={showAllImages}
+          className='w-full flex items-center gap-8px px-12px py-6px text-13px text-t-secondary cursor-pointer bg-transparent border-none border-t border-t-solid border-t-[var(--aou-2)] hover:bg-3 transition-colors'
+          onClick={() => setShowAllImages(!showAllImages)}
+        >
+          <Down
+            theme='outline'
+            size='14'
+            fill={iconColors.secondary}
+            className={classNames('transition-transform duration-200', showAllImages && 'rotate-180')}
+          />
+          {showAllImages
+            ? t('messages.turnDeliverables.showLessImages', { defaultValue: 'Show fewer images' })
+            : t('messages.turnDeliverables.showMoreImages', {
+                count: hiddenImageCount,
+                defaultValue: 'Show {{count}} more images',
+              })}
+        </button>
+      )}
+
+      {fileDeliverables.length > 0 && (
+        <div className='w-full bg-2'>
+          {visible.map((item) => (
+            <DeliverableRow key={item.absolutePath ?? item.relativePath} item={item} />
+          ))}
+          {(hiddenCount > 0 || showAll) && (
+            <button
+              type='button'
+              aria-expanded={showAll}
+              className='w-full flex items-center gap-8px px-12px py-6px text-13px text-t-secondary cursor-pointer bg-transparent border-none hover:bg-3 transition-colors'
+              onClick={() => setShowAll(!showAll)}
+            >
+              <Down
+                theme='outline'
+                size='14'
+                fill={iconColors.secondary}
+                className={classNames('transition-transform duration-200', showAll && 'rotate-180')}
+              />
+              {showAll
+                ? t('messages.turnDeliverables.showLess', { defaultValue: 'Show less' })
+                : t('messages.turnDeliverables.showMore', {
+                    count: hiddenCount,
+                    defaultValue: 'Show {{count}} more files',
+                  })}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 };

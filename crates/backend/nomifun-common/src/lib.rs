@@ -22,6 +22,7 @@ pub mod paths;
 pub mod provider_lifecycle;
 pub mod provider_usage;
 pub mod stage_direction;
+pub mod text_search;
 mod timestamp;
 mod types;
 pub mod vision_registry;
@@ -46,8 +47,7 @@ pub use nomi_types::agent::{
 pub use crypto::{decrypt_string, encrypt_string};
 pub use enums::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, FileChangeOperation, McpServerStatus,
-    McpSource, MessagePosition, MessageStatus, MessageType, PreviewContentType, ProtocolType, RemoteAgentAuthType,
-    RemoteAgentProtocol, RemoteAgentStatus,
+    McpSource, MessagePosition, MessageStatus, MessageType, PreviewContentType, ProtocolType,
 };
 pub use error::{AppError, ErrorChain, workspace_path_has_edge_whitespace_segment};
 pub use execution_authority::ExecutionAuthority;

@@ -3,7 +3,7 @@
 <div align="center">
 
 <a href="https://www.nomifun.com">
-  <img src="docs/images/readme-00-agent-collaboration-hero.png" alt="NomiFun Agent collaboration, reusable roles, and execution graph" width="100%">
+  <img src="docs/images/readme/en/workspace.png" alt="Current NomiFun Desktop workspace" width="100%">
 </a>
 
 <h3>A no-holds-barred, fully open-source, <em>local-first</em> super AI workstation.</h3>
@@ -36,6 +36,7 @@
   <a href="docs/README.md">📖 Docs</a>&nbsp;·&nbsp;
   <a href="#-getting-started">🚀 Get started</a>&nbsp;·&nbsp;
   <a href="https://github.com/nomifun/nomifun-desktop/releases">📦 Releases</a>&nbsp;·&nbsp;
+  <a href="https://gitee.com/nomifun/nomifun-desktop">🇨🇳 Gitee source</a>&nbsp;·&nbsp;
   <a href="https://pan.baidu.com/s/5GPonoJNrwJ7GciBSDgXLaA">China mirror</a>&nbsp;·&nbsp;
   <a href="./RELEASING.zh-CN.md">发版手册</a>&nbsp;·&nbsp;
   <a href="#-contact--community">💬 Community</a>
@@ -53,6 +54,58 @@
 **NomiFun** is everything you imagine an AI workstation to be — and it runs on your terms. One React frontend and one Rust backend give you an evolving desktop companion, an unattended automation platform, a unified knowledge base, native computer- and browser-use, and an open capability bus that any agent can drive. No cloud account. No telemetry. No subscription. Your data never leaves your machine except for the LLM calls **you** configure.
 
 > The product name is **NomiFun**. Lowercase `nomifun` is used only for code identifiers, crate names, environment variables, and repository paths.
+
+---
+
+## NomiFun open-source product family
+
+NomiFun now has four related open-source projects. **Desktop is the local AI,
+data, model, Agent, task, and tool hub**; Mobile and the Xiaozhi robot connect to
+capabilities that you explicitly enable, while Net Infra provides an optional,
+self-hosted cross-network relay. Desktop also hosts Agent
+Mini Apps, so an app created by an Agent can keep using the same local runtime
+and governed capabilities instead of becoming an isolated demo.
+
+| Project | Role | Start here |
+|---|---|---|
+| **NomiFun Desktop** (this repository; [GitHub](https://github.com/nomifun/nomifun-desktop) · [Gitee](https://gitee.com/nomifun/nomifun-desktop)) | Local source of truth and runtime for data, models, Agents, tasks, Skills, knowledge, Mini Apps, WebUI, REST and MCP | [Download](https://github.com/nomifun/nomifun-desktop/releases) · [Desktop docs](https://www.nomifun.com/docs/) · [WebUI remote access](docs/guides/webui-remote-access.md) |
+| NomiFun Mobile ([GitHub](https://github.com/nomifun/nomifun-mobile) · [Gitee](https://gitee.com/nomifun/nomifun-mobile)) | Android / iOS / H5 client that directly reuses Desktop sessions, tasks, requirements, companions and administration | [Mobile docs](https://github.com/nomifun/nomifun-mobile#readme) · Enable **Remote & Open → WebUI access** in Desktop, then scan its one-time QR code |
+| NomiFun Xiaozhi Yuntai ([GitHub](https://github.com/nomifun/nomifun-xiaozhi-yuntai) · [Gitee](https://gitee.com/nomifun/nomifun-xiaozhi-yuntai)) | ESP32-S3 Xiaozhi robot and pan-tilt platform for voice, motion and device-side multimodal interaction | [Xiaozhi docs](https://github.com/nomifun/nomifun-xiaozhi-yuntai#readme) · [Desktop integration guide](docs/guides/xiaozhi-robot.md) |
+| NomiFun Net Infra ([GitHub](https://github.com/nomifun/nomifun-net-infra) · [Gitee](https://gitee.com/nomifun/nomifun-net-infra)) | Self-hosted NomiRelay infrastructure for exposing Desktop or other HTTP/WebSocket/TCP/UDP services behind NAT across networks | [Product page](https://www.nomifun.com/products/net-infra/) · [Portal guide](https://www.nomifun.com/docs/guides/net-infra/) · [Relay docs](https://github.com/nomifun/nomifun-net-infra/tree/main/docs/integration) |
+
+### Connect the four projects
+
+1. Run Desktop, configure the models/companions you need, and keep all data on
+   that machine.
+2. For Mobile, open **Remote & Open → WebUI access**, start the listener, and
+   scan the short-lived, one-time QR code from the Mobile app. On a LAN, Mobile
+   connects directly to Desktop with **no NomiFun cloud relay**. Desktop remains
+   the authority and server; the phone is an authenticated client, so model
+   credentials and the durable data set do not need to be copied to the phone.
+3. For Xiaozhi, build and flash the Yuntai firmware, then follow the companion
+   **Remote control → Robot connection** flow in Desktop to bind the device.
+4. When access must cross networks, self-host NomiRelay and `nfagent`, then
+   point Mobile at the relay business endpoint. Mobile never receives relay
+   admin credentials, and Desktop remains the application-data authority.
+
+Only enable remote interfaces on networks you trust. The Desktop guides above
+document authentication, LAN exposure, and deployment boundaries.
+
+### One local hub, many interaction surfaces
+
+This is not a collection of unrelated clients that happen to share a logo. Desktop owns
+the durable state and executes models, Agents, requirements, tools, knowledge,
+companion memory, and Skills. Mobile is a direct LAN control surface; Xiaozhi is
+a voice-and-motion hardware surface; Mini Apps are interactive software surfaces
+created and hosted by the same Desktop installation; Net Infra is an optional
+transport layer rather than another application backend. The result is one governed
+capability graph with multiple ways to reach it, rather than separate clouds,
+accounts, credentials, and copies of user data.
+
+Read [the NomiFun product ecosystem architecture](docs/architecture/product-ecosystem.md)
+for the trust boundaries, communication model, differentiators, and product
+innovation timeline. Simplified Chinese:
+[`product-ecosystem.zh.md`](docs/architecture/product-ecosystem.zh.md).
 
 ---
 
@@ -97,32 +150,41 @@ See [`SECURITY.md`](SECURITY.md) for the deployment threat model and responsible
 </p>
 
 <p>
-  <img src="docs/images/readme-01-workbench-overview.png" alt="NomiFun Agent collaboration and execution graph" width="100%">
-  <br/><sub><b>Agent collaboration: one conversation, reusable roles, and a live execution graph</b></sub>
+  <img src="docs/images/readme/en/workspace.png" alt="Current NomiFun Desktop workspace" width="100%">
+  <br/><sub><b>Workspace · conversations, Agents, tasks, tools, and connected devices in one desktop</b></sub>
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/readme-05-companions.png" alt="Desktop companion overview"><br/><sub><b>Desktop companions · memory and growth</b></sub></td>
-    <td width="50%"><img src="docs/images/readme-07-requirements.png" alt="Requirements platform list"><br/><sub><b>Requirements platform · AutoWork entry</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/en/models.png" alt="NomiFun multi-model management"><br/><sub><b>Multi-model management · task-aware routing and Free Models</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/en/companions.png" alt="NomiFun desktop companions"><br/><sub><b>Desktop companions · persona, memory, models, and remote control</b></sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/images/readme-06-knowledge.png" alt="Knowledge base list"><br/><sub><b>Knowledge base · local domain context</b></sub></td>
-    <td width="50%"><img src="docs/images/readme-02-terminal-create.png" alt="Create an agent terminal"><br/><sub><b>Terminal · capabilities for Agent CLI</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/readme-03-presets.png" alt="Presets and Skills capability library"><br/><sub><b>Presets & Skills · reusable capability templates</b></sub></td>
-    <td width="50%"><img src="docs/images/readme-04-model-agents.png" alt="Models and Agents management"><br/><sub><b>Models & Agents · unified management and setup</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/en/skills.png" alt="Current NomiFun Skills Hub"><br/><sub><b>Skills Hub · reusable, governed Agent capabilities</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/en/creative-workshop.png" alt="NomiFun Creative Workshop Beta"><br/><sub><b>Creative Workshop · persistent multimodal creation canvas (Beta)</b></sub></td>
   </tr>
 </table>
 
-<sub>Captured from the live NomiFun desktop app on 2026-07-01 and kept at 2560px wide. See <a href="docs/images/SCREENSHOTS.md">the screenshot manifest</a> for the full set and capture method.</sub>
+<sub>Refreshed from the current NomiFun Portal product screenshot collection. See <a href="docs/images/SCREENSHOTS.md">the screenshot manifest</a> for source and usage details.</sub>
 
 </div>
 
 ---
 
 ## 🚀 Feature highlights
+
+NomiFun Desktop has grown from an Agent chat client into a local, extensible AI
+workspace. Its major product surfaces now share the same conversations, models,
+memory, tools, permissions, and execution runtime:
+
+| Product surface | What it adds |
+|---|---|
+| **Multi-Agent execution cluster** | Plans dependency-aware work, delegates steps to specialized Agents, schedules parallel execution, and exposes live state, transcripts, approvals, retry, and recovery. |
+| **Agent Mini Apps** | Turns a normal Agent conversation into a previewable and publishable local web tool, with an editable working copy and a durable published snapshot. |
+| **Creative Workshop (Beta)** | Provides a persistent visual canvas and asset library for model-driven image, text, video, and speech creation. |
+| **Task-aware multi-model control plane** | Manages extensible providers and models for chat, realtime, speech, vision, media generation, embedding, and reranking, with per-task routing and fallback. |
+| **NomiFun Free Models** | Ships a managed provider that can be enabled, refreshed, health-checked, and used without first creating your own provider entry. |
+| **Phone, robot, and open access** | Pairs Mobile directly with Desktop, binds a Xiaozhi robot to a companion, and exposes governed capabilities through WebUI, REST, MCP, IM channels, and NomiRelay. |
 
 ### 🐾 Desktop Companion — it grows with you
 
@@ -148,14 +210,41 @@ sessions, and tool coordination. Setup is built into each companion's **Remote
 control → Robot connection** page: copy its OTA address, enter the six-digit
 activation code shown by the robot, and bind the device to that companion.
 
-### 🧠 Agent collaboration
+### 🧩 Agent Mini Apps — turn a conversation into a reusable tool
 
-Start from a normal Agent conversation. When the task deserves parallel work, the same Agent capability can delegate parts of it and expose a live execution graph.
+Create a Mini App in a normal Agent conversation, preview it in the same
+workspace, and explicitly publish a durable snapshot to the local Mini Apps
+library. Desktop keeps that published version separate from the editable working
+copy, so you can continue iterating without silently changing what users launch.
+Every revision remains attached to a normal, auditable conversation rather than
+a hidden second chat system, and the resulting app can reuse the same local
+Agents, data, models, and governed tools.
 
-- **One product concept.** Configure Agents and a collaboration policy; delegated work stays in the same Conversation and the single `AgentExecution` aggregate.
-- **Per-step preflight control.** Before a delegated Agent starts, override its model and add a preset brief; settled steps can be retried with the same configuration.
-- **Review before execution.** Approval-enabled collaboration pauses after planning and shows the plan in the conversation, so you can adjust the graph before work begins.
-- **Real Agent transcripts.** Click any step to read that Agent's actual conversation, then return to the lead conversation to keep guiding the work.
+### 🎨 Creative Workshop — visual creation on a persistent canvas *(Beta)*
+
+Creative Workshop combines a persistent canvas with a reusable asset library.
+Arrange image, text, video, generator, loop, compare, output, and group nodes to
+build visual workflows instead of losing each prompt in an isolated chat.
+Depending on the models you configure, the workshop can drive text-to-image,
+image-to-image, inpainting, text-to-video, image-to-video, text generation, and
+text-to-speech. Outputs stay on the canvas for comparison and further editing.
+
+> **Beta:** Creative Workshop is available in the current build, but its canvas
+> model and workflow format are still evolving. Keep original source assets and
+> avoid treating a workshop project as your only archival copy.
+
+### 🧠 Multi-Agent execution cluster — plan, schedule, supervise
+
+Start from a normal Agent conversation. When a task deserves specialization or
+parallel work, NomiFun creates one persistent `AgentExecution` aggregate linked
+to that Conversation, plans a dependency graph, and schedules ready steps across
+delegated Agents while the lead Agent remains the control point.
+
+- **Dependency-aware scheduling.** Independent steps can run concurrently; blocked steps wait for their prerequisites instead of racing on incomplete context.
+- **Per-step preflight control.** Override a delegated Agent's model and add a preset brief before it starts; completed or failed steps can be retried with the same configuration.
+- **Review before execution.** Approval-enabled collaboration pauses after planning and presents the graph in the conversation so you can adjust it before work begins.
+- **Live, real transcripts.** Follow state changes and open any step's actual Agent conversation, then return to the lead conversation to keep supervising the whole cluster.
+- **Recovery is part of execution.** Persisted state supports retry and restart recovery instead of reducing a cluster run to disposable background messages.
 
 ### 🤖 Unattended automation — Requirements + AutoWork + IDMM
 
@@ -197,7 +286,7 @@ Walk a whole site from a seed URL and file the readable content into a knowledge
 Self-built, **in-process Rust** — no Playwright, no Node, no third-party automation daemon. More capable, faster, and far cheaper on tokens, with fine-grained control and fully open source for you to extend.
 
 - **Computer use** — accessibility tree + Set-of-Marks overlay + OCR, steering the model to act on real UI elements instead of guessing pixels. macOS (AXUIElement + Vision OCR) and Windows (UI Automation) are complete; Linux (AT-SPI2) is partial.
-- **Browser use** — a main-process `BrowserSessionHub` owns managed Chromium Hosts and addressable Browser Lanes. Built-in agents, ACP/Codex, Gateway, remote agents, and parallel AgentExecution attempts all enter the same platform instead of launching private browsers.
+- **Browser use** — a main-process `BrowserSessionHub` owns managed Chromium Hosts and addressable Browser Lanes. The built-in agent, the Gateway, and parallel AgentExecution attempts all enter the same platform instead of launching private browsers.
 - **Status and lifecycle browser management** — the **Browser** page reports conversations, runtimes, Lanes, tabs, URLs, identity mode, capacity, queue position, pressure, resource estimates, and failures. Within that management boundary, a user can explicitly foreground an already-running Primary Lane; the page still does not embed a preview or expose page input or takeover controls.
 - **Shared live login identity** — ordinary interactive Lanes use an application-managed Primary profile and see live shared login state. Public crawls use an anonymous identity with no Primary cookies or site storage, while explicitly isolated work gets a separate identity. NomiFun never opens the user's real Chrome or Edge profile.
 - **Bounded, observable concurrency** — different Lanes can run concurrently while each Lane remains strictly serialized. When safe capacity is exhausted, callers and the UI receive queue position, pressure reason, and recommended concurrency rather than an apparently ready handle blocked by a hidden global lock.
@@ -217,19 +306,36 @@ Every capability NomiFun has is exposed through a single, typed capability regis
 - **REST + OpenAPI** at `/v1/tools`, with streaming and an auto-generated `/v1/openapi.json`.
 - Adding a capability to the bus makes it appear on MCP **and** REST automatically — no drift.
 
-### 🧩 Bring your own agents — or use the built-in one
+### 🧩 One built-in agent, many models
 
 > Guide: [`docs/guides/model-routing.md`](docs/guides/model-routing.md)
 
-- **Built-in `nomi` agent** — no extra install. Works with **26+ model providers/presets** (OpenAI, Anthropic, Gemini + Vertex AI, AWS Bedrock, DeepSeek, OpenRouter, Moonshot/Kimi, Qwen/Dashscope, Zhipu/GLM, MiniMax, SiliconFlow, xAI, Volcengine/Doubao, and more) across **4 wire protocols**, plus the **New API** aggregator gateway.
-- **~19 external agents over ACP** — connect Claude Code, Codex, Gemini, Qwen, Kimi, Cursor, Copilot, Goose, OpenCode, Droid, and more, and NomiFun feeds them models *and* its native capabilities (computer/browser/knowledge/gateway) over injected MCP bridges.
-- **Everywhere** — the native capabilities are available to the built-in agent, to ACP agents, in the chat UI, **and** in the terminal.
+- **Built-in `nomi` agent** — no extra install, and the only conversation engine. Works with **26+ model providers/presets** (OpenAI, Anthropic, Gemini + Vertex AI, AWS Bedrock, DeepSeek, OpenRouter, Moonshot/Kimi, Qwen/Dashscope, Zhipu/GLM, MiniMax, SiliconFlow, xAI, Volcengine/Doubao, and more) across **4 wire protocols**, plus the **New API** aggregator gateway.
+- **One code path** — every conversation runs the same engine, so capabilities, tool policy, approvals, and failover behave identically no matter which model you pick.
+- **Want Claude Code, Codex, or Gemini CLI?** Run them in **terminal mode** — real in-app PTY sessions with NomiFun's capabilities injected through each CLI's own native config. See [`docs/guides/terminal.md`](docs/guides/terminal.md).
+- **Everywhere** — the native capabilities are available to the built-in agent, in the chat UI, **and** in the terminal.
 - **Graceful multimodal fallback** — if a selected provider/model rejects image input, NomiFun strips the images, retries in the same conversation, and leaves an inline notice instead of killing the session.
 - **Per-model context tuning** — override context-window limits per model when an upstream platform reports bad defaults or hides them, improving routing and long-context budgeting.
 
-### 🔌 Model providers: quick setup links
+### 🔌 Multi-model control plane — providers, capabilities, and Free Models
 
-NomiFun does not lock you into a single model vendor. Pick providers by region, price, quota, model capability, and data policy, then paste the API key into NomiFun's **Models & Agents** page. These are third-party services; pricing, regional availability, rate limits, and data-handling terms are controlled by each provider.
+NomiFun separates provider credentials from model capabilities. Extend the
+catalog with your own providers and assign models to chat, realtime, ASR, TTS,
+vision, image generation/editing, video generation, embedding, and reranking.
+Routing is task-aware, supports per-model context limits, and can fail over
+without pretending that every provider uses the same URL, protocol, or auth.
+
+**NomiFun Free Models** are available through a built-in managed provider. You
+can enable it, refresh its catalog, run a health check, and activate an available
+model without first creating a separate provider entry or supplying your own API
+key. These are online third-party inference services: availability, limits, and
+data-handling terms can change, so review the in-product notice before sending
+sensitive content.
+
+For your own providers, pick by region, price, quota, capability, and data policy,
+then add the credentials on **Models & Agents**. The following services are
+third-party offerings; their pricing, availability, rate limits, and data terms
+remain under each provider's control.
 
 | Provider | Start here | Good to evaluate |
 |---|---|---|
@@ -246,17 +352,24 @@ NomiFun does not lock you into a single model vendor. Pick providers by region, 
 | <img src="https://www.google.com/s2/favicons?sz=64&domain=openai.com" alt="OpenAI logo" width="20" height="20"> **GPT / OpenAI** | [GPT models](https://platform.openai.com/docs/models) · [API keys](https://platform.openai.com/api-keys) | GPT models, OpenAI API, agent workflows, coding, and general-purpose tasks |
 | <img src="https://www.google.com/s2/favicons?sz=64&domain=aistudio.google.com" alt="Gemini logo" width="20" height="20"> **Gemini / Google AI** | [API keys](https://aistudio.google.com/app/apikey) | Gemini models, multimodal work, very long context, and Google AI Studio |
 
-### 💻 Terminal mode
+### 💻 Terminal mode — where third-party agent CLIs live
 
 > Guide: [`docs/guides/terminal.md`](docs/guides/terminal.md)
 
-Run agent CLIs inside in-app PTY sessions (or the standalone `nomi` CLI). NomiFun injects native capabilities — knowledge search, requirement completion, and lifecycle hooks — into known CLIs through their *own* native config, so you keep full fidelity and OAuth.
+Run agent CLIs inside in-app PTY sessions (or the standalone `nomi` CLI). This is how **Claude Code, Codex, and Gemini CLI** are used with NomiFun: a real pseudo-terminal, the CLI's own auth and OAuth, its own approval prompts, nothing re-implemented. NomiFun injects native capabilities — knowledge search, requirement completion, and lifecycle hooks — into known CLIs through their *own* native config, so you keep full fidelity. AutoWork can drive such a terminal turn by turn.
 
-### 📱 WebUI remote control — scan, and you're in
+### 📱 NomiFun Mobile — direct to your Desktop
 
 > Guide: [`docs/guides/webui-remote-access.md`](docs/guides/webui-remote-access.md)
+> · App: [nomifun-mobile](https://github.com/nomifun/nomifun-mobile)
 
-No social platform required. One-tap **QR pairing** connects your phone or tablet to your computer over the LAN (one-time token, realtime over WebSocket) so you can drive your workstation remotely from the couch.
+No social platform or NomiFun cloud relay is required on a LAN. One-tap **QR
+pairing** gives the phone a short-lived, one-time login credential and connects
+it directly to the authenticated listener inside Desktop. Mobile then uses the
+same sessions, tasks, requirements, companions, models, and tools in real time;
+Desktop remains the data and execution authority. The phone is a connected,
+authenticated client, so it does not need a duplicate database or a second copy
+of your model credentials.
 
 ### ⚙️ Config once, use anywhere
 
@@ -275,6 +388,11 @@ Bind a companion to any of these and drive it from where you already chat:
 ## 🏗️ Architecture
 
 One React frontend, one Rust backend, **two host modes** — and the same backend runs in-process in both.
+
+At the product-family level, Desktop is also the hub for Mobile, Xiaozhi, Mini
+Apps, and companion IM channels. See
+[`docs/architecture/product-ecosystem.md`](docs/architecture/product-ecosystem.md)
+for the full communication, security, and innovation model.
 
 | | `nomifun-desktop` | `nomifun-web` |
 |---|---|---|
@@ -342,8 +460,8 @@ bun run build:ui && bun run serve:web
 
 The official image is published on Docker Hub:
 [`nomifun/nomifun-web`](https://hub.docker.com/repository/docker/nomifun/nomifun-web).
-The examples below use the published `v0.3.4` tag; replace it with a newer
-Docker Hub tag when one is available.
+The examples below use `latest`, the stable rolling tag published on Docker
+Hub. For reproducible deployments, pin an explicit version or image digest.
 
 ```bash
 # Pull and run the official image.
@@ -352,7 +470,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8787:8787 \
   -v nomifun-data:/data \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 # then open http://<server-ip>:8787 and create the first admin
 ```
 
@@ -367,7 +485,7 @@ docker run -d \
   -v nomifun-data:/data \
   -e NOMIFUN_ADMIN_USERNAME=admin \
   -e NOMIFUN_ADMIN_PASSWORD='change-me-to-something-strong' \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 ```
 
 Compose can use the same official image:
@@ -375,7 +493,7 @@ Compose can use the same official image:
 ```yaml
 services:
   nomifun:
-    image: nomifun/nomifun-web:v0.3.4
+    image: nomifun/nomifun-web:latest
     restart: unless-stopped
     ports:
       - "8787:8787"
@@ -398,7 +516,7 @@ docker compose up -d --build
 # then open http://<server-ip>:8787  —  pair with the bundled Caddyfile for TLS
 
 # Fast path when ui/dist and target/release/nomifun-web are already built:
-bun run docker:prebuilt -- --tag nomifun/nomifun-web:v0.3.4 --build-missing --sudo
+bun run docker:prebuilt -- --tag nomifun/nomifun-web:latest --build-missing --sudo
 ```
 
 See [`docs/getting-started/installation.md`](docs/getting-started/installation.md) and [`docs/guides/web-server-deployment.md`](docs/guides/web-server-deployment.md) for details.
@@ -510,7 +628,6 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | **运行（组装好的应用）** | |
 | `bun run serve:web` | 启动 Web 服务器，托管已构建的前端 |
 | **测试** | |
-| `bun run test:git-attribution` | Validate the repository-local human-only Git attribution policy. |
 | `bun run test` | 运行全部 Rust 测试（含 doctest） |
 | `bun run test:fast` | 用 nextest 快速跑 Rust 测试（日常） |
 | `bun run test:crate` | 运行单个 Rust crate：bun run test:crate <crate> [cargo 参数] |
@@ -518,11 +635,11 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | `bun run test:desktop` | 运行桌面壳测试，不监听或打包 ui/dist 资源 |
 | `bun run test:browser` | 运行 browser-use 门控的 Rust 测试（browser-platform 全量 + gateway/ai-agent/nomi-agent/app 开启 --features browser-use；crate/core 车道会静默跳过这些） |
 | `bun run test:ui` | 运行前端单元测试（bun test，收集 ui/src 下全部 *.test.ts/tsx） |
-| **静态检查 / 门禁** | |
+| **静态检查** | |
 | `bun run check:process-runtime-boundary` | Enforce the supervised process runtime boundary and exact hand-off allowlist. |
 | `bun run check:browser-platform-boundary` | Enforce the single BrowserSessionHub ownership boundary and reject private browser launch paths. |
 | `bun run check:agent-vocabulary` | Enforce AgentExecution as the only active collaboration aggregate and permit only exact migration fences. |
-| `bun run check` | 聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 死 CSS 工具类 + 进程运行时边界 + Agent 词汇边界 + 脚本登记 |
+| `bun run check` | 聚合静态检查：typecheck + i18n + 主题契约 + 图标导入 + 死 CSS 工具类 + 进程运行时边界 + Agent 词汇边界 + 脚本登记 |
 | `bun run typecheck` | 前端 TypeScript 类型检查（tsc --noEmit） |
 | `bun run check:i18n` | 校验 i18n 类型与 locale 键是否一致 |
 | `bun run check:theme` | 校验预设 CSS 主题契约 |
@@ -531,7 +648,6 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | **代码生成** | |
 | `bun run gen:i18n` | 由 locale 重新生成 i18n 类型声明 |
 | **维护 / 工具** | |
-| `bun run setup:git-hooks` | Enable this repository's human-only Git attribution hooks without changing global Git config. |
 | `bun run clean` | 深度回收构建空间（debug 产物 + flycheck + 旧安装包） |
 | `bun run seed:dev` | 用生产数据目录播种 dev 数据目录 |
 | `bun run bump` | 统一改版本号：根 Cargo.toml(真源) + package.json + ui + Cargo.lock，可选 --tag 提交并打 tag |
@@ -601,13 +717,15 @@ Projects and products we appreciate:
 
 ## 📬 Contact & community
 
-We'd love to hear from you. The fastest way to reach us is GitHub; the social channels below are all official.
+The following contact information is shared across the NomiFun open-source
+product family. For reproducible bugs and feature requests, GitHub Issues is the
+preferred channel.
 
 | Channel | Where |
 |---|---|
 | 🌐 **Website** | [www.nomifun.com](https://www.nomifun.com) |
-| 🐙 **GitHub** | [nomifun/nomifun-desktop](https://github.com/nomifun/nomifun-desktop) · [Issues](https://github.com/nomifun/nomifun-desktop/issues) · [Releases](https://github.com/nomifun/nomifun-desktop/releases) |
-| ✉️ **Email** | `hello@nomifun.com` <sub>(provisional — being finalized)</sub> |
+| 🐙 **Issues** | [github.com/nomifun/nomifun-desktop/issues](https://github.com/nomifun/nomifun-desktop/issues) |
+| 📮 **Contact** | [www.nomifun.com/contact](https://www.nomifun.com/contact) |
 | 📕 **小红书 / RED** | [NomiFun](https://xhslink.com/m/4x6ti8n6cA1) |
 | 📺 **Bilibili** | [NomiFun](https://b23.tv/0UhgKDh) · [demo video](https://www.bilibili.com/video/BV1kwKZ6UE5X/) |
 | 🎵 **抖音 / Douyin** | [NomiFun](https://v.douyin.com/MDT5QVdYaJk/) |
@@ -620,7 +738,7 @@ We'd love to hear from you. The fastest way to reach us is GitHub; the social ch
 <div align="center">
 <table>
   <tr>
-    <td align="center"><img src="docs/images/contact/wechat-group-qr.jpg" alt="WeChat group QR" width="220"><br/><sub><b>WeChat group / 微信群</b></sub></td>
+    <td align="center"><img src="docs/assets/nomifun-wechat-group.jpg" alt="NomiFun WeChat group QR" width="220"><br/><sub><b>NomiFun WeChat group / NomiFun 微信交流群</b></sub></td>
     <td align="center"><img src="docs/images/contact/qq-group-qr.png" alt="QQ group QR" width="220"><br/><sub><b>QQ group / QQ 群</b></sub></td>
   </tr>
 </table>

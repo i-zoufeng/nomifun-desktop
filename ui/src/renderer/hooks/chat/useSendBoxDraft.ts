@@ -11,30 +11,6 @@ type Draft =
       content: unknown;
     }
   | {
-      _type: 'acp';
-      content: string;
-      atPath: Array<string | FileOrFolderItem>;
-      uploadFile: string[];
-    }
-  | {
-      _type: 'openclaw-gateway';
-      content: string;
-      atPath: Array<string | FileOrFolderItem>;
-      uploadFile: string[];
-    }
-  | {
-      _type: 'nanobot';
-      content: string;
-      atPath: Array<string | FileOrFolderItem>;
-      uploadFile: string[];
-    }
-  | {
-      _type: 'remote';
-      content: string;
-      atPath: Array<string | FileOrFolderItem>;
-      uploadFile: string[];
-    }
-  | {
       _type: 'nomi';
       content: string;
       atPath: Array<string | FileOrFolderItem>;
@@ -49,10 +25,6 @@ type SendBoxDraftStore = {
 };
 
 const store: SendBoxDraftStore = {
-  acp: new Map(),
-  'openclaw-gateway': new Map(),
-  nanobot: new Map(),
-  remote: new Map(),
   nomi: new Map(),
 };
 
@@ -63,34 +35,6 @@ const setDraft = <K extends TChatConversation['type']>(
 ) => {
   // TODO import ts-pattern for exhaustive check
   switch (type) {
-    case 'acp':
-      if (draft) {
-        store.acp.set(conversation_id, draft as Extract<Draft, { _type: 'acp' }>);
-      } else {
-        store.acp.delete(conversation_id);
-      }
-      break;
-    case 'openclaw-gateway':
-      if (draft) {
-        store['openclaw-gateway'].set(conversation_id, draft as Extract<Draft, { _type: 'openclaw-gateway' }>);
-      } else {
-        store['openclaw-gateway'].delete(conversation_id);
-      }
-      break;
-    case 'nanobot':
-      if (draft) {
-        store.nanobot.set(conversation_id, draft as Extract<Draft, { _type: 'nanobot' }>);
-      } else {
-        store.nanobot.delete(conversation_id);
-      }
-      break;
-    case 'remote':
-      if (draft) {
-        store.remote.set(conversation_id, draft as Extract<Draft, { _type: 'remote' }>);
-      } else {
-        store.remote.delete(conversation_id);
-      }
-      break;
     case 'nomi':
       if (draft) {
         store.nomi.set(conversation_id, draft as Extract<Draft, { _type: 'nomi' }>);
@@ -109,14 +53,6 @@ const getDraft = <K extends TChatConversation['type']>(
 ): Extract<Draft, { _type: K }> | undefined => {
   // TODO import ts-pattern for exhaustive check
   switch (type) {
-    case 'acp':
-      return store.acp.get(conversation_id) as Extract<Draft, { _type: K }>;
-    case 'openclaw-gateway':
-      return store['openclaw-gateway'].get(conversation_id) as Extract<Draft, { _type: K }>;
-    case 'nanobot':
-      return store.nanobot.get(conversation_id) as Extract<Draft, { _type: K }>;
-    case 'remote':
-      return store.remote.get(conversation_id) as Extract<Draft, { _type: K }>;
     case 'nomi':
       return store.nomi.get(conversation_id) as Extract<Draft, { _type: K }>;
     default:

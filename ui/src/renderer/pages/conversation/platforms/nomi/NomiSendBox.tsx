@@ -50,7 +50,10 @@ import {
   releaseInitialMessageDelivery,
 } from '@/renderer/pages/conversation/platforms/initialMessageDelivery';
 import { classifyPublicMessageDelivery } from '@/renderer/pages/conversation/platforms/publicMessageDelivery';
-import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
+import {
+  stopConversationAndConfirmRelease,
+  waitForConversationTurnReleaseUntilSettled,
+} from '@/renderer/pages/conversation/platforms/requestConversationStop';
 import {
   shouldReleaseStopInteraction,
   useConversationStopAttemptGuard,
@@ -62,7 +65,7 @@ import {
   warmupConversationForPassiveMount,
 } from '@/renderer/pages/conversation/utils/warmupConversation';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
-import { allSupportedExts, imageExts } from '@/renderer/services/FileService';
+import { allSupportedExts } from '@/renderer/services/FileService';
 import { iconColors } from '@/renderer/styles/colors';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
@@ -77,11 +80,8 @@ import NomiModelSelector from './NomiModelSelector';
 import { ContextUsageRing } from './ContextUsageRing';
 import type { NomiModelSelection } from './useNomiModelSelection';
 import { useModelSelectorProviderLabel } from '@/renderer/hooks/agent/useModelSelectorProviderLabel';
-import { useModelsForTask } from '@/renderer/hooks/agent/useModelsForTask';
-import type { ModelTrait } from '@/common/config/storage';
-
-/** Trait refinement for the vision guard (stable identity for the SWR key). */
-const VISION_INPUT_TRAITS: ModelTrait[] = ['vision_input'];
+import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
+import { evaluateNomiVisionSend } from './nomiVisionSendGuard';
 
 const useNomiSendBoxDraft = getSendBoxDraftHook('nomi', {
   _type: 'nomi',
@@ -171,38 +171,39 @@ const NomiSendBox: React.FC<{
   const { checkAndUpdateTitle } = useAutoTitle();
   const { current_model } = modelSelection;
 
-  // ── Vision guard ──────────────────────────────────────────────────────────
-  // Chat models that accept image input, from the unified catalog resolve.
-  // When the user sends image attachments through a model that is NOT in this
-  // set, warn once per model selection — never block the send (the backend
-  // returns a typed error if the model truly cannot take images).
   const {
-    groups: visionGroups,
-    isLoading: isVisionCatalogLoading,
-    error: visionCatalogError,
-  } = useModelsForTask('chat', VISION_INPUT_TRAITS);
-  const warnedVisionModelKeyRef = useRef<string | null>(null);
-  const maybeWarnNonVisionModel = useCallback(
+    data: providerGraph,
+    isLoading: isProviderGraphLoading,
+    error: providerGraphError,
+  } = useProvidersQuery();
+  const canSendFiles = useCallback(
     (files: string[]) => {
-      if (!current_model?.id || !current_model.use_model) return;
-      // Unresolved/failed catalog: never emit a false-positive warning.
-      if (isVisionCatalogLoading || visionCatalogError) return;
-      const hasImageAttachment = files.some((file) => {
-        const lower = file.toLowerCase();
-        return imageExts.some((ext) => lower.endsWith(ext));
+      const decision = evaluateNomiVisionSend({
+        files,
+        providers: providerGraph ?? [],
+        providerGraphResolved:
+          !isProviderGraphLoading && !providerGraphError && Array.isArray(providerGraph),
+        providerId: current_model?.id,
+        model: current_model?.use_model,
       });
-      if (!hasImageAttachment) return;
-      const supportsVision = visionGroups.some(
-        (group) =>
-          group.provider.id === current_model.id && group.models.includes(current_model.use_model)
+      if (decision.allowed) return true;
+      Message.warning(
+        decision.reason === 'capability_unavailable'
+          ? t('conversation.chat.visionCapabilityUnavailable')
+          : t('conversation.chat.visionModelBlocked', {
+              model: current_model?.use_model ?? '',
+            })
       );
-      if (supportsVision) return;
-      const selectionKey = `${current_model.id}:${current_model.use_model}`;
-      if (warnedVisionModelKeyRef.current === selectionKey) return;
-      warnedVisionModelKeyRef.current = selectionKey;
-      Message.warning(t('conversation.chat.visionModelHint', { model: current_model.use_model }));
+      return false;
     },
-    [current_model?.id, current_model?.use_model, isVisionCatalogLoading, visionCatalogError, visionGroups, t]
+    [
+      current_model?.id,
+      current_model?.use_model,
+      isProviderGraphLoading,
+      providerGraph,
+      providerGraphError,
+      t,
+    ]
   );
 
   const {
@@ -216,7 +217,6 @@ const NomiSendBox: React.FC<{
     setWaitingResponse,
     resetState,
     confirmStopped,
-    restoreRunningAfterStopFailure,
     getTurnStartGeneration,
     getTurnCompletionGeneration,
   } = turnActivity;
@@ -333,6 +333,9 @@ const NomiSendBox: React.FC<{
         Message.warning(t('conversation.chat.noModelSelected'));
         throw new Error('No model selected');
       }
+      if (!canSendFiles(files)) {
+        throw new Error('Image send blocked by the selected chat capability');
+      }
 
       // Persisted queue/recovery deliveries start behind an idle fence. Only
       // the atomic first-delivery winner may open a new local turn.
@@ -400,6 +403,7 @@ const NomiSendBox: React.FC<{
     [
       addOrUpdateMessage,
       checkAndUpdateTitle,
+      canSendFiles,
       conversation_id,
       current_model?.use_model,
       markTurnAccepted,
@@ -502,7 +506,7 @@ const NomiSendBox: React.FC<{
 
   const onSendHandler = async (message: string) => {
     const filesToSend = collectSelectedFiles(uploadFile, atPath);
-    maybeWarnNonVisionModel(filesToSend);
+    if (!canSendFiles(filesToSend)) return;
     clearFiles();
     emitter.emit('nomi.selected.file.clear');
 
@@ -525,7 +529,7 @@ const NomiSendBox: React.FC<{
   const handleEditResubmit = useCallback(
     async (msgId: MessageId, createdAt: number, message: string) => {
       const filesToSend = collectSelectedFiles(uploadFile, atPath);
-      maybeWarnNonVisionModel(filesToSend);
+      if (!canSendFiles(filesToSend)) return;
       const oldSuffixLocalIds = snapshotEditSuffixLocalIds(
         messageListRef.current,
         msgId,
@@ -579,7 +583,7 @@ const NomiSendBox: React.FC<{
       workspacePath,
       clearFiles,
       markTurnAccepted,
-      maybeWarnNonVisionModel,
+      canSendFiles,
       reconcilePublicDeliveryReplay,
       messageListRef,
       removeMessagesByLocalIds,
@@ -639,9 +643,11 @@ const NomiSendBox: React.FC<{
         }
       } catch (error) {
         if (msg_id) removeMessageByMsgId(msg_id);
-        // Engine can't steer (non-Nomi) or the turn just ended → fall back to the
-        // pending queue so the interjection is never lost.
+        // Rethrow so the caller can divert the interjection into the persisted
+        // command queue. Swallowing here (as this used to) stranded the draft:
+        // the box had already been cleared, so the text was unrecoverable.
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
+        throw error;
       }
     },
     [
@@ -658,10 +664,21 @@ const NomiSendBox: React.FC<{
 
   const onSteerHandler = async (message: string) => {
     const filesToSend = collectSelectedFiles(uploadFile, atPath);
-    maybeWarnNonVisionModel(filesToSend);
+    if (!canSendFiles(filesToSend)) return;
     clearFiles();
     emitter.emit('nomi.selected.file.clear');
-    await executeSteer({ input: message, files: filesToSend });
+    try {
+      await executeSteer({ input: message, files: filesToSend });
+    } catch {
+      // Steering has no durable channel of its own: a failed delivery is simply
+      // gone. Divert into the same persisted command queue the normal send path
+      // uses when busy, so an offline click keeps both the text and the
+      // attachments instead of losing them to an error toast. This is the
+      // fallback the catch in executeSteer has always claimed to perform, and
+      // conversation.steer.fallbackQueued is the message written for it.
+      enqueue({ input: message, files: filesToSend });
+      Message.info(t('conversation.steer.fallbackQueued'));
+    }
   };
 
   const handleEditQueuedCommand = useCallback(
@@ -698,7 +715,7 @@ const NomiSendBox: React.FC<{
       if (mode === currentMode) return;
       try {
         await prepareRuntimeSync();
-        await ipcBridge.acpConversation.setMode.invoke({ conversation_id, mode });
+        await ipcBridge.agentConversation.setMode.invoke({ conversation_id, mode });
         setCurrentMode(mode);
         void savePreferredMode('nomi', mode);
         Message.success(t('agentMode.switchSuccess'));
@@ -716,7 +733,7 @@ const NomiSendBox: React.FC<{
     if (!conversation_id) return;
     let cancelled = false;
     void prepareRuntimeSync()
-      .then(() => ipcBridge.acpConversation.getMode.invoke({ conversation_id }))
+      .then(() => ipcBridge.agentConversation.getMode.invoke({ conversation_id }))
       .then((result) => {
         if (cancelled || !result) return;
         if (result.initialized !== false) {
@@ -898,13 +915,31 @@ const NomiSendBox: React.FC<{
       return;
     }
 
-    console.warn('[NomiSendBox] stop request could not be confirmed', result);
-    restoreRunningAfterStopFailure();
-    setIsStopping(false);
-    Message.error({
-      content: t('conversation.stop.failed', { defaultValue: 'Failed to stop the current task. Please try again.' }),
+    // A timeout/unknown result is not idle authority. Keep the stop lock and
+    // queue pause until a later GET proves the runtime is idle or deleted.
+    console.warn('[NomiSendBox] stop request needs continued authoritative confirmation', result);
+    Message.warning({
+      content: t('conversation.stop.confirming', {
+        defaultValue: 'Stop requested. Waiting for the task to finish stopping...',
+      }),
       closable: true,
     });
+    const settled = await waitForConversationTurnReleaseUntilSettled(conversation_id, {
+      isCurrent: () => getStopAttemptStatus(stopAttempt) === 'current',
+    });
+    const settledAttemptStatus = getStopAttemptStatus(stopAttempt);
+    if (settledAttemptStatus !== 'current') {
+      if (shouldReleaseStopInteraction(settledAttemptStatus)) setIsStopping(false);
+      return;
+    }
+    if (settled === 'released' || settled === 'deleted') {
+      confirmStopped();
+      setIsStopping(false);
+      resetActiveExecution('external-reset');
+      return;
+    }
+
+    console.warn('[NomiSendBox] stop confirmation became stale', result);
   };
 
   // Clear conversation context (release model context); keeps message records.
@@ -956,7 +991,7 @@ const NomiSendBox: React.FC<{
         disabled={!current_model?.use_model}
         placeholder={
           current_model?.use_model
-            ? t('acp.sendbox.placeholder', {
+            ? t('agent.sendbox.placeholder', {
                 backend: agent_name || 'Nomi',
                 defaultValue: `Send message to {{backend}}...`,
               })

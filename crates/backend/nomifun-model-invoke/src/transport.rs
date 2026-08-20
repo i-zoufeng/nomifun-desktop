@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::de::DeserializeOwned;
 
 use crate::auth::AuthMaterial;
 use crate::error::{InvokeError, InvokeErrorKind};
+use nomifun_net::secret_redaction::SecretRedactor;
 
 /// Map a reqwest transport error onto [`InvokeError`]
 /// (timeout → [`InvokeErrorKind::Timeout`], else [`InvokeErrorKind::Network`]).
@@ -43,21 +45,42 @@ pub(crate) async fn send_with_rotation<F>(auth: &AuthMaterial, build: F) -> Resu
 where
     F: Fn() -> Result<reqwest::RequestBuilder, InvokeError>,
 {
+    let redactor = auth.secret_redactor();
     let secrets = if auth.scheme.rotates() { auth.secrets() } else { Vec::new() };
     if secrets.len() < 2 {
         // Single-shot path: `apply` also surfaces the canonical Config error
         // for empty credentials.
-        return auth.apply(build()?)?.send().await.map_err(net_err);
+        let mut response = auth.apply(build()?)?.send().await.map_err(net_err)?;
+        response.extensions_mut().insert(redactor);
+        return reject_non_api_response(response);
     }
     let last = secrets.len() - 1;
     for (idx, secret) in secrets.iter().enumerate() {
-        let resp = auth.apply_with_secret(build()?, secret)?.send().await.map_err(net_err)?;
+        let mut resp = auth.apply_with_secret(build()?, secret)?.send().await.map_err(net_err)?;
+        resp.extensions_mut().insert(redactor.clone());
         if idx < last && is_rotation_status(resp.status()) {
             continue; // this key was refused/throttled — try the next one
         }
-        return Ok(resp);
+        return reject_non_api_response(resp);
     }
     unreachable!("rotation loop always returns on the last key")
+}
+
+/// Fail a response whose content type shows it is a document, not an API payload.
+///
+/// Placed on the single shared send path so every adapter — and
+/// [`crate::service::ModelInvokeService::probe`] — inherits it. Without this, a
+/// gateway that serves its SPA at a near-miss path returns `200 OK` with HTML
+/// and each adapter's own JSON decode fails with a message about parsing, which
+/// reads as a provider bug rather than a wrong address.
+fn reject_non_api_response(response: reqwest::Response) -> Result<reqwest::Response, InvokeError> {
+    match nomifun_net::api_response::is_non_api_content_type(response.headers()) {
+        Some(content_type) => Err(InvokeError::non_api_response(
+            response.status().as_u16(),
+            &content_type,
+        )),
+        None => Ok(response),
+    }
 }
 
 /// `POST url` with a JSON body through key rotation.
@@ -120,6 +143,12 @@ pub(crate) async fn get_request(
 
 /// Longest Retry-After we are willing to honor (seconds).
 const MAX_RETRY_AFTER_SECS: u64 = 120;
+/// Error bodies are diagnostics, never artifacts. Bound their transport read
+/// separately so non-2xx submit/download responses cannot allocate an
+/// arbitrarily large String before the existing 500-character presentation
+/// truncation runs.
+const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const MAX_ERROR_RESPONSE_SNIPPET_CHARS: usize = 500;
 
 /// Parse a `Retry-After` header value in the delta-seconds form, clamped to
 /// [`MAX_RETRY_AFTER_SECS`], as milliseconds. The HTTP-date form yields `None`.
@@ -135,6 +164,7 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<u64
 /// 400/422 → [`InvokeErrorKind::InvalidParams`]; 5xx and everything else →
 /// [`InvokeErrorKind::ProviderError`]. `http_status` is always set.
 pub async fn error_from_response(resp: reqwest::Response) -> InvokeError {
+    let redactor = response_secret_redactor(&resp);
     let status = resp.status();
     let code = status.as_u16();
     let kind = match code {
@@ -143,24 +173,238 @@ pub async fn error_from_response(resp: reqwest::Response) -> InvokeError {
         400 | 422 => InvokeErrorKind::InvalidParams,
         _ => InvokeErrorKind::ProviderError, // 5xx and everything unclassified
     };
-    // Read the header before `text()` consumes the response.
+    // Read the header before the bounded body reader consumes the response.
     let retry_after_ms = (code == 429)
         .then(|| parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER)))
         .flatten();
-    let body = resp.text().await.unwrap_or_default();
-    let snippet: String = body.chars().take(500).collect();
+    let snippet = redactor.redact(&read_error_body_snippet(resp).await);
     InvokeError {
         kind,
         message: format!("provider returned {status}: {snippet}"),
         http_status: Some(code),
         retry_after_ms,
+        catalog_failure: false,
     }
+}
+
+/// Obtain the exact runtime credential redactor attached by the authenticated
+/// send path. Protocols that surface provider-specific failure headers/bodies
+/// use this before consuming the response.
+pub(crate) fn response_secret_redactor(resp: &reqwest::Response) -> SecretRedactor {
+    resp.extensions()
+        .get::<SecretRedactor>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn read_error_body_snippet(mut resp: reqwest::Response) -> String {
+    if let Some(declared) = resp.content_length()
+        && declared > MAX_ERROR_RESPONSE_BODY_BYTES as u64
+    {
+        return format!(
+            "<provider error body omitted: declared {declared} bytes exceeds {}-byte cap>",
+            MAX_ERROR_RESPONSE_BODY_BYTES
+        );
+    }
+
+    let mut body = Vec::new();
+    let mut exceeded_cap = false;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_ERROR_RESPONSE_BODY_BYTES.saturating_sub(body.len());
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    exceeded_cap = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                if body.is_empty() {
+                    return format!("<provider error body read failed: {error}>");
+                }
+                break;
+            }
+        }
+    }
+
+    let mut snippet: String = String::from_utf8_lossy(&body)
+        .chars()
+        .take(MAX_ERROR_RESPONSE_SNIPPET_CHARS)
+        .collect();
+    if exceeded_cap {
+        snippet.push_str(&format!(
+            "… <truncated at {}-byte cap>",
+            MAX_ERROR_RESPONSE_BODY_BYTES
+        ));
+    }
+    snippet
 }
 
 /// Hard ceiling on a single downloaded artifact / video-content body. Streams
 /// are aborted once this is exceeded so a large or hostile provider response
 /// cannot exhaust process memory.
 pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Native image-result contract shared by every image adapter. These limits
+/// are enforced while the provider response is still at the invocation
+/// boundary, before an untrusted base64 string is decoded into another large
+/// allocation. Product persistence repeats the per-image check as defense in
+/// depth.
+pub(crate) const MAX_IMAGE_RESPONSE_IMAGES: usize = 8;
+pub(crate) const MAX_IMAGE_RESPONSE_BYTES_PER_IMAGE: usize = 20 * 1024 * 1024;
+/// Aggregate decoded budget shared with the native chat image product. This
+/// must be enforced before JSON parsing/base64 decode, not only later during
+/// materialization, otherwise an ultimately rejected 8-image response can
+/// transiently occupy hundreds of MiB.
+pub(crate) const MAX_IMAGE_RESPONSE_TOTAL_BYTES: usize = 40 * 1024 * 1024;
+
+const IMAGE_RESPONSE_JSON_OVERHEAD_BYTES: u64 = 1024 * 1024;
+
+/// URL-only image submit/poll envelopes never contain image bytes. Keeping a
+/// separate small cap prevents a hostile async provider from consuming the much
+/// larger allowance needed for legal inline base64 results.
+pub(crate) const MAX_IMAGE_METADATA_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// Maximum JSON body size for an inline response expected to contain at most
+/// `max_images` legal images. The fixed allowance covers JSON structure, MIME
+/// strings, text parts and provider metadata without making that metadata
+/// unbounded.
+pub(crate) fn inline_image_response_body_limit(max_images: usize) -> u64 {
+    debug_assert!((1..=MAX_IMAGE_RESPONSE_IMAGES).contains(&max_images));
+    let decoded_budget = MAX_IMAGE_RESPONSE_TOTAL_BYTES
+        .min(MAX_IMAGE_RESPONSE_BYTES_PER_IMAGE.saturating_mul(max_images));
+    decoded_budget.div_ceil(3) as u64 * 4 + IMAGE_RESPONSE_JSON_OVERHEAD_BYTES
+}
+
+/// Validate the caller-requested image count before issuing network requests.
+/// Besides avoiding excessive Gemini loops, this makes the response-body cap
+/// calculable from a trusted value.
+pub(crate) fn validate_image_request_count(count: u32) -> Result<usize, InvokeError> {
+    let count = usize::try_from(count).map_err(|_| {
+        InvokeError::new(
+            InvokeErrorKind::InvalidParams,
+            format!("image count must be between 1 and {MAX_IMAGE_RESPONSE_IMAGES}"),
+        )
+    })?;
+    if !(1..=MAX_IMAGE_RESPONSE_IMAGES).contains(&count) {
+        return Err(InvokeError::new(
+            InvokeErrorKind::InvalidParams,
+            format!("image count must be between 1 and {MAX_IMAGE_RESPONSE_IMAGES}"),
+        ));
+    }
+    Ok(count)
+}
+
+/// Per-response/batch image budget. Adapters first preflight the number of
+/// image-bearing items with [`Self::ensure_additional_count`], then record URL
+/// results or decode inline base64 through this value. The decoder checks the
+/// encoded length *before* allocating the decoded buffer, and repeats the
+/// decoded per-image and aggregate checks afterwards.
+pub(crate) struct ImageResponseBudget {
+    max_images: usize,
+    max_bytes_per_image: usize,
+    max_total_bytes: usize,
+    images: usize,
+    decoded_bytes: usize,
+}
+
+impl ImageResponseBudget {
+    pub(crate) fn new(max_images: usize) -> Result<Self, InvokeError> {
+        if !(1..=MAX_IMAGE_RESPONSE_IMAGES).contains(&max_images) {
+            return Err(InvokeError::new(
+                InvokeErrorKind::InvalidParams,
+                format!("image count must be between 1 and {MAX_IMAGE_RESPONSE_IMAGES}"),
+            ));
+        }
+        Ok(Self {
+            max_images,
+            max_bytes_per_image: MAX_IMAGE_RESPONSE_BYTES_PER_IMAGE,
+            max_total_bytes: MAX_IMAGE_RESPONSE_TOTAL_BYTES
+                .min(MAX_IMAGE_RESPONSE_BYTES_PER_IMAGE * max_images),
+            images: 0,
+            decoded_bytes: 0,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_limits(max_images: usize, max_bytes_per_image: usize, max_total_bytes: usize) -> Self {
+        Self {
+            max_images,
+            max_bytes_per_image,
+            max_total_bytes,
+            images: 0,
+            decoded_bytes: 0,
+        }
+    }
+
+    pub(crate) fn ensure_additional_count(
+        &self,
+        additional: usize,
+        context: &str,
+    ) -> Result<(), InvokeError> {
+        let total = self.images.checked_add(additional).ok_or_else(|| {
+            image_response_limit_error(format!("{context} image count overflowed"))
+        })?;
+        if total > self.max_images {
+            return Err(image_response_limit_error(format!(
+                "{context} returned {total} images, exceeding the limit of {}",
+                self.max_images
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn accept_url(&mut self, context: &str) -> Result<(), InvokeError> {
+        self.ensure_additional_count(1, context)?;
+        self.images += 1;
+        Ok(())
+    }
+
+    pub(crate) fn decode_base64(
+        &mut self,
+        encoded: &str,
+        context: &str,
+    ) -> Result<Vec<u8>, InvokeError> {
+        self.ensure_additional_count(1, context)?;
+        let encoded = encoded.trim();
+        let encoded_cap = self.max_bytes_per_image.div_ceil(3) * 4;
+        if encoded.len() > encoded_cap {
+            return Err(image_response_limit_error(format!(
+                "{context} base64 length {} exceeds the encoded limit of {encoded_cap}",
+                encoded.len()
+            )));
+        }
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|_| InvokeError::parse(format!("{context} is not valid base64")))?;
+        if bytes.len() > self.max_bytes_per_image {
+            return Err(image_response_limit_error(format!(
+                "{context} decoded to {} bytes, exceeding the per-image limit of {}",
+                bytes.len(),
+                self.max_bytes_per_image
+            )));
+        }
+        let total = self.decoded_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            image_response_limit_error(format!("{context} aggregate size overflowed"))
+        })?;
+        if total > self.max_total_bytes {
+            return Err(image_response_limit_error(format!(
+                "{context} would raise decoded image bytes to {total}, exceeding the aggregate limit of {}",
+                self.max_total_bytes
+            )));
+        }
+        self.images += 1;
+        self.decoded_bytes = total;
+        Ok(bytes)
+    }
+}
+
+fn image_response_limit_error(message: impl Into<String>) -> InvokeError {
+    InvokeError::new(InvokeErrorKind::ProviderError, message)
+}
 
 /// Read a response body fully into memory under a hard byte cap. Rejects early
 /// on an oversized `Content-Length`, then streams chunk-by-chunk (Content-Length
@@ -187,6 +431,19 @@ pub async fn read_body_capped(mut resp: reqwest::Response, max: u64) -> Result<V
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// Read and deserialize a JSON response under a hard body cap. This must be
+/// used instead of `Response::json()` for provider responses that may carry
+/// inline media: the latter buffers without an application-level ceiling.
+pub(crate) async fn read_json_capped<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<T, InvokeError> {
+    let body = read_body_capped(resp, max_bytes).await?;
+    serde_json::from_slice(&body)
+        .map_err(|error| InvokeError::parse(format!("invalid {context} JSON: {error}")))
 }
 
 /// Decode a base64 payload (adapters share this for inline results).
@@ -218,7 +475,9 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -230,11 +489,94 @@ mod tests {
         reqwest::Client::new().get(format!("{}/x", server.uri())).send().await.unwrap()
     }
 
+    fn assert_query_secret_redacted(error: &InvokeError, secret: &str, request_root: &str) {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("api_key", secret)
+            .finish();
+        let invoke_rendered = error.to_string();
+        let app_error: nomifun_common::AppError = error.clone().into();
+        let app_rendered = app_error.to_string();
+        for rendered in [&invoke_rendered, &app_rendered] {
+            assert!(!rendered.contains(secret), "raw secret leaked: {rendered}");
+            assert!(!rendered.contains(&encoded), "encoded secret leaked: {rendered}");
+            assert!(!rendered.contains("api_key"), "query parameter leaked: {rendered}");
+            assert!(!rendered.contains(request_root), "request URL leaked: {rendered}");
+        }
+    }
+
+    async fn respond_chunked(status: u16, chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} Test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for chunk in chunks {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        reqwest::Client::new()
+            .get(format!("http://{address}/chunked"))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn b64_roundtrip() {
         assert_eq!(decode_b64(&encode_b64(b"hello")).unwrap(), b"hello");
         assert_eq!(decode_b64(" aGVsbG8= ").unwrap(), b"hello");
         assert!(decode_b64("!!not base64!!").is_none());
+    }
+
+    #[test]
+    fn image_contract_response_limits_reject_encoded_per_image_aggregate_and_count_overflow() {
+        assert_eq!(MAX_IMAGE_RESPONSE_IMAGES, 8);
+        assert_eq!(MAX_IMAGE_RESPONSE_BYTES_PER_IMAGE, 20 * 1024 * 1024);
+        assert_eq!(MAX_IMAGE_RESPONSE_TOTAL_BYTES, 40 * 1024 * 1024);
+        assert_eq!(
+            inline_image_response_body_limit(8),
+            (40 * 1024 * 1024usize).div_ceil(3) as u64 * 4
+                + IMAGE_RESPONSE_JSON_OVERHEAD_BYTES
+        );
+        assert!(validate_image_request_count(1).is_ok());
+        assert!(validate_image_request_count(8).is_ok());
+        assert_eq!(validate_image_request_count(0).unwrap_err().kind, InvokeErrorKind::InvalidParams);
+        assert_eq!(validate_image_request_count(9).unwrap_err().kind, InvokeErrorKind::InvalidParams);
+
+        // Four decoded bytes would require eight base64 characters, but a
+        // three-byte member budget permits only four. This fails before decode.
+        let mut encoded = ImageResponseBudget::with_limits(2, 3, 6);
+        let error = encoded.decode_base64("AQIDBA==", "test image").unwrap_err();
+        assert_eq!(error.kind, InvokeErrorKind::ProviderError);
+        assert!(error.message.contains("base64 length"));
+
+        let mut aggregate = ImageResponseBudget::with_limits(3, 3, 5);
+        assert_eq!(aggregate.decode_base64("YWJj", "first").unwrap(), b"abc");
+        let error = aggregate.decode_base64("ZGVm", "second").unwrap_err();
+        assert_eq!(error.kind, InvokeErrorKind::ProviderError);
+        assert!(error.message.contains("aggregate limit"));
+
+        let mut count = ImageResponseBudget::with_limits(1, 3, 3);
+        count.accept_url("first").unwrap();
+        let error = count.accept_url("second").unwrap_err();
+        assert_eq!(error.kind, InvokeErrorKind::ProviderError);
+        assert!(error.message.contains("exceeding the limit of 1"));
     }
 
     #[test]
@@ -463,7 +805,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
             .mount(&server)
             .await;
-        let client = reqwest::Client::builder().timeout(Duration::from_millis(50)).build().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
         let err = client.get(format!("{}/slow", server.uri())).send().await.unwrap_err();
         assert_eq!(net_err(err).kind, InvokeErrorKind::Timeout);
 
@@ -472,12 +818,71 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let err = reqwest::Client::new()
+        let err = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(format!("http://127.0.0.1:{port}/x"))
             .send()
             .await
             .unwrap_err();
         assert_eq!(net_err(err).kind, InvokeErrorKind::Network);
+    }
+
+    #[tokio::test]
+    async fn query_key_transport_error_never_discloses_raw_or_encoded_secret() {
+        let server = MockServer::start().await;
+        let secret = "query secret/+?&=TOP_SECRET";
+        Mock::given(method("GET"))
+            .and(path("/slow-secret"))
+            .and(query_param("api_key", secret))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(250)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = AuthMaterial {
+            scheme: AuthScheme::QueryKey("api_key".into()),
+            credentials: json!({"api_keys": [secret]}),
+        };
+        let url = format!("{}/slow-secret", server.uri());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let error = get_request(&client, &url, Duration::from_millis(20), &auth)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, InvokeErrorKind::Timeout);
+        assert_query_secret_redacted(&error, secret, &server.uri());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn query_key_json_decode_error_never_discloses_raw_or_encoded_secret() {
+        let server = MockServer::start().await;
+        let secret = "json secret/+?&=TOP_SECRET";
+        Mock::given(method("GET"))
+            .and(path("/invalid-json-secret"))
+            .and(query_param("api_key", secret))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = AuthMaterial {
+            scheme: AuthScheme::QueryKey("api_key".into()),
+            credentials: json!({"api_keys": [secret]}),
+        };
+        let url = format!("{}/invalid-json-secret", server.uri());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = get_request(&client, &url, Duration::from_secs(1), &auth)
+            .await
+            .unwrap();
+
+        let source = response.json::<serde_json::Value>().await.unwrap_err();
+        let error = InvokeError::response_json("invalid test JSON", &source);
+
+        assert_eq!(error.kind, InvokeErrorKind::ParseError);
+        assert_query_secret_redacted(&error, secret, &server.uri());
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -498,6 +903,44 @@ mod tests {
             assert_eq!(err.retry_after_ms, None, "status {status}");
             assert!(err.message.contains("nope"), "status {status}: {}", err.message);
         }
+    }
+
+    #[tokio::test]
+    async fn error_from_response_redacts_every_runtime_key_and_encoded_form() {
+        let first = "sk first/+?=";
+        let second = "sk-second-secret";
+        let encoded_first = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("key", first)
+            .finish()
+            .strip_prefix("key=")
+            .unwrap()
+            .to_owned();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redact"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+                "Authorization: Bearer {first}; x-api-key={second}; query={encoded_first}"
+            )))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let response = post_json(
+            &reqwest::Client::new(),
+            &format!("{}/redact", server.uri()),
+            Duration::from_secs(5),
+            &bearer(&[first, second]),
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        let error = error_from_response(response).await;
+        assert_eq!(error.kind, InvokeErrorKind::Auth);
+        for secret in [first, second, encoded_first.as_str()] {
+            assert!(!error.message.contains(secret), "secret leaked: {}", error.message);
+        }
+        assert!(error.message.contains("[REDACTED]"));
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -532,7 +975,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_body_capped_enforces_cap() {
+    async fn image_contract_response_limits_bound_declared_and_chunked_error_bodies() {
+        let declared = respond(
+            ResponseTemplate::new(500)
+                .set_body_string("x".repeat(MAX_ERROR_RESPONSE_BODY_BYTES + 1)),
+        )
+        .await;
+        let declared_error = error_from_response(declared).await;
+        assert_eq!(declared_error.http_status, Some(500));
+        assert!(
+            declared_error.message.contains("provider error body omitted"),
+            "{}",
+            declared_error.message
+        );
+
+        let chunked = respond_chunked(
+            500,
+            vec![
+                vec![b'x'; MAX_ERROR_RESPONSE_BODY_BYTES / 2],
+                vec![b'y'; MAX_ERROR_RESPONSE_BODY_BYTES / 2 + 1],
+            ],
+        )
+        .await;
+        assert_eq!(chunked.content_length(), None);
+        let chunked_error = error_from_response(chunked).await;
+        assert_eq!(chunked_error.http_status, Some(500));
+        assert!(
+            chunked_error.message.contains("truncated at 65536-byte cap"),
+            "{}",
+            chunked_error.message
+        );
+        assert!(chunked_error.message.len() < 1024);
+    }
+
+    #[tokio::test]
+    async fn image_contract_response_limits_reject_declared_body_before_json_parse() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/artifact"))
@@ -544,11 +1021,88 @@ mod tests {
 
         // Over the cap → error (rejected on the declared Content-Length).
         let resp = client.get(&url).send().await.unwrap();
-        assert!(read_body_capped(resp, 10).await.is_err(), "oversized body must be rejected");
+        let error = read_json_capped::<serde_json::Value>(resp, 10, "test")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, InvokeErrorKind::ProviderError);
+        assert!(error.message.contains("declared"));
 
         // Within the cap → full body returned (streaming accumulation path).
         let resp2 = client.get(&url).send().await.unwrap();
         let body = read_body_capped(resp2, 1024).await.unwrap();
         assert_eq!(body.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn image_contract_response_limits_reject_chunked_body_without_content_length() {
+        let resp = respond_chunked(200, vec![b"1234".to_vec(), b"5678".to_vec()]).await;
+        assert_eq!(resp.content_length(), None);
+        let error = read_body_capped(resp, 5).await.unwrap_err();
+        assert_eq!(error.kind, InvokeErrorKind::ProviderError);
+        assert!(error.message.contains("exceeded size cap"));
+    }
+
+    /// A gateway serving its SPA at a near-miss path answers `200 OK` with HTML.
+    /// Status-only checks accepted that and the failure surfaced later as a
+    /// parse/stream complaint about the model instead of the address.
+    #[tokio::test]
+    async fn html_success_is_rejected_as_a_non_api_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<!doctype html><html><body>gateway</body></html>", "text/html"),
+            )
+            .mount(&server)
+            .await;
+        let auth = AuthMaterial {
+            scheme: AuthScheme::Bearer,
+            credentials: json!({"api_keys": ["k"]}),
+        };
+        let error = post_json(
+            &reqwest::Client::new(),
+            &format!("{}/chat/completions", server.uri()),
+            Duration::from_secs(5),
+            &auth,
+            &json!({}),
+        )
+        .await
+        .expect_err("an HTML body must not be accepted as an API response");
+        assert_eq!(error.kind, InvokeErrorKind::NonApiResponse);
+        assert_eq!(error.http_status, Some(200));
+        assert!(
+            error.message.contains("web page"),
+            "diagnosis must point at the address: {}",
+            error.message
+        );
+    }
+
+    /// The gate keys on content type, not on status, so a normal JSON error
+    /// response still reaches the adapter's own classification untouched.
+    #[tokio::test]
+    async fn json_responses_pass_the_non_api_gate_at_any_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"code": "INVALID_API_KEY"})),
+            )
+            .mount(&server)
+            .await;
+        let auth = AuthMaterial {
+            scheme: AuthScheme::Bearer,
+            credentials: json!({"api_keys": ["k"]}),
+        };
+        let response = post_json(
+            &reqwest::Client::new(),
+            &format!("{}/v1/chat/completions", server.uri()),
+            Duration::from_secs(5),
+            &auth,
+            &json!({}),
+        )
+        .await
+        .expect("a JSON body must reach the caller for normal classification");
+        assert_eq!(response.status(), 401);
     }
 }

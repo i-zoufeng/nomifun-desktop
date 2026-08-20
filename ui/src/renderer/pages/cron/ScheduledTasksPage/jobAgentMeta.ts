@@ -16,28 +16,26 @@ function normalizeAgentBackend(agent: string | undefined): string | undefined {
 /**
  * Resolve the display name and logo for a cron job's agent.
  *
- * ACP jobs store the literal string "acp" in `agent_type`; the real vendor id
- * (claude/gemini/codex/…) and the human-readable label live in `agent_config`.
- * Non-ACP agents (nomi, remote, nanobot, openclaw-gateway, …) use
- * `agent_type` directly. Nomi's provider_id is a model selection and is not
- * used to resolve the agent logo.
+ * `agent_type` is the runtime discriminant and resolves the logo directly.
+ * Nomi's provider_id is a model selection and is not used for the logo.
  */
 export function getJobAgentMeta(job: ICronJob, cliAgents: AgentMetadata[]): { name?: string; logo?: string | null } {
   const rawType = normalizeAgentBackend(job.metadata.agent_type);
   if (!rawType) return {};
+  const config = job.metadata.agent_config;
+  // A preset is the user-selected execution identity. Keep its frozen name
+  // visible even when the underlying runtime resolves to another agent row.
+  const presetName = config?.preset_id ? config.name.trim() : undefined;
+  const hasStableAgentId = Boolean(config?.custom_agent_id);
+  const detectedById = config?.custom_agent_id
+    ? cliAgents.find((agent) => agent.agent_id === config.custom_agent_id)
+    : undefined;
 
-  if (rawType === 'acp') {
-    const backend = job.metadata.agent_config?.backend;
-    const detected = backend ? cliAgents.find((a) => (a.backend || a.agent_type) === backend) : undefined;
-    return {
-      name: detected?.name || job.metadata.agent_config?.name || backend || rawType,
-      logo: getAgentLogo(backend),
-    };
-  }
-
-  const detected = cliAgents.find((a) => (a.backend || a.agent_type) === rawType);
+  const detected = hasStableAgentId
+    ? detectedById
+    : cliAgents.find((agent) => (agent.backend || agent.agent_type) === rawType);
   return {
-    name: detected?.name || rawType,
-    logo: getAgentLogo(rawType),
+    name: presetName || detected?.name || config?.name || rawType,
+    logo: getAgentLogo(detected?.backend || rawType),
   };
 }

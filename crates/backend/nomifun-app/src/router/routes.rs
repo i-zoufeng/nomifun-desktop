@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Router, middleware};
 use tower_http::cors::{Any, CorsLayer};
 
-use nomifun_ai_agent::{agent_routes, remote_agent_routes};
+use nomifun_ai_agent::agent_routes;
 use nomifun_assets::{AssetRouterState, asset_routes};
 use nomifun_preset::preset_routes;
 use nomifun_auth::{
@@ -270,6 +270,11 @@ pub async fn create_router(services: &AppServices) -> Router {
         provider_model_repo: Arc::new(nomifun_db::SqliteProviderModelRepository::new(
             services.database.pool().clone(),
         )),
+        provider_model_capability_repo: Arc::new(
+            nomifun_db::SqliteProviderModelCapabilityRepository::new(
+                services.database.pool().clone(),
+            ),
+        ),
         idmm_service: states.idmm.service.clone(),
         knowledge_service: services.knowledge_service.clone(),
         // 创意工坊 canvas index: a fresh repo over the same pool the workshop
@@ -304,7 +309,6 @@ pub async fn create_router(services: &AppServices) -> Router {
         hub_installer: states.hub.installer.clone(),
         skill_paths: states.skill.skill_paths.clone(),
         agent_service: states.agent.service.clone(),
-        remote_agent_service: states.remote_agent.service.clone(),
         client_pref_repo: Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
             services.database.pool().clone(),
         )),
@@ -732,13 +736,6 @@ pub fn create_router_with_all_state(
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    // Remote agent routes protected by auth middleware
-    let remote_agent_authenticated = protect_instance_owner(
-        remote_agent_routes(states.remote_agent),
-        &auth_mw_state,
-        &instance_owner_state,
-    );
-
     // SSH host book (owner-only): saved connection profiles + test-connection.
     let ssh_host_authenticated = protect_instance_owner(
         nomifun_ssh::ssh_host_routes(states.ssh_host),
@@ -1102,7 +1099,6 @@ pub fn create_router_with_all_state(
         .merge(knowledge_registration_write_local)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
-        .merge(remote_agent_authenticated)
         .merge(ssh_host_authenticated)
         .merge(miniapp_authenticated)
         .merge(agent_authenticated)

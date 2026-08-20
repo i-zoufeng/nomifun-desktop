@@ -26,7 +26,7 @@ import coworkSvg from '@/renderer/assets/icons/cowork.svg';
 import NomiScrollArea from '@/renderer/components/base/NomiScrollArea';
 import HubPageShell from '@/renderer/components/layout/HubPageShell';
 import { useDetectedAgents, usePresetEditor, usePresetList, usePresetTags } from '@/renderer/hooks/preset';
-import { resolveAvatarImageSrc } from './presetUtils';
+import { resolvePresetAvatarImageSrc } from '@/renderer/utils/model/presetPresentation';
 import PresetEditDrawer from './PresetEditDrawer';
 import PresetListPanel from './PresetListPanel';
 import DeletePresetModal from './DeletePresetModal';
@@ -85,6 +85,8 @@ const PresetSettings: React.FC = () => {
     activePreset,
     isExtensionPreset,
     loadPresets,
+    loadError: presetsLoadError,
+    isLoading: presetsLoading,
     localeKey,
   } = usePresetList();
 
@@ -103,7 +105,7 @@ const PresetSettings: React.FC = () => {
     message,
   });
 
-  const editAvatarImage = resolveAvatarImageSrc(editor.editAvatar, avatarImageMap);
+  const editAvatarImage = resolvePresetAvatarImageSrc(editor.editAvatar, avatarImageMap);
   const hasConsumedNavigationIntentRef = useRef(false);
 
   useEffect(() => {
@@ -278,7 +280,11 @@ const PresetSettings: React.FC = () => {
           </div>
         </Tabs.TabPane>
         <Tabs.TabPane key='market' title={t('settings.presetsPage.marketTab', { defaultValue: 'Preset Market' })}>
-          <PresetPackageMarketSettings onImported={loadPresets} />
+          <PresetPackageMarketSettings
+            onImported={loadPresets}
+            presets={presets}
+            addedStateLoading={presetsLoading || Boolean(presetsLoadError)}
+          />
         </Tabs.TabPane>
       </Tabs>
     </HubPageShell>

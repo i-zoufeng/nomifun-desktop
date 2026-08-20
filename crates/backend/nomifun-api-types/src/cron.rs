@@ -39,8 +39,8 @@ pub enum CronScheduleDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CronAgentConfigDto {
-    /// ACP/agent backend only. Nomi provider selection is carried by
-    /// `provider_id`; this field must be absent for Nomi jobs.
+    /// Retired vendor-backend selector. Nomi provider selection is carried by
+     /// `provider_id`; this field must be absent for Nomi jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     pub name: String,
@@ -49,8 +49,8 @@ pub struct CronAgentConfigDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     /// Reusable configuration preset selected for this scheduled task. This is
-    /// deliberately independent from `custom_agent_id`, which identifies an
-    /// executable custom ACP/OpenClaw/Nanobot agent rather than a preset.
+    /// deliberately independent from `custom_agent_id`, which identifies a
+    /// custom agent row rather than a preset.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn agent_config_full() {
         let raw = json!({
-            "backend": "acp",
+            "backend": "legacy-backend",
             "name": "Claude Agent",
             "cli_path": "/usr/bin/claude",
             "custom_agent_id": "agent-1",
@@ -433,7 +433,7 @@ mod tests {
             "workspace": "/tmp/ws"
         });
         let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(c.backend.as_deref(), Some("acp"));
+        assert_eq!(c.backend.as_deref(), Some("legacy-backend"));
         assert_eq!(c.name, "Claude Agent");
         assert_eq!(c.cli_path.as_deref(), Some("/usr/bin/claude"));
         assert_eq!(c.custom_agent_id.as_deref(), Some("agent-1"));
@@ -457,7 +457,7 @@ mod tests {
         ] {
             assert!(
                 serde_json::from_value::<CronAgentConfigDto>(json!({
-                    "backend": "acp",
+                    "backend": "legacy-backend",
                     "name": "Claude",
                     "preset_id": preset_id
                 }))
@@ -584,7 +584,10 @@ mod tests {
         assert_eq!(json["schedule"]["expr"], "0 0 9 * * *");
         assert_eq!(json["message"], "Generate report");
         assert_eq!(json["execution_mode"], "new_conversation");
-        assert_eq!(json["metadata"]["conversation_id"], "0190f5fe-7c00-7a00-8abc-012345678901");
+        assert_eq!(
+            json["metadata"]["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678901"
+        );
         assert_eq!(json["metadata"]["agent_type"], "acp");
         assert_eq!(json["metadata"]["created_by"], "user");
         assert_eq!(json["metadata"]["created_at"], 1700000000000_i64);
@@ -671,7 +674,10 @@ mod tests {
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Daily task");
         assert_eq!(req.message.as_deref(), Some("Do the thing"));
-        assert_eq!(req.conversation_id.as_deref(), Some("0190f5fe-7c00-7a00-8abc-012345678901"));
+        assert_eq!(
+            req.conversation_id.as_deref(),
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
+        );
         assert_eq!(req.agent_type, "acp");
         assert_eq!(req.created_by, "user");
         assert_eq!(req.execution_mode.as_deref(), Some("new_conversation"));
@@ -858,7 +864,10 @@ mod tests {
     fn list_query_with_conversation_id() {
         let raw = json!({"conversation_id": "0190f5fe-7c00-7a00-8abc-012345678901"});
         let q: ListCronJobsQuery = serde_json::from_value(raw).unwrap();
-        assert_eq!(q.conversation_id.as_deref(), Some("0190f5fe-7c00-7a00-8abc-012345678901"));
+        assert_eq!(
+            q.conversation_id.as_deref(),
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
+        );
     }
 
     #[test]
@@ -871,8 +880,7 @@ mod tests {
     #[test]
     fn list_query_rejects_numeric_and_malformed_conversation_ids() {
         assert!(
-            serde_json::from_value::<ListCronJobsQuery>(json!({"conversation_id": 7}))
-                .is_err()
+            serde_json::from_value::<ListCronJobsQuery>(json!({"conversation_id": 7})).is_err()
         );
         assert!(
             serde_json::from_value::<ListCronJobsQuery>(json!({"conversation_id": "conv_7"}))
@@ -888,7 +896,10 @@ mod tests {
             conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
         };
         let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["conversation_id"], "0190f5fe-7c00-7a00-8abc-012345678901");
+        assert_eq!(
+            json["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678901"
+        );
     }
 
     #[test]

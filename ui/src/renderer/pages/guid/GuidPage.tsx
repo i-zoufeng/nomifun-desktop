@@ -22,6 +22,7 @@ import { isSubmitGesture } from '@/renderer/hooks/chat/useCompositionInput';
 import { appendSpeechTranscript } from '@/renderer/hooks/system/useSpeechInput';
 import { useConfig } from '@/renderer/hooks/config/useConfig';
 import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
+import { isEmoji, resolvePresetAvatarImageSrc } from '@/renderer/utils/model/presetPresentation';
 import { CUSTOM_AVATAR_IMAGE_MAP } from './constants';
 import AgentPillBar from './components/AgentPillBar';
 import ComposerEntryStrip, { type GuidActiveSkill } from './components/ComposerEntryStrip';
@@ -182,8 +183,7 @@ const GuidPage: React.FC = () => {
   }, []);
 
   // --- Hooks ---
-  // Only nomi uses this provider-based model picker now (Gemini runs as a
-  // regular ACP backend with its own model selector).
+  // Nomi is the only engine, and it picks models from configured providers.
   const modelSelection = useGuidModelSelection('nomi');
   const { configuredPairs, allPairs, isLoading: isModelCatalogLoading } = useExecutionModelPool();
   const collaboratorReconciliation = useMemo(
@@ -302,7 +302,6 @@ const GuidPage: React.FC = () => {
     selectedAgentKey: agentSelection.selectedAgentKey,
     selectedAgentInfo: agentSelection.selectedAgentInfo,
     selectedMode: agentSelection.selectedMode,
-    selectedAcpModel: agentSelection.selectedAcpModel,
     current_model: modelSelection.current_model,
 
     // Agent helpers
@@ -568,17 +567,13 @@ const GuidPage: React.FC = () => {
     );
     const avatarValue = selectedPreset?.avatar?.trim() || agentSelection.selectedAgentInfo?.avatar?.trim();
     if (!avatarValue) return { kind: 'icon' as const };
-    const mappedAvatar = CUSTOM_AVATAR_IMAGE_MAP[avatarValue];
-    const resolvedAvatar = resolveExtensionAssetUrl(avatarValue);
-    const avatarImage = mappedAvatar || resolvedAvatar;
-    const isImageAvatar = Boolean(
-      avatarImage &&
-      (/\.(svg|png|jpe?g|webp|gif)$/i.test(avatarImage) || /^(https?:|file:\/\/|data:|\/)/i.test(avatarImage)),
-    );
-    if (isImageAvatar && avatarImage) {
+    const avatarImage = resolvePresetAvatarImageSrc(avatarValue, CUSTOM_AVATAR_IMAGE_MAP);
+    if (avatarImage) {
       return { kind: 'image' as const, value: avatarImage };
     }
-    return { kind: 'emoji' as const, value: avatarValue };
+    return isEmoji(avatarValue)
+      ? { kind: 'emoji' as const, value: avatarValue }
+      : { kind: 'icon' as const };
   }, [
     agentSelection.presets,
     agentSelection.is_presetAgent,
@@ -729,10 +724,9 @@ const GuidPage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveAgentType, advancedConfig.summon]);
 
-  // Agents that use configured model providers instead of ACP probe-based models.
-  // Only nomi now — Gemini runs as a regular ACP backend with ACP-cached models.
+  // Agents that use configured model providers for their model selection.
   const PROVIDER_BASED_AGENTS = new Set(['nomi']);
-  const isGeminiMode =
+  const isProviderModelMode =
     PROVIDER_BASED_AGENTS.has(effectiveAgentType) &&
     (!agentSelection.is_presetAgent || agentSelection.currentEffectiveAgentInfo.isAvailable);
 
@@ -749,13 +743,10 @@ const GuidPage: React.FC = () => {
   // Build the model selector node — a plain single-select model picker.
   const modelSelectorNode = (
     <GuidModelSelector
-      isGeminiMode={isGeminiMode}
+      isProviderModelMode={isProviderModelMode}
       modelList={modelSelection.modelList}
       current_model={modelSelection.current_model}
       setCurrentModel={modelSelection.setCurrentModel}
-      currentAcpCachedModelInfo={agentSelection.currentAcpCachedModelInfo}
-      selectedAcpModel={agentSelection.selectedAcpModel}
-      setSelectedAcpModel={agentSelection.setSelectedAcpModel}
     />
   );
   const collaboratorSelectorNode = (

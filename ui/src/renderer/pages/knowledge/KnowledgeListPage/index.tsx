@@ -26,7 +26,7 @@ import {
   Tooltip,
   Typography,
 } from '@arco-design/web-react';
-import { AddOne, Search, SettingTwo } from '@icon-park/react';
+import { AddOne, Brain, Search, SettingTwo } from '@icon-park/react';
 import { useLayoutContext } from '@renderer/hooks/context/LayoutContext';
 import { isDesktopShell } from '@renderer/utils/platform';
 import { ipcBridge } from '@/common';
@@ -48,8 +48,15 @@ import KnowledgeTagFilterBar, {
 import toolbarStyles from '../KnowledgeTagFilterBar.module.css';
 import { sortKnowledgeBases } from '../knowledgeSort';
 import KnowledgeTagManagementModal from '../KnowledgeTagManagementModal';
+import KnowledgeRetrievalSettingsModal from '../KnowledgeRetrievalSettingsModal';
 import CreateStudio from '../CreateStudio';
 import type { StudioInitialKind } from '../CreateStudio/sourceTypes';
+
+// Keep the catalog compact and responsive: the existing 1180px page shell
+// caps the grid at three 290px+ cards, while auto-fill steps down to two and
+// one column only as the actual content area narrows. `min(..., 100%)` keeps
+// the single-column layout overflow-safe on small screens.
+const KNOWLEDGE_CARD_GRID_COLUMNS = 'repeat(auto-fill, minmax(min(290px, 100%), 1fr))';
 
 // ─── Filter pure function ────────────────────────────────────────────────────
 
@@ -103,6 +110,7 @@ const KnowledgeListPage: React.FC = () => {
   const { bases, loading, error, refresh } = useKnowledgeBases();
   const { tags, createTag, updateTag, deleteTag } = useKnowledgeTags();
   const [tagModalVisible, setTagModalVisible] = useState(false);
+  const [retrievalModalVisible, setRetrievalModalVisible] = useState(false);
 
   // Filter state
   const [kindFilter, setKindFilter] = useState<KnowledgeKind | null>(null);
@@ -272,6 +280,7 @@ const KnowledgeListPage: React.FC = () => {
 
   const searchLabel = t('knowledge.searchPlaceholder', { defaultValue: '搜索知识库...' });
   const manageTagsLabel = t('knowledge.filter.manageTags', { defaultValue: '管理标签' });
+  const retrievalSettingsLabel = t('knowledge.retrieval.open');
   const newBaseLabel = t('knowledge.newBase', { defaultValue: '新建知识库' });
 
   return (
@@ -343,6 +352,39 @@ const KnowledgeListPage: React.FC = () => {
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                   />
+                </div>
+              </Tooltip>
+
+              {/* Install-wide, task-exact knowledge retrieval models */}
+              <Tooltip content={retrievalSettingsLabel} position='top' mini>
+                <div
+                  role='button'
+                  tabIndex={0}
+                  aria-label={retrievalSettingsLabel}
+                  onClick={() => setRetrievalModalVisible(true)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setRetrievalModalVisible(true);
+                    }
+                  }}
+                  className={[
+                    'inline-flex h-34px box-border flex-none items-center gap-6px rounded-full px-12px leading-none',
+                    'border border-solid border-[var(--color-border-3)] bg-[var(--color-bg-2)]',
+                    'text-13px font-medium text-[var(--color-text-1)] cursor-pointer select-none',
+                    'hover:border-[var(--color-border-4)] hover:bg-[var(--color-fill-2)]',
+                    'focus-visible:outline-none focus-visible:border-primary-6 transition-colors',
+                    !isMobile ? toolbarStyles.desktopIconAction : '',
+                  ].join(' ')}
+                >
+                  <span className={`${toolbarStyles.actionIcon} inline-flex h-18px w-18px flex-none items-center justify-center`}>
+                    <Brain theme='outline' size={14} strokeWidth={3} className='block' />
+                  </span>
+                  {!isMobile && (
+                    <span className={`${toolbarStyles.desktopActionLabel} inline-flex h-18px items-center leading-18px`}>
+                      {retrievalSettingsLabel}
+                    </span>
+                  )}
                 </div>
               </Tooltip>
 
@@ -430,7 +472,7 @@ const KnowledgeListPage: React.FC = () => {
         ) : (
           <>
             {/* Card grid */}
-            <div className='grid gap-16px' style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))' }}>
+            <div className='grid gap-16px' style={{ gridTemplateColumns: KNOWLEDGE_CARD_GRID_COLUMNS }}>
               {displayBases.map((base) => (
                 <KnowledgeCard
                   key={base.knowledge_base_id}
@@ -455,7 +497,7 @@ const KnowledgeListPage: React.FC = () => {
                 }}
                 className={[
                   'flex flex-col items-center justify-center gap-8px cursor-pointer select-none',
-                  'min-h-188px rounded-16px',
+                  'min-h-172px box-border rounded-16px',
                   'border border-dashed border-[var(--color-border-3)] bg-transparent',
                   'text-[var(--color-text-3)]',
                   'hover:border-[var(--color-primary-light-3)] hover:text-primary-6 hover:bg-[var(--color-primary-light-1)]',
@@ -527,6 +569,10 @@ const KnowledgeListPage: React.FC = () => {
         createTag={createTag}
         updateTag={updateTag}
         deleteTag={deleteTag}
+      />
+      <KnowledgeRetrievalSettingsModal
+        visible={retrievalModalVisible}
+        onClose={() => setRetrievalModalVisible(false)}
       />
     </div>
   );

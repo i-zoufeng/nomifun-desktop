@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::FutureExt;
 
@@ -19,11 +20,85 @@ use nomi_tools::{ToolExecutionContext, registry::ToolRegistry};
 pub(crate) const SKIPPED_AFTER_PRIOR_ERROR: &str = "\
 Skipped because a previous tool call in this assistant turn failed. Inspect the failed result first, then decide whether to retry with a larger timeout, use exec_command/write_stdin for long-running commands, or choose a different next step. Do not assume this step ran.";
 
+/// A tool approval prompt must not hold an Agent turn forever when the
+/// renderer disappears or a confirmation event is lost.  The browser
+/// approval facade uses the same bound.
+pub(crate) const TOOL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The combined output of a tool execution batch: protocol content blocks
 /// paired with per-call context modifiers (None for non-skill tools).
 pub struct ToolCallOutcome {
     pub results: Vec<ContentBlock>,
     pub modifiers: Vec<Option<ContextModifier>>,
+}
+
+/// Keeps the diagnostic `started`/`completed` lifecycle paired even when an
+/// in-flight tool future is dropped by turn cancellation. Protocol/UI terminal
+/// events remain owned by the surrounding turn machinery; this guard only
+/// closes the structured log span used to diagnose stuck tool calls.
+struct ToolExecutionLog<'a> {
+    tool: &'a str,
+    call_id: &'a str,
+    started: std::time::Instant,
+    stage: &'static str,
+    finished: bool,
+}
+
+impl<'a> ToolExecutionLog<'a> {
+    fn start(tool: &'a str, call_id: &'a str) -> Self {
+        tracing::info!(
+            target: "nomi_agent",
+            tool,
+            call_id,
+            "tool execution started"
+        );
+        Self {
+            tool,
+            call_id,
+            started: std::time::Instant::now(),
+            stage: "pre_hook",
+            finished: false,
+        }
+    }
+
+    fn enter(&mut self, stage: &'static str) {
+        self.stage = stage;
+    }
+
+    fn finish(&mut self, success: bool, outcome: &'static str) {
+        let duration_ms = self.started.elapsed().as_millis() as u64;
+        tracing::info!(
+            target: "nomi_agent",
+            tool = self.tool,
+            call_id = self.call_id,
+            stage = self.stage,
+            duration_ms,
+            success,
+            outcome,
+            "tool execution completed"
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for ToolExecutionLog<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        let duration_ms = self.started.elapsed().as_millis() as u64;
+        tracing::info!(
+            target: "nomi_agent",
+            tool = self.tool,
+            call_id = self.call_id,
+            stage = self.stage,
+            duration_ms,
+            success = false,
+            outcome = "aborted_or_cancelled",
+            "tool execution completed"
+        );
+    }
 }
 
 /// Immutable execution authority captured from the exact tool definitions in
@@ -413,9 +488,7 @@ async fn execute_single_with_authority(
     compaction_level: nomi_compact::CompactionLevel,
     toon_enabled: bool,
 ) -> (ContentBlock, Option<ContextModifier>) {
-    let ContentBlock::ToolUse {
-        id, name, input, ..
-    } = call
+    let ContentBlock::ToolUse { name, input, .. } = call
     else {
         unreachable!("execute_single called with non-ToolUse block")
     };
@@ -424,13 +497,80 @@ async fn execute_single_with_authority(
         return (gated, None);
     }
 
-    let start = std::time::Instant::now();
-    tracing::info!(target: "nomi_agent", tool = %name, call_id = %id, "tool execution started");
+    let timeout = registry
+        .get(name)
+        .map(|tool| tool.execution_timeout(input))
+        .unwrap_or(nomi_tools::DEFAULT_TOOL_EXECUTION_TIMEOUT);
+    let timeout = if timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        timeout
+    };
+    match tokio::time::timeout(
+        timeout,
+        execute_single_without_deadline(
+            registry,
+            call,
+            execution_scope,
+            hooks,
+            compaction_level,
+            toon_enabled,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            let ContentBlock::ToolUse { id, name, .. } = call else {
+                unreachable!("execute_single called with non-ToolUse block")
+            };
+            tracing::error!(
+                target: "nomi_agent",
+                tool = %name,
+                call_id = %id,
+                timeout_ms = timeout.as_millis() as u64,
+                "tool execution exceeded its bounded deadline"
+            );
+            (
+                ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: format!(
+                        "Tool '{name}' timed out after {} ms. The invocation was cancelled \
+                         before a result was available; do not assume its side effects \
+                         completed. Inspect the current state before retrying.",
+                        timeout.as_millis()
+                    ),
+                    is_error: true,
+                    images: Vec::new(),
+                },
+                None,
+            )
+        }
+    }
+}
+
+async fn execute_single_without_deadline(
+    registry: &ToolRegistry,
+    call: &ContentBlock,
+    execution_scope: &str,
+    hooks: Option<&HookEngine>,
+    compaction_level: nomi_compact::CompactionLevel,
+    toon_enabled: bool,
+) -> (ContentBlock, Option<ContextModifier>) {
+    let ContentBlock::ToolUse {
+        id, name, input, ..
+    } = call
+    else {
+        unreachable!("execute_single called with non-ToolUse block")
+    };
+
+    let mut execution_log = ToolExecutionLog::start(name, id);
 
     // Run pre-tool-use hooks
     if let Some(hook_engine) = hooks
         && let Err(e) = hook_engine.run_pre_tool_use(name, input).await
     {
+        execution_log.finish(false, "blocked_by_hook");
         return (
             ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
@@ -442,6 +582,7 @@ async fn execute_single_with_authority(
         );
     }
 
+    execution_log.enter("tool");
     let (result, modifier) = match registry.get(name) {
         Some(tool) => {
             let max_size = tool.max_result_size();
@@ -508,6 +649,7 @@ async fn execute_single_with_authority(
 
     // Run post-tool-use hooks
     if let Some(hook_engine) = hooks {
+        execution_log.enter("post_hook");
         let messages = hook_engine
             .run_post_tool_use(name, input, &result.content)
             .await;
@@ -516,8 +658,11 @@ async fn execute_single_with_authority(
         }
     }
 
-    let duration_ms = start.elapsed().as_millis() as u64;
-    tracing::info!(target: "nomi_agent", duration_ms, success = !result.is_error, "tool execution completed");
+    execution_log.enter("finalize");
+    execution_log.finish(
+        !result.is_error,
+        if result.is_error { "error" } else { "success" },
+    );
 
     // Defense-in-depth: scrub secret patterns (API keys, tokens, PEM blocks)
     // from tool output before it enters the model context / provider request /
@@ -591,9 +736,41 @@ pub async fn execute_tool_calls_with_approval(
     msg_id: &str,
     auto_approve: bool,
     allow_list: &[String],
+    hooks: Option<&mut HookEngine>,
+    compaction_level: nomi_compact::CompactionLevel,
+    toon_enabled: bool,
+) -> Result<ToolCallOutcome, ExecutionControl> {
+    execute_tool_calls_with_approval_timeout(
+        registry,
+        tool_calls,
+        authority,
+        approval_manager,
+        writer,
+        msg_id,
+        auto_approve,
+        allow_list,
+        hooks,
+        compaction_level,
+        toon_enabled,
+        TOOL_APPROVAL_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_calls_with_approval_timeout(
+    registry: &ToolRegistry,
+    tool_calls: &[ContentBlock],
+    authority: &ProviderToolAuthority,
+    approval_manager: &Arc<ToolApprovalManager>,
+    writer: &Arc<dyn ProtocolEmitter>,
+    msg_id: &str,
+    auto_approve: bool,
+    allow_list: &[String],
     mut hooks: Option<&mut HookEngine>,
     compaction_level: nomi_compact::CompactionLevel,
     toon_enabled: bool,
+    approval_timeout: Duration,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
@@ -747,6 +924,8 @@ pub async fn execute_tool_calls_with_approval(
 
         if needs_approval {
             // Emit tool_request and wait for approval
+            let (rx, approval_token) =
+                approval_manager.request_approval_with_token(id, &category);
             let _ = writer.emit(&ProtocolEvent::ToolRequest {
                 msg_id: msg_id.to_string(),
                 call_id: id.clone(),
@@ -758,8 +937,15 @@ pub async fn execute_tool_calls_with_approval(
                 },
             });
 
-            let rx = approval_manager.request_approval(id, &category);
-            match rx.await {
+            match wait_for_tool_approval(
+                approval_manager,
+                id,
+                rx,
+                approval_token,
+                approval_timeout,
+            )
+            .await
+            {
                 Ok(ToolApprovalResult::Approved) => { /* continue to execute */ }
                 Ok(ToolApprovalResult::Denied { reason }) => {
                     let _ = writer.emit(&ProtocolEvent::ToolCancelled {
@@ -777,9 +963,34 @@ pub async fn execute_tool_calls_with_approval(
                     modifiers.push(None);
                     continue;
                 }
-                Err(_) => {
+                Err(ApprovalWaitError::Disconnected) => {
                     // Channel dropped — client disconnected
                     return Err(ExecutionControl::Quit);
+                }
+                Err(ApprovalWaitError::TimedOut) => {
+                    let reason = format!(
+                        "Tool approval timed out after {} seconds; the tool was not executed",
+                        approval_timeout.as_secs()
+                    );
+                    let _ = writer.emit(&ProtocolEvent::ToolCancelled {
+                        msg_id: msg_id.to_string(),
+                        call_id: id.clone(),
+                        reason: reason.clone(),
+                    });
+                    halt_after_error = true;
+                    let result = ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!(
+                            "{reason}. Do not assume any side effects completed; \
+                             inspect the current state before retrying."
+                        ),
+                        is_error: true,
+                        images: Vec::new(),
+                    };
+                    emit_tool_result_event(writer, msg_id, call, &result);
+                    results.push(result);
+                    modifiers.push(None);
+                    continue;
                 }
             }
         }
@@ -841,6 +1052,29 @@ pub async fn execute_tool_calls_with_approval(
     }
 
     Ok(ToolCallOutcome { results, modifiers })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWaitError {
+    TimedOut,
+    Disconnected,
+}
+
+async fn wait_for_tool_approval(
+    approval_manager: &ToolApprovalManager,
+    call_id: &str,
+    rx: tokio::sync::oneshot::Receiver<ToolApprovalResult>,
+    approval_token: nomi_protocol::ToolApprovalToken,
+    timeout: Duration,
+) -> Result<ToolApprovalResult, ApprovalWaitError> {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(ApprovalWaitError::Disconnected),
+        Err(_) => {
+            approval_manager.drop_pending_if(call_id, approval_token);
+            Err(ApprovalWaitError::TimedOut)
+        }
+    }
 }
 
 /// If `call` is a Skill tool call that returned successfully, parse and merge
@@ -967,6 +1201,80 @@ fn group_batches(batchable: &[bool]) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(run: impl FnOnce()) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || LogWriter(Arc::clone(&writer_output)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+
+        let bytes = output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        String::from_utf8(bytes).expect("test tracing output is UTF-8")
+    }
+
+    #[test]
+    fn dropped_tool_future_logs_one_cancelled_completion() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let logs = capture_logs(|| {
+            let mut future = Box::pin(async {
+                let mut execution_log = ToolExecutionLog::start("Glob", "call_cancelled");
+                execution_log.enter("tool");
+                std::future::pending::<()>().await;
+            });
+            let waker = futures::task::noop_waker();
+            let mut context = Context::from_waker(&waker);
+            assert_eq!(future.as_mut().poll(&mut context), Poll::Pending);
+            drop(future);
+        });
+
+        assert_eq!(logs.matches("tool execution started").count(), 1, "{logs}");
+        assert_eq!(logs.matches("tool execution completed").count(), 1, "{logs}");
+        assert!(logs.contains("call_cancelled"), "{logs}");
+        assert!(logs.contains("aborted_or_cancelled"), "{logs}");
+        assert!(logs.contains("stage=\"tool\""), "{logs}");
+    }
+
+    #[test]
+    fn explicitly_finished_tool_log_is_not_duplicated_on_drop() {
+        let logs = capture_logs(|| {
+            let mut execution_log = ToolExecutionLog::start("Glob", "call_success");
+            execution_log.enter("finalize");
+            execution_log.finish(true, "success");
+        });
+
+        assert_eq!(logs.matches("tool execution started").count(), 1, "{logs}");
+        assert_eq!(logs.matches("tool execution completed").count(), 1, "{logs}");
+        assert!(logs.contains("call_success"), "{logs}");
+        assert!(logs.contains("outcome=\"success\""), "{logs}");
+        assert!(!logs.contains("aborted_or_cancelled"), "{logs}");
+    }
 
     #[test]
     fn group_batches_groups_consecutive_batchable_and_isolates_rest() {
@@ -1828,6 +2136,188 @@ mod tests {
         fn category(&self) -> nomi_protocol::events::ToolCategory {
             nomi_protocol::events::ToolCategory::Info
         }
+    }
+
+    struct DeadlineTool {
+        name: &'static str,
+        timeout: Duration,
+        delay: Duration,
+        concurrent_safe: bool,
+        dispatches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DeadlineTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "deadline test tool"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
+            self.concurrent_safe
+        }
+
+        fn execution_timeout(&self, _input: &serde_json::Value) -> Duration {
+            self.timeout
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> nomi_types::tool::ToolResult {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            nomi_types::tool::ToolResult::text(self.name)
+        }
+
+        fn category(&self) -> nomi_protocol::events::ToolCategory {
+            nomi_protocol::events::ToolCategory::Info
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_execution_deadline_returns_fail_closed_error_with_original_call_id() {
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DeadlineTool {
+            name: "DeadlineTool",
+            timeout: Duration::from_millis(10),
+            delay: Duration::from_secs(60),
+            concurrent_safe: false,
+            dispatches: dispatches.clone(),
+        }));
+        let call = ContentBlock::ToolUse {
+            id: "deadline-call".into(),
+            name: "DeadlineTool".into(),
+            input: json!({}),
+            extra: None,
+        };
+        let authority = ProviderToolAuthority::from_request_tools(&registry.to_tool_defs());
+
+        let (result, modifier) = execute_single_with_authority(
+            &registry,
+            &call,
+            &authority,
+            "deadline-test",
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+        )
+        .await;
+
+        assert!(modifier.is_none());
+        assert!(matches!(
+            result,
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+                ..
+            } if tool_use_id == "deadline-call"
+                && content.contains("timed out")
+                && content.contains("do not assume")
+        ));
+        assert_eq!(
+            dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the timeout result must not claim that dispatch never started"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_approval_timeout_cancels_without_dispatch_and_halts_following_calls() {
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DeadlineTool {
+            name: "ApprovalExec",
+            timeout: Duration::from_secs(1),
+            delay: Duration::from_millis(1),
+            concurrent_safe: false,
+            dispatches: dispatches.clone(),
+        }));
+        registry.register(Box::new(DeadlineTool {
+            name: "NeverAfterApprovalError",
+            timeout: Duration::from_secs(1),
+            delay: Duration::from_millis(1),
+            concurrent_safe: false,
+            dispatches: dispatches.clone(),
+        }));
+        let calls = vec![
+            ContentBlock::ToolUse {
+                id: "approval-timeout".into(),
+                name: "ApprovalExec".into(),
+                input: json!({}),
+                extra: None,
+            },
+            ContentBlock::ToolUse {
+                id: "after-timeout".into(),
+                name: "NeverAfterApprovalError".into(),
+                input: json!({}),
+                extra: None,
+            },
+        ];
+        let authority = ProviderToolAuthority::from_request_tools(&registry.to_tool_defs());
+        let approval_manager = Arc::new(ToolApprovalManager::new());
+        let emitter = Arc::new(CapturingEmitter::default());
+        let writer: Arc<dyn ProtocolEmitter> = emitter.clone();
+
+        let outcome = execute_tool_calls_with_approval_timeout(
+            &registry,
+            &calls,
+            &authority,
+            &approval_manager,
+            &writer,
+            "approval-timeout-message",
+            false,
+            &[],
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+            Duration::from_millis(10),
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(1), outcome)
+            .await
+            .expect("approval timeout task should finish")
+            .unwrap();
+
+        assert_eq!(outcome.results.len(), 2);
+        assert!(matches!(
+            &outcome.results[0],
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+                ..
+            } if tool_use_id == "approval-timeout"
+                && content.contains("approval timed out")
+                && content.contains("not executed")
+        ));
+        assert!(matches!(
+            &outcome.results[1],
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+                ..
+            } if tool_use_id == "after-timeout"
+                && tool_use_id == "after-timeout"
+                && content.contains("Skipped because a previous tool call")
+        ));
+        assert_eq!(
+            dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "approval timeout and its following skipped call must never dispatch"
+        );
+        assert!(emitter.has_event_for("tool_request", "approval-timeout"));
+        assert!(emitter.has_event_for("tool_cancelled", "approval-timeout"));
+        assert!(emitter.has_event_for("tool_result", "approval-timeout"));
+        assert!(!emitter.has_event_for("tool_running", "approval-timeout"));
+        assert!(emitter.has_event_for("tool_result", "after-timeout"));
     }
 
     #[tokio::test]

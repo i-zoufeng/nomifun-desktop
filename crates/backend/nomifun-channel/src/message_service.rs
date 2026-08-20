@@ -7,7 +7,10 @@ use nomifun_api_types::{
 use nomifun_common::{AgentType, ConversationSource, MessagePosition, MessageType};
 use nomifun_conversation::ConversationService;
 use nomifun_db::IChannelRepository;
-use nomifun_db::models::ChannelSessionRow;
+use nomifun_db::models::{
+    CHANNEL_CHAT_KIND_DIRECT, CHANNEL_CHAT_KIND_GROUP, CHANNEL_OWNER_DOMAIN_CUSTOMER_SERVICE,
+    CHANNEL_USER_AUTHORIZATION_AUTO_GROUP, ChannelSessionRow,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -141,9 +144,14 @@ impl ChannelMessageService {
     }
 
     /// The customer-service agent bound to `channel_plugin_id`, if the seam is
-    /// wired and a binding exists. The message loop uses this to skip the
-    /// conversation-based busy guard (客服域自己管并发).
+    /// wired, the bot belongs to the customer-service domain, and a binding
+    /// exists. A stray binding on a companion bot is ignored. The message loop
+    /// uses this to skip the conversation-based busy guard (客服域自己管并发).
     pub async fn cs_bound_agent(&self, channel_plugin_id: &str) -> Option<String> {
+        let plugin = self.repo.get_plugin(channel_plugin_id).await.ok()??;
+        if plugin.owner_domain != CHANNEL_OWNER_DOMAIN_CUSTOMER_SERVICE {
+            return None;
+        }
         let routing = self.cs_routing.as_ref()?;
         routing.binding_for(channel_plugin_id).await
     }
@@ -159,6 +167,9 @@ impl ChannelMessageService {
         chat_id: &str,
         text: &str,
     ) -> Result<String, String> {
+        if self.cs_bound_agent(channel_plugin_id).await.as_deref() != Some(cs_agent_id) {
+            return Err("customer-service bot binding is unavailable".to_owned());
+        }
         let Some(routing) = self.cs_routing.as_ref() else {
             return Err("customer-service routing not configured".to_owned());
         };
@@ -346,27 +357,68 @@ impl ChannelMessageService {
         // routed in the message loop BEFORE this method — its turns must never
         // create or touch a Conversation. If a caller still lands here with a
         // bound bot, refuse instead of leaking a conversation.
-        if let Some(channel_plugin_id) = session.channel_plugin_id.as_deref()
-            && self.cs_bound_agent(channel_plugin_id).await.is_some()
+        if let Some(channel_plugin_id) = session.channel_plugin_id.as_deref() {
+            let plugin = self
+                .repo
+                .get_plugin(channel_plugin_id)
+                .await?
+                .ok_or_else(|| ChannelError::PluginNotFound(channel_plugin_id.to_owned()))?;
+            if plugin.owner_domain == CHANNEL_OWNER_DOMAIN_CUSTOMER_SERVICE {
+                return Err(ChannelError::MessageSendFailed(
+                    "customer-service bot must not enter the conversation path".into(),
+                ));
+            }
+        }
+
+        // Admission normally rejects ambiguous provider events before a
+        // session can dispatch. Keep the same fail-closed boundary here for
+        // stale queue rows and internal callers that bypass admission: an
+        // unknown scope must never be treated as direct or gain a fallback
+        // dedicated conversation. Plugin identity is validated first above so
+        // every scoped session also fails closed when its bot row is missing.
+        if session.chat_kind != CHANNEL_CHAT_KIND_DIRECT
+            && session.chat_kind != CHANNEL_CHAT_KIND_GROUP
         {
-            return Err(ChannelError::MessageSendFailed(
-                "customer-service bound bot must not enter the conversation path".into(),
+            return Err(ChannelError::UserNotAuthorized(
+                "channel chat kind is unknown; dispatch refused".into(),
             ));
         }
 
-        // Resolve the target conversation. A nomi channel turn bound to a
-        // companion is routed into that companion's ONE persistent session, so
-        // the desktop bubble, the chat tab, and every IM chat share a single
-        // transcript (no more separate per-chat channel conversation
-        // leaking into the homepage work list). Non-companion / ACP / unbound
-        // channels keep a dedicated per-session conversation.
-        let agent_type = parse_agent_type(&session.agent_type);
+        // Resolve the target conversation. A DIRECT turn bound to a companion
+        // uses that companion's one private persistent session. Every GROUP turn
+        // is forced into a dedicated channel conversation so group members can
+        // never read or pollute the owner's private transcript. Non-companion and
+        // unbound channels are dedicated as before.
+        //
+        // The old "open-group guests may only use the restricted Nomi agent"
+        // check lived here. It is gone because `parse_agent_type` above now
+        // enforces something strictly stronger: a session naming any engine
+        // other than nomi is rejected for EVERY caller, guest or owner. Keeping
+        // the guest-only form would have asserted a condition that can no longer
+        // be true.
+        let agent_type = parse_agent_type(&session.agent_type)?;
+        let is_direct = session.chat_kind == CHANNEL_CHAT_KIND_DIRECT;
+        let is_group = session.chat_kind == CHANNEL_CHAT_KIND_GROUP;
+        let auto_group_guest = if is_group {
+            let user = self
+                .repo
+                .get_user(&session.channel_user_id)
+                .await?
+                .ok_or_else(|| ChannelError::UserNotFound(session.channel_user_id.clone()))?;
+            user.authorization_kind == CHANNEL_USER_AUTHORIZATION_AUTO_GROUP
+        } else {
+            false
+        };
         let companion_id = if agent_type == AgentType::Nomi {
             self.resolve_session_companion(session, platform).await
         } else {
             None
         };
-        let conversation_id = if let Some(cid) = companion_id.as_deref() {
+        let uses_shared_companion_session = is_direct && companion_id.is_some();
+        let conversation_id = if uses_shared_companion_session {
+            let cid = companion_id
+                .as_deref()
+                .expect("shared companion session requires a companion id");
             match self.channel_agent_profile.as_ref() {
                 Some(profile) => match profile.ensure_companion_session(cid).await {
                     Some(id) => id,
@@ -386,9 +438,15 @@ impl ChannelMessageService {
                 }
             }
         } else {
-            match &session.conversation_id {
-                Some(cid) => cid.clone(),
-                None => self.create_conversation_for_session(session, platform).await?,
+            match self
+                .reusable_session_conversation(session, auto_group_guest)
+                .await?
+            {
+                Some(cid) => cid,
+                None => {
+                    self.create_conversation_for_session(session, platform, auto_group_guest)
+                        .await?
+                }
             }
         };
 
@@ -398,7 +456,7 @@ impl ChannelMessageService {
         // is what lets the floating window render it as a remote IM turn.
         // Dedicated per-chat channel conversations keep their extra-derived marker
         // (marker None → send_message falls back to extra).
-        let channel_platform = companion_id.as_ref().map(|_| platform.to_string());
+        let channel_platform = uses_shared_companion_session.then(|| platform.to_string());
         self.dispatch_to_conversation(
             &session.channel_session_id,
             conversation_id,
@@ -498,6 +556,62 @@ impl ChannelMessageService {
         })
     }
 
+    /// A group session may only reuse a conversation created for that exact
+    /// group chat and authorization tier. This is a defensive backstop for
+    /// legacy/stale bindings: a row that still points at the companion owner's
+    /// private conversation, or an unrestricted conversation attached to an
+    /// `auto_group` identity, is never dispatched into.
+    async fn reusable_session_conversation(
+        &self,
+        session: &ChannelSessionRow,
+        auto_group_guest: bool,
+    ) -> Result<Option<String>, ChannelError> {
+        let Some(conversation_id) = session.conversation_id.as_deref() else {
+            return Ok(None);
+        };
+        if session.chat_kind == CHANNEL_CHAT_KIND_DIRECT {
+            return Ok(Some(conversation_id.to_owned()));
+        }
+        if session.chat_kind != CHANNEL_CHAT_KIND_GROUP {
+            warn!(
+                channel_session_id = %session.channel_session_id,
+                conversation_id,
+                "discarding conversation binding for unknown chat kind"
+            );
+            return Ok(None);
+        }
+
+        let conversation = match self
+            .conversation_svc
+            .get(&self.owner_user_id, conversation_id)
+            .await
+        {
+            Ok(conversation) => conversation,
+            Err(nomifun_common::AppError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(ChannelError::MessageSendFailed(error.to_string())),
+        };
+        let belongs_to_group = session.chat_id.is_some()
+            && conversation.channel_chat_id.as_deref() == session.chat_id.as_deref();
+        let is_group_guest = conversation
+            .extra
+            .get("channel_group_guest")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !belongs_to_group || is_group_guest != auto_group_guest {
+            warn!(
+                channel_session_id = %session.channel_session_id,
+                conversation_id,
+                belongs_to_group,
+                expected_group_guest = auto_group_guest,
+                actual_group_guest = is_group_guest,
+                "discarding unsafe or stale group conversation binding"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(conversation_id.to_owned()))
+    }
+
     /// Creates a new conversation for a channel session.
     ///
     /// Sets `source` to the appropriate platform and `channel_chat_id`
@@ -506,9 +620,10 @@ impl ChannelMessageService {
         &self,
         session: &ChannelSessionRow,
         platform: PluginType,
+        auto_group_guest: bool,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);
-        let agent_type = parse_agent_type(&session.agent_type);
+        let agent_type = parse_agent_type(&session.agent_type)?;
 
         let agent_config = self.settings.get_agent_config(platform).await?;
         let model_config = self.settings.get_model_config(platform).await?;
@@ -544,6 +659,9 @@ impl ChannelMessageService {
         }
 
         let mut extra = Self::build_channel_extra(agent_config.backend.as_deref());
+        if auto_group_guest {
+            extra["channel_group_guest"] = serde_json::Value::Bool(true);
+        }
         apply_channel_agent_context(&mut extra, agent_type, platform, channel_companion_id.as_deref());
         let name = channel_conversation_name(
             platform,
@@ -581,11 +699,16 @@ impl ChannelMessageService {
             extra,
         };
 
-        let creation_key = channel_creation_key(
-            &self.owner_user_id,
-            session,
-            "dedicated",
-        );
+        let creation_scope = if session.chat_kind == CHANNEL_CHAT_KIND_GROUP {
+            if auto_group_guest {
+                "dedicated-group-guest"
+            } else {
+                "dedicated-group-approved"
+            }
+        } else {
+            "dedicated"
+        };
+        let creation_key = channel_creation_key(&self.owner_user_id, session, creation_scope);
         let response = self
             .conversation_svc
             .create_idempotent(&self.owner_user_id, req, &creation_key)
@@ -711,60 +834,9 @@ impl ChannelMessageService {
                     status: format!("{:?}", data.status),
                 })
             }
-            AgentStreamEvent::AcpToolCall(data) => {
-                if data.update.status
-                    != Some(nomifun_ai_agent::protocol::events::AcpToolCallStatus::Completed)
-                {
-                    return None;
-                }
-                let artifacts = data
-                    .update
-                    .content
-                    .as_ref()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| match item {
-                        nomifun_ai_agent::protocol::events::AcpToolCallContentItem::Artifact {
-                            artifact,
-                            ..
-                        } => Some(artifact.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                (!artifacts.is_empty()).then_some(StreamAction::ArtifactsProduced(artifacts))
-            }
             // Blocking decisions: forward as a numbered text choice. A decision
             // with no options is unanswerable, so it is dropped (None).
-            AgentStreamEvent::AcpPermission(data) => match data {
-                nomifun_ai_agent::protocol::events::AcpPermissionEventData::Request(req) => {
-                    let options: Vec<crate::types::DecisionOption> = req
-                        .options
-                        .iter()
-                        .map(|o| crate::types::DecisionOption {
-                            option_id: o.option_id.clone(),
-                            label: o.name.clone(),
-                        })
-                        .collect();
-                    if options.is_empty() {
-                        return None;
-                    }
-                    Some(StreamAction::Decision {
-                        call_id: req.tool_call.tool_call_id.clone(),
-                        prompt: req
-                            .tool_call
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| "请选择".to_owned()),
-                        options,
-                    })
-                }
-                nomifun_ai_agent::protocol::events::AcpPermissionEventData::Confirmation(conf) => {
-                    confirmation_to_decision(conf)
-                }
-            },
-            AgentStreamEvent::Permission(value) => serde_json::from_value::<nomifun_common::Confirmation>(value.clone())
-                .ok()
-                .and_then(|conf| confirmation_to_decision(&conf)),
+            AgentStreamEvent::Permission(data) => confirmation_to_decision(data.confirmation()),
             // Events that don't produce user-facing messages
             AgentStreamEvent::Start(_)
             | AgentStreamEvent::Tips(_)
@@ -774,11 +846,6 @@ impl ChannelMessageService {
             | AgentStreamEvent::AvailableCommands(_)
             | AgentStreamEvent::SkillSuggest(_)
             | AgentStreamEvent::CronTrigger(_)
-            | AgentStreamEvent::AcpModelInfo(_)
-            | AgentStreamEvent::AcpModeInfo(_)
-            | AgentStreamEvent::AcpConfigOption(_)
-            | AgentStreamEvent::AcpSessionInfo(_)
-            | AgentStreamEvent::AcpContextUsage(_)
             | AgentStreamEvent::TurnCompleted(_)
             | AgentStreamEvent::System(_)
             | AgentStreamEvent::RequestTrace(_)
@@ -1109,20 +1176,18 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
     }
 }
 
-/// Parses an agent_type string to an AgentType enum.
+/// Parses an `agent_type` string from a persisted channel session.
 ///
-/// Falls back to `AgentType::Acp` for unknown values.
-fn parse_agent_type(s: &str) -> AgentType {
+/// Rejects anything that is not a live engine. This column is free-form TEXT,
+/// so a session bound to a retired engine is still readable — coercing it to a
+/// surviving engine would resurrect it with the wrong runtime and the wrong
+/// `extra` shape, failing much later and far from the cause.
+fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
     match s {
-        "acp" => AgentType::Acp,
-        "openclaw-gateway" => AgentType::OpenclawGateway,
-        "nanobot" => AgentType::Nanobot,
-        "remote" => AgentType::Remote,
-        "nomi" => AgentType::Nomi,
-        _ => {
-            warn!(agent_type = %s, "unknown agent type, defaulting to Acp");
-            AgentType::Acp
-        }
+        "nomi" => Ok(AgentType::Nomi),
+        _ => Err(ChannelError::InvalidConfig(format!(
+            "channel session names agent type '{s}', which no longer exists in this build"
+        ))),
     }
 }
 
@@ -1167,11 +1232,10 @@ fn channel_conversation_name(
 mod tests {
     use super::*;
     use nomifun_ai_agent::protocol::events::{
-        AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
-        AcpToolCallUpdateData, ErrorEventData, FinishEventData, StartEventData, TextEventData,
-        ThinkingEventData, ToolCallEventData, ToolCallStatus,
+        ErrorEventData, FinishEventData, StartEventData, TextEventData, ThinkingEventData,
+        ToolCallEventData, ToolCallStatus,
     };
-    use nomifun_common::{PersistedArtifactId, ProviderWithModel};
+    use nomifun_common::PersistedArtifactId;
 
     // ── extract_last_user_text ────────────────────────────────────────
 
@@ -1321,13 +1385,15 @@ mod tests {
     }
 
     #[test]
-    fn channel_context_acp_preserves_backend_without_nomi_context() {
+    fn channel_context_preserves_declared_backend_alongside_nomi_context() {
+        // `extra.backend` is a free-form label a channel session may carry (an
+        // IM plugin's own naming). It is NOT the engine discriminant, so adding
+        // the nomi companion context must leave it untouched.
         let mut extra = ChannelMessageService::build_channel_extra(Some("claude"));
-        apply_channel_agent_context(&mut extra, AgentType::Acp, PluginType::Lark, Some("companion_1"));
-        assert!(extra.get("companion_session").is_none());
-        assert!(extra.get("channel_platform").is_none());
-        assert!(extra.get("companion_id").is_none());
+        apply_channel_agent_context(&mut extra, AgentType::Nomi, PluginType::Lark, Some("companion_1"));
         assert_eq!(extra["backend"], serde_json::json!("claude"));
+        assert_eq!(extra["companion_session"], serde_json::json!(true));
+        assert_eq!(extra["companion_id"], serde_json::json!("companion_1"));
     }
 
     #[test]
@@ -1355,17 +1421,21 @@ mod tests {
 
     #[test]
     fn parse_known_agent_types() {
-        assert_eq!(parse_agent_type("acp"), AgentType::Acp);
-        assert_eq!(parse_agent_type("openclaw-gateway"), AgentType::OpenclawGateway);
-        assert_eq!(parse_agent_type("nanobot"), AgentType::Nanobot);
-        assert_eq!(parse_agent_type("remote"), AgentType::Remote);
-        assert_eq!(parse_agent_type("nomi"), AgentType::Nomi);
+        assert_eq!(parse_agent_type("nomi").unwrap(), AgentType::Nomi);
     }
 
     #[test]
-    fn parse_unknown_agent_type_defaults_to_acp() {
-        assert_eq!(parse_agent_type("unknown"), AgentType::Acp);
-        assert_eq!(parse_agent_type(""), AgentType::Acp);
+    fn parse_unknown_agent_type_is_rejected() {
+        // Retired engine names must REJECT, not coerce. `channel_sessions
+        // .agent_type` is free-form TEXT, so a row written by an older build can
+        // still name a deleted engine; silently reading it as nomi would start a
+        // session with the wrong runtime and an incompatible `extra` shape,
+        // failing much later and far from the cause.
+        assert!(parse_agent_type("acp").is_err());
+        assert!(parse_agent_type("unknown").is_err());
+        assert!(parse_agent_type("nanobot").is_err());
+        assert!(parse_agent_type("openclaw-gateway").is_err());
+        assert!(parse_agent_type("").is_err());
     }
 
     // ── process_stream_event ───────────────────────────────────────────
@@ -1532,77 +1602,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_acp_tool_call_preserves_verified_artifact_receipts() {
-        let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: PersistedArtifactId::new().into_string(),
-            kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
-            mime_type: "image/png".into(),
-            path: "/workspace/nomifun-artifacts/artifact-acp-1.png".into(),
-            relative_path: "nomifun-artifacts/artifact-acp-1.png".into(),
-            size_bytes: 10,
-            sha256: "abc".into(),
-        };
-        let event = AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "sess-1".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "tool-1".into(),
-                status: Some(AcpToolCallStatus::Completed),
-                title: None,
-                kind: None,
-                raw_input: None,
-                raw_output: None,
-                content: Some(vec![AcpToolCallContentItem::Artifact {
-                    artifact: artifact.clone(),
-                    source_uri: None,
-                }]),
-                locations: None,
-            },
-            meta: None,
-        });
-
-        match ChannelMessageService::process_stream_event(&event) {
-            Some(StreamAction::ArtifactsProduced(artifacts)) => {
-                assert_eq!(artifacts, vec![artifact]);
-            }
-            other => panic!("expected ACP ArtifactsProduced, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn failed_acp_tool_call_never_uploads_artifact_receipts() {
-        let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: PersistedArtifactId::new().into_string(),
-            kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
-            mime_type: "image/png".into(),
-            path: "/workspace/nomifun-artifacts/artifact-acp-failed.png".into(),
-            relative_path: "nomifun-artifacts/artifact-acp-failed.png".into(),
-            size_bytes: 10,
-            sha256: "abc".into(),
-        };
-        let event = AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
-            session_id: "sess-1".into(),
-            update: AcpToolCallUpdateData {
-                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
-                tool_call_id: "tool-1".into(),
-                status: Some(AcpToolCallStatus::Failed),
-                title: None,
-                kind: None,
-                raw_input: None,
-                raw_output: None,
-                content: Some(vec![AcpToolCallContentItem::Artifact {
-                    artifact,
-                    source_uri: None,
-                }]),
-                locations: None,
-            },
-            meta: None,
-        });
-
-        assert!(ChannelMessageService::process_stream_event(&event).is_none());
-    }
-
-    #[test]
     fn running_tool_call_still_produces_tool_call_status() {
         let event = AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "c1".into(),
@@ -1729,67 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_permission_request_produces_decision() {
-        use nomifun_ai_agent::protocol::events::{
-            AcpPermissionEventData, AcpPermissionOptionData, AcpPermissionOptionKind, AcpPermissionRequestData,
-            AcpPermissionToolCall,
-        };
-
-        let event = AgentStreamEvent::AcpPermission(AcpPermissionEventData::Request(AcpPermissionRequestData {
-            session_id: "s1".into(),
-            tool_call: AcpPermissionToolCall {
-                tool_call_id: "call-7".into(),
-                status: None,
-                title: Some("Run rm -rf?".into()),
-                kind: None,
-                raw_input: None,
-                raw_output: None,
-                content: None,
-                locations: None,
-                meta: None,
-            },
-            options: vec![
-                AcpPermissionOptionData {
-                    option_id: "allow".into(),
-                    name: "Allow once".into(),
-                    kind: AcpPermissionOptionKind::AllowOnce,
-                    meta: None,
-                },
-                AcpPermissionOptionData {
-                    option_id: "reject".into(),
-                    name: "Reject".into(),
-                    kind: AcpPermissionOptionKind::RejectOnce,
-                    meta: None,
-                },
-            ],
-            meta: None,
-        }));
-
-        match ChannelMessageService::process_stream_event(&event) {
-            Some(StreamAction::Decision { call_id, prompt, options }) => {
-                assert_eq!(call_id, "call-7");
-                assert_eq!(prompt, "Run rm -rf?");
-                assert_eq!(
-                    options,
-                    vec![
-                        crate::types::DecisionOption {
-                            option_id: "allow".into(),
-                            label: "Allow once".into()
-                        },
-                        crate::types::DecisionOption {
-                            option_id: "reject".into(),
-                            label: "Reject".into()
-                        },
-                    ]
-                );
-            }
-            other => panic!("expected Decision, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn permission_value_confirmation_produces_decision() {
-        // Legacy untyped Permission carrying a serialized `Confirmation`.
+    fn permission_confirmation_produces_decision() {
         let value = serde_json::json!({
             "id": "conf-1",
             "call_id": "call-9",
@@ -1802,7 +1741,8 @@ mod tests {
                 { "label": "No", "value": "no" },
             ],
         });
-        let event = AgentStreamEvent::Permission(value);
+        let conf: nomifun_common::Confirmation = serde_json::from_value(value).unwrap();
+        let event = AgentStreamEvent::Permission(conf.into());
 
         match ChannelMessageService::process_stream_event(&event) {
             Some(StreamAction::Decision { call_id, prompt, options }) => {
@@ -1835,7 +1775,8 @@ mod tests {
             "description": "",
             "options": [],
         });
-        let event = AgentStreamEvent::Permission(value);
+        let conf: nomifun_common::Confirmation = serde_json::from_value(value).unwrap();
+        let event = AgentStreamEvent::Permission(conf.into());
         assert!(
             ChannelMessageService::process_stream_event(&event).is_none(),
             "an unanswerable decision (no options) must not surface"
@@ -1914,52 +1855,6 @@ mod tests {
         let extra = ChannelMessageService::build_channel_extra(Some("claude"));
         assert_eq!(extra["session_mode"], "yolo");
         assert_eq!(extra["backend"], "claude");
-    }
-
-    // ── model placement by agent_type (regression: non-nomi must not
-    //    use top-level model) ──────────────────────────────────────────
-
-    #[test]
-    fn acp_model_goes_into_extra_not_top_level() {
-        let agent_type = AgentType::Acp;
-        let model = ProviderWithModel {
-            provider_id: "prov1".into(),
-            model: "claude-sonnet".into(),
-            use_model: Some("global.anthropic.claude-sonnet-4-6".into()),
-        };
-        let mut extra = ChannelMessageService::build_channel_extra(Some("codex"));
-
-        let top_level_model = if agent_type == AgentType::Nomi {
-            Some(model.clone())
-        } else {
-            extra["model"] = serde_json::to_value(&model).unwrap();
-            None
-        };
-
-        assert!(top_level_model.is_none(), "acp must not have top-level model");
-        assert_eq!(extra["model"]["provider_id"], "prov1");
-        assert_eq!(extra["model"]["use_model"], "global.anthropic.claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn nomi_model_stays_at_top_level() {
-        let agent_type = AgentType::Nomi;
-        let model = ProviderWithModel {
-            provider_id: "prov2".into(),
-            model: "gpt-4o".into(),
-            use_model: None,
-        };
-        let mut extra = ChannelMessageService::build_channel_extra(None);
-
-        let top_level_model = if agent_type == AgentType::Nomi {
-            Some(model.clone())
-        } else {
-            extra["model"] = serde_json::to_value(&model).unwrap();
-            None
-        };
-
-        assert!(top_level_model.is_some(), "nomi must use top-level model");
-        assert!(extra.get("model").is_none() || extra["model"].is_null());
     }
 
     // ── channel_conversation_name ─────────────────────────────────────

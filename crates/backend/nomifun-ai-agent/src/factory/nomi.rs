@@ -19,11 +19,13 @@ use tracing::{debug, info, warn};
 use crate::runtime_handle::AgentRuntimeHandle;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
-use crate::factory::platform_table;
+use crate::image_generation::{
+    CatalogImageGenerationToolDiscovery, ImageGenerationToolDiscovery, image_generation_prompt,
+};
 use crate::manager::nomi::{
     NomiAgentManager, NomiHostWiring, NomiSummonWiring, sanitize_session_messages,
 };
-use crate::types::{AgentRuntimeBuildOptions, NomiCompatOverrides, NomiResolvedConfig};
+use crate::types::{AgentRuntimeBuildOptions, NomiResolvedConfig};
 
 /// Apply the complete ceiling for an authenticated principal that does not own
 /// this installation.  This is model-only execution: no OS tools, configured
@@ -49,6 +51,17 @@ fn apply_model_only_ceiling(overrides: &mut NomiBuildExtra) {
     overrides.delegation_policy = DelegationPolicy::Disabled;
     // Summon loads local companion memories/skills — installation-owner only.
     overrides.summon = None;
+}
+
+/// Effective host authority for a Nomi runtime. Channel conversations are
+/// physically owned by the installation owner, so the principal alone is not
+/// enough: an automatically admitted group member must lower that authority at
+/// the same single ceiling used for secondary users.
+fn has_effective_host_authority(
+    authority: ExecutionAuthority,
+    channel_group_guest: bool,
+) -> bool {
+    authority.controls_host() && !channel_group_guest
 }
 
 fn retarget_resumed_session(session: &mut Session, provider: &str, model: &str) -> bool {
@@ -111,7 +124,8 @@ pub(super) async fn build(
     // The first-class conversation field is authoritative. Never let an
     // open-ended extra payload override execution policy.
     overrides.delegation_policy = options.delegation_policy;
-    let is_instance_owner = authority.controls_host();
+    let is_instance_owner =
+        has_effective_host_authority(authority, overrides.channel_group_guest);
 
     // Gateway entitlement is derived from the immutable principal, never from
     // persisted/open JSON. Process-owned config is injected only after the
@@ -119,7 +133,7 @@ pub(super) async fn build(
     overrides.gateway_mcp_config = None;
 
     // A non-owner runtime is deliberately model-only.  Hiding a few tools is
-    // insufficient because every native shell/ACP process shares the backend's
+    // insufficient because every native shell process shares the backend's
     // OS uid; the single ceiling below is the enforceable boundary.
     if !is_instance_owner {
         apply_model_only_ceiling(&mut overrides);
@@ -261,6 +275,39 @@ pub(super) async fn build(
     }
     let has_platform_gateway = overrides.gateway_mcp_config.is_some();
 
+    // Build a retained local discovery authority from the authoritative
+    // catalog. The manager reruns this resolver before every admitted turn (no
+    // health probe / generation request), so provider, model, connection,
+    // credential, task-tag and default changes do not require runtime teardown.
+    // An incomplete candidate never leaks an unusable provider schema, and
+    // restricted principals retain their model-only ceiling.
+    let image_generation_discovery: Option<Arc<dyn ImageGenerationToolDiscovery>> =
+        if platform_gateway_entitled {
+            deps.model_invoke_service.as_ref().map(|invoke| {
+                Arc::new(CatalogImageGenerationToolDiscovery::new(
+                    deps.client_prefs.clone(),
+                    invoke.clone(),
+                )) as Arc<dyn ImageGenerationToolDiscovery>
+            })
+        } else {
+            None
+        };
+    let (image_generation_tool, image_generation_discovery_failed) =
+        match image_generation_discovery.as_ref() {
+            Some(discovery) => match discovery.discover_tool().await {
+                Ok(tool) => (tool, false),
+                Err(error) => {
+                    warn!(
+                        conversation_id = %ctx.conversation_id,
+                        error = %error,
+                        "image_gen: catalog discovery failed closed"
+                    );
+                    (None, true)
+                }
+            },
+            None => (None, false),
+        };
+
     let (mut extra_mcp_servers, loopback_capability_leases) =
         resolve_mcp_servers(&overrides, &ctx.conversation_id);
     if is_instance_owner && let Some(repo) = deps.mcp_server_repo.as_ref() {
@@ -312,14 +359,25 @@ pub(super) async fn build(
         knowledge_write_policy.mode,
         nomifun_knowledge::WriteMode::Disabled
     );
+    // Prompt capability must be derived from the same effective surface that
+    // can register the native tools. Restricted workers retain a persistent
+    // allowlist, so advertising search/read when either name is absent creates
+    // a deterministic provider-authority violation later in the turn.
+    let knowledge_search_enabled = should_expose_knowledge_search(
+        is_instance_owner,
+        deps.knowledge_retrieval.is_some(),
+        !overrides.knowledge_mounts.is_empty(),
+        &overrides.allowed_tools,
+    );
 
     // Knowledge bases: append the mounted-bases section (per-base TOC +
     // write-back contract) to the system prompt, so nomi-engine sessions
     // (companion companion threads included) see the same knowledge context the
-    // ACP path gets via its preset_context.
+    // engine assembles into its session context.
     overrides.system_prompt = append_knowledge_context(
         overrides.system_prompt.take(),
         &overrides,
+        knowledge_search_enabled,
         knowledge_write_enabled,
     );
 
@@ -337,23 +395,37 @@ pub(super) async fn build(
         overrides.delegation_policy,
     );
 
-    // Every native Nomi session — regular desktop chat, companion, IM
-    // Channel Agent — must think AND reply in the
-    // app's UI language, not a hardcoded one. The persona prompt no longer forces
-    // a language, so it is decided HERE from the live system setting and appended
-    // LAST (so it wins over the English base prompt / any earlier persisted
-    // language line, and the first turn follows the system language). Read live
-    // per build → switching the language takes effect on the next new session.
-    // External ACP/openclaw agents own their own prompts (built elsewhere) and
-    // are intentionally unaffected.
-    {
-        let lang = read_app_language(deps.settings_repo.as_ref()).await;
-        let directive = output_language_directive(&lang);
-        overrides.system_prompt = Some(match overrides.system_prompt.take() {
-            Some(existing) => format!("{existing}\n\n{directive}"),
-            None => directive.to_owned(),
-        });
-    }
+    let app_language = read_app_language(deps.settings_repo.as_ref()).await;
+
+    // The prompt is policy, not capability authority: registration below is
+    // still conditional on a ready catalog snapshot. It tells weaker chat
+    // models that ordinary image requests have exactly one native route and
+    // that Browser/Computer/shell/third-party sites are reserved for an
+    // explicit user request. The manager additionally enforces that route at
+    // the advertised-tool and artifact-receipt boundaries.
+    let image_policy = if platform_gateway_entitled {
+        image_generation_prompt(None)
+    } else {
+        "This restricted Agent session is not entitled to native image generation. Do not use Browser, web search, or a third-party generator as a substitute, and do not claim that an image was generated. Tell the user to retry in a full local session or ask the session owner to enable the native capability.".to_owned()
+    };
+    overrides.system_prompt = Some(match overrides.system_prompt.take() {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{existing}\n\n{image_policy}")
+        }
+        _ => image_policy,
+    });
+
+    // Every native Nomi session — regular desktop chat, companion, and IM
+    // Channel Agent — follows the language of the owner's current request.
+    // This is appended last so an English base prompt, memories, retrieved
+    // context, or tool output cannot pin the conversation to their language.
+    // The decision is made again for every request instead of being frozen to
+    // the app UI locale for the lifetime of a session.
+    let directive = output_language_directive();
+    overrides.system_prompt = Some(match overrides.system_prompt.take() {
+        Some(existing) => format!("{existing}\n\n{directive}"),
+        None => directive.to_owned(),
+    });
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -390,10 +462,8 @@ pub(super) async fn build(
         .unwrap_or(&model_selection.model)
         .to_owned();
 
-    let fields = super::provider_config::resolve_provider_fields_with_fallback(
-        &deps.provider_repo,
-        &deps.provider_model_repo,
-        &deps.encryption_key,
+    let fields = super::provider_config::resolve_provider_fields(
+        deps.model_invoke.as_ref(),
         provider_id,
         &model_id,
     )
@@ -695,7 +765,7 @@ pub(super) async fn build(
         None
     };
 
-    let knowledge_prelude: Option<String> = if overrides.knowledge_mounts.is_empty() {
+    let knowledge_prelude: Option<String> = if !knowledge_search_enabled {
         None
     } else {
         let names: Vec<&str> = overrides
@@ -757,6 +827,11 @@ pub(super) async fn build(
         browser_lane_binding,
         ssh_backend: ssh_session.as_ref().map(|s| Arc::clone(&s.backend)),
         ssh_lease: ssh_session.map(|s| s.lease),
+        image_generation_tool,
+        image_generation_discovery,
+        image_generation_entitled: platform_gateway_entitled,
+        image_generation_discovery_failed,
+        image_generation_response_in_chinese: app_language == "zh-CN",
     };
     let agent = NomiAgentManager::new_with_host_wiring(
         ctx.conversation_id,
@@ -769,7 +844,9 @@ pub(super) async fn build(
         } else {
             None
         },
-        is_instance_owner.then(|| deps.knowledge_retrieval.clone()).flatten(),
+        knowledge_search_enabled
+            .then(|| deps.knowledge_retrieval.clone())
+            .flatten(),
         knowledge_kb_ids,
         knowledge_prelude,
         knowledge_writeback_sink,
@@ -897,10 +974,10 @@ async fn read_string_pref(deps: &AgentFactoryDeps, key: &str, host_default: &str
 /// `SystemSettingsResponse::default().language` in `nomifun-api-types`.
 const DEFAULT_APP_LANGUAGE: &str = "en-US";
 
-/// Normalize an arbitrary locale tag to the output-language directive's supported
-/// axis. [`output_language_directive`] only distinguishes `zh-CN` from everything
-/// else, so any Chinese locale (`zh`, `zh_CN`, `zh-Hans`, `zh-Hans-CN`, …) folds
-/// to `zh-CN`; any other tag is returned normalized (→ English directive).
+/// Normalize an arbitrary locale tag for deterministic localized native
+/// messages (currently the image-generation acknowledgement). Any Chinese
+/// locale (`zh`, `zh_CN`, `zh-Hans`, `zh-Hans-CN`, …) folds to `zh-CN`; any
+/// other tag is returned normalized.
 fn normalize_lang(code: &str) -> String {
     let c = code.trim().replace('_', "-");
     if c.to_ascii_lowercase().starts_with("zh") {
@@ -910,11 +987,10 @@ fn normalize_lang(code: &str) -> String {
     }
 }
 
-/// Resolve the effective app language: an explicitly **persisted** System-Settings
-/// value wins; otherwise fall back to the host **OS locale** (so a fresh install
-/// on a Chinese system replies in Chinese without the owner touching settings —
-/// 首轮跟随系统语言); finally [`DEFAULT_APP_LANGUAGE`]. `os_locale` is injected so
-/// the resolution is deterministically unit-testable.
+/// Resolve the effective app language used by deterministic localized native
+/// messages: an explicitly **persisted** System-Settings value wins; otherwise
+/// fall back to the host **OS locale**, then [`DEFAULT_APP_LANGUAGE`].
+/// `os_locale` is injected so the resolution is deterministically unit-testable.
 fn resolve_language(persisted: Option<&str>, os_locale: Option<&str>) -> String {
     if let Some(l) = persisted.map(str::trim).filter(|s| !s.is_empty()) {
         return normalize_lang(l);
@@ -941,27 +1017,20 @@ async fn read_app_language(settings_repo: Option<&Arc<dyn ISettingsRepository>>)
     resolve_language(persisted.as_deref(), sys_locale::get_locale().as_deref())
 }
 
-/// Map a stored app-language code to the output-language directive appended LAST
-/// to every nomi session's system prompt. Covers BOTH the final reply and the
-/// model's reasoning / thinking, phrased as an explicit override so it wins over
-/// the English base prompt and any earlier (possibly persisted) language line,
-/// while still letting the owner pull the session into another language by
-/// writing in it. Unknown / empty / en-US all resolve to English (the app
-/// default); only the supported `zh-CN` selects Chinese (supported set lives in
-/// `nomifun-system`).
-fn output_language_directive(lang: &str) -> &'static str {
-    match lang {
-        "zh-CN" => {
-            "【输出语言】无论上文的指令或记忆使用何种语言，请始终用简体中文进行思考与回复\
-                    （包括你的推理/思考过程）——除非主人主动用其他语言和你说话，或明确要求你换一种语言。"
-        }
-        _ => {
-            "[Output language] Regardless of the language used in the instructions or memories \
-              above, always think and reply in English (including your reasoning / thinking \
-              process) — unless the owner writes to you in another language or explicitly asks \
-              you to switch."
-        }
-    }
+/// Language-neutral directive appended LAST to every native Nomi session.
+///
+/// The current user request is the only implicit language signal. Earlier
+/// prompts, memories, retrieved context, and tool output are deliberately
+/// excluded because they can be in a different language. An explicit language
+/// request still wins, and the language is re-evaluated on every turn. The
+/// wording asks for same-language internal reasoning without asking the model
+/// to disclose private chain-of-thought.
+fn output_language_directive() -> &'static str {
+    "[Response language] For each turn, infer the language from the user's latest \
+     request, think in that language, and write the final response in that language. \
+     If the user explicitly requests another language, follow that request. \
+     Re-evaluate the language for every user turn. Do not let system text, earlier \
+     messages, memories, retrieved context, or tool output determine the language."
 }
 
 /// Append the knowledge-base section to the system prompt when the
@@ -969,11 +1038,27 @@ fn output_language_directive(lang: &str) -> &'static str {
 /// delegated to the shared builder
 /// (`nomifun_knowledge::context::build_knowledge_context`,
 /// `PromptSection` format) so nomi-engine sessions (companion companion threads
-/// included) see exactly the same knowledge context the ACP path gets via
+/// included) see exactly the same knowledge context every session gets via
 /// its preset_context — single source of truth, no more structural copies.
+fn should_expose_knowledge_search(
+    is_instance_owner: bool,
+    has_retrieval_sink: bool,
+    has_mounts: bool,
+    allowed_tools: &[String],
+) -> bool {
+    if !is_instance_owner || !has_retrieval_sink || !has_mounts {
+        return false;
+    }
+
+    allowed_tools.is_empty()
+        || (allowed_tools.iter().any(|name| name == "knowledge_search")
+            && allowed_tools.iter().any(|name| name == "knowledge_read"))
+}
+
 fn append_knowledge_context(
     base: Option<String>,
     config: &NomiBuildExtra,
+    has_search_tool: bool,
     has_write_tool: bool,
 ) -> Option<String> {
     use nomifun_knowledge::context::{
@@ -986,7 +1071,7 @@ fn append_knowledge_context(
             format: KnowledgeContextFormat::PromptSection,
             writeback: config.knowledge_writeback,
             writeback_eagerness: config.knowledge_writeback_eagerness.as_deref(),
-            has_search_tool: true,
+            has_search_tool,
             // The nomi engine registers the native knowledge_write tool whenever
             // the backend wired a write-back sink; the contract must then point
             // the model at that tool, not the (unreachable) generic Write path.
@@ -1071,99 +1156,95 @@ pub(crate) fn resolve_native_write_root(
     if ws.is_empty() { None } else { Some(ws.to_owned()) }
 }
 
-/// Map Nomi DB platform name to the nomi provider identifier.
-///
-/// Mirrors the frontend `src/process/agent/nomi/envBuilder.ts` mapping. Pure
-/// table lookup against [`platform_table::PLATFORM_CHAT_RULES`] (default row:
-/// `openai`), except the new-api gateway special case: for the `new-api`
-/// platform the model's per-row `protocol` override (from its
-/// `provider_models` row) takes precedence over the table.
-pub(crate) fn map_nomi_provider(platform: &str, protocol: Option<&str>) -> String {
-    if platform == "new-api" && protocol == Some("anthropic") {
-        return "anthropic".to_owned();
-    }
-
-    platform_table::platform_chat_rule(platform).nomi_provider.to_owned()
-}
-
-/// Resolve base_url and compat overrides for the nomi provider.
-///
-/// `is_full_url` bypasses every platform rule (the configured URL is the
-/// request URL, minus trailing `/`, with an empty `api_path`). Otherwise the
-/// platform's [`platform_table::UrlRule`] decides:
-/// - `GeminiOpenAiCompat`: prepend `/v1beta/openai`, pin `api_path` to
-///   `/chat/completions`
-/// - `ConfiguredChatBase`: keep the configured base (nonstandard version
-///   path), pin `api_path` to `/chat/completions`
-/// - `StripTrailingV1` (default row): strip trailing `/v1` (nomi appends its
-///   own path); OpenAI official (`api.openai.com`, mapped provider `openai`)
-///   additionally sets `max_tokens_field = max_completion_tokens`
-pub(crate) fn resolve_nomi_url_and_compat(
-    platform: &str,
-    raw_base_url: &str,
-    mapped_provider: &str,
-    is_full_url: bool,
-) -> (Option<String>, NomiCompatOverrides) {
-    let mut compat = NomiCompatOverrides::default();
-
-    if is_full_url {
-        let trimmed = raw_base_url.trim_end_matches('/');
-        compat.api_path = Some(String::new());
-        return (Some(trimmed.to_owned()), compat);
-    }
-
-    match platform_table::platform_chat_rule(platform).url_rule {
-        platform_table::UrlRule::GeminiOpenAiCompat => {
-            let trimmed = raw_base_url.trim_end_matches('/');
-            let base = format!("{trimmed}/v1beta/openai");
-            compat.api_path = Some("/chat/completions".to_owned());
-            (Some(base), compat)
-        }
-        platform_table::UrlRule::ConfiguredChatBase => {
-            let base = raw_base_url.trim_end_matches('/').to_owned();
-            compat.api_path = Some("/chat/completions".to_owned());
-            (Some(base).filter(|u| !u.is_empty()), compat)
-        }
-        platform_table::UrlRule::StripTrailingV1 => {
-            let normalized = normalize_nomi_base_url(raw_base_url);
-            let base_url = Some(normalized).filter(|u| !u.is_empty());
-
-            if mapped_provider == "openai" && is_openai_host(raw_base_url) {
-                compat.max_tokens_field = Some("max_completion_tokens".to_owned());
-            }
-
-            (base_url, compat)
-        }
-    }
-}
-
-fn is_openai_host(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower
-        .strip_prefix("https://")
-        .or_else(|| lower.strip_prefix("http://"))
-        .map(|rest| rest == "api.openai.com" || rest.starts_with("api.openai.com/"))
-        .unwrap_or(false)
-}
-
-/// Strip trailing `/v1`, `/v1/`, or lone `/` from a base URL so that
-/// nomi can append its own path suffix (`/v1/messages`, `/v1/chat/completions`).
-fn normalize_nomi_base_url(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
-}
-
 pub(crate) fn resolve_bedrock_config(
     json: Option<&str>,
+    credentials: &serde_json::Value,
 ) -> Option<nomi_config::config::BedrockConfig> {
-    let bc: nomifun_api_types::BedrockConfig = serde_json::from_str(json?).ok()?;
-    Some(nomi_config::config::BedrockConfig {
-        region: Some(bc.region),
-        access_key_id: bc.access_key_id,
-        secret_access_key: bc.secret_access_key,
-        session_token: None,
-        profile: bc.profile,
-    })
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BedrockMetadata {
+        auth_method: nomifun_api_types::BedrockAuthMethod,
+        region: String,
+        profile: Option<String>,
+    }
+
+    let metadata: BedrockMetadata = serde_json::from_str(json?).ok()?;
+    let region = metadata.region.trim();
+    if region.is_empty() {
+        return None;
+    }
+    let credentials = credentials.as_object()?;
+    match metadata.auth_method {
+        nomifun_api_types::BedrockAuthMethod::AccessKey => {
+            if metadata.profile.is_some() {
+                return None;
+            }
+            let access_key_id = credentials
+                .get("access_key_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let secret_access_key = credentials
+                .get("secret_access_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let session_token = match credentials.get("session_token") {
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?
+                        .to_owned(),
+                ),
+                None => None,
+            };
+            if credentials.keys().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "access_key_id" | "secret_access_key" | "session_token"
+                )
+            }) {
+                return None;
+            }
+            Some(nomi_config::config::BedrockConfig {
+                region: Some(region.to_owned()),
+                access_key_id: Some(access_key_id.to_owned()),
+                secret_access_key: Some(secret_access_key.to_owned()),
+                session_token,
+                profile: None,
+            })
+        }
+        nomifun_api_types::BedrockAuthMethod::Profile => {
+            if !credentials.is_empty() {
+                return None;
+            }
+            let profile = metadata
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(nomi_config::config::BedrockConfig {
+                region: Some(region.to_owned()),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                profile: Some(profile.to_owned()),
+            })
+        }
+        nomifun_api_types::BedrockAuthMethod::DefaultChain => {
+            if !credentials.is_empty() || metadata.profile.is_some() {
+                return None;
+            }
+            Some(nomi_config::config::BedrockConfig {
+                region: Some(region.to_owned()),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                profile: None,
+            })
+        }
+    }
 }
 
 async fn load_user_mcp_servers(
@@ -1259,6 +1340,7 @@ fn row_to_mcp_server_config(row: &McpServerRow) -> Result<McpServerConfig, Strin
                 url: None,
                 headers: None,
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
         "http" | "streamable_http" => {
@@ -1284,6 +1366,7 @@ fn row_to_mcp_server_config(row: &McpServerRow) -> Result<McpServerConfig, Strin
                 url: Some(url.to_owned()),
                 headers: Some(headers),
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
         "sse" => {
@@ -1309,6 +1392,7 @@ fn row_to_mcp_server_config(row: &McpServerRow) -> Result<McpServerConfig, Strin
                 url: Some(url.to_owned()),
                 headers: Some(headers),
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
         other => Err(format!("unsupported transport_type: {other}")),
@@ -1331,6 +1415,7 @@ fn session_server_to_mcp_server_config(
                 url: None,
                 headers: None,
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
         SessionMcpTransport::Http { url, headers } => {
@@ -1345,6 +1430,7 @@ fn session_server_to_mcp_server_config(
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
         SessionMcpTransport::Sse { url, headers } => {
@@ -1359,6 +1445,7 @@ fn session_server_to_mcp_server_config(
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
         SessionMcpTransport::StreamableHttp { url, headers } => {
@@ -1373,6 +1460,7 @@ fn session_server_to_mcp_server_config(
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
                 deferred: Some(false),
+                request_timeout_secs: None,
             })
         }
     }
@@ -1458,10 +1546,9 @@ fn resolved_session_mode(overrides: &NomiBuildExtra) -> String {
         .to_owned()
 }
 
-/// Platform Gateway MCP stdio bridge config for the Nomi engine, mirroring the
-/// ACP assembler's `gateway_mcp_server`. Caller conversation + user ids ride
-/// along for self-protection and data scoping; the companion binding (when present)
-/// rides along for attribution.
+/// Platform Gateway MCP stdio bridge config for the Nomi engine. Caller
+/// conversation + user ids ride along for self-protection and data scoping; the
+/// companion binding (when present) rides along for attribution.
 fn gateway_mcp_to_config(
     cfg: &GatewayMcpConfig,
     overrides: &NomiBuildExtra,
@@ -1502,6 +1589,7 @@ fn gateway_mcp_to_config(
         url: None,
         headers: None,
         deferred: Some(true),
+        request_timeout_secs: None,
     };
 
     Some((
@@ -1605,6 +1693,76 @@ mod tests {
     }
 
     #[test]
+    fn owner_backed_group_guest_is_still_model_only() {
+        let authority = ExecutionAuthority::resolve("owner", "owner");
+        assert!(authority.controls_host());
+        assert!(!has_effective_host_authority(authority, true));
+        assert!(has_effective_host_authority(authority, false));
+
+        let mcp_server_id = McpServerId::new();
+        let mut overrides = NomiBuildExtra {
+            channel_group_guest: true,
+            channel_platform: Some("lark".into()),
+            computer_use: Some(true),
+            browser_use: Some(true),
+            gateway_mcp_config: Some(gateway_config(41237, "/usr/bin/nomicore", "owner")),
+            mcp_server_ids: Some(vec![mcp_server_id.clone()]),
+            session_mcp_servers: vec![SessionMcpServer {
+                mcp_server_id,
+                name: "guest-mcp".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command: "server".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                },
+            }],
+            companion: true,
+            companion_id: Some("0190f5fe-7c00-7a00-8abc-012345678967".into()),
+            knowledge_mounts: vec![nomifun_api_types::KnowledgeMountInfo {
+                knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
+                name: "private knowledge".into(),
+                description: "must not remain mounted for a group guest".into(),
+                rel_path: ".nomi/knowledge/private".into(),
+                toc: Vec::new(),
+                summary: None,
+                live_sources: Vec::new(),
+            }],
+            knowledge_writeback: true,
+            knowledge_channel_write_enabled: true,
+            summon: Some(nomifun_api_types::SummonConfig {
+                companion_id: "0190f5fe-7c00-7a00-8abc-012345678969".into(),
+                memory_ids: vec![],
+                skill_exclusions: vec![],
+                summoned_at: 1,
+            }),
+            goal: Some(nomifun_api_types::NomiGoalSpec {
+                objective: "persist autonomous work".into(),
+                max_auto_continuations: None,
+            }),
+            delegation_policy: DelegationPolicy::Automatic,
+            ..Default::default()
+        };
+
+        apply_model_only_ceiling(&mut overrides);
+
+        assert!(overrides.gateway_mcp_config.is_none());
+        assert_eq!(overrides.computer_use, Some(false));
+        assert_eq!(overrides.browser_use, Some(false));
+        assert!(overrides.mcp_server_ids.is_none());
+        assert!(overrides.session_mcp_servers.is_empty());
+        assert!(!overrides.companion && overrides.companion_id.is_none());
+        assert!(overrides.channel_platform.is_none());
+        assert!(overrides.knowledge_mounts.is_empty());
+        assert!(!overrides.knowledge_writeback);
+        assert!(!overrides.knowledge_channel_write_enabled);
+        assert!(overrides.summon.is_none());
+        assert_eq!(overrides.allowed_tools, vec!["update_plan"]);
+        assert_eq!(overrides.max_turns, Some(1));
+        assert!(overrides.goal.is_none());
+        assert_eq!(overrides.delegation_policy, DelegationPolicy::Disabled);
+    }
+
+    #[test]
     fn resumed_session_metadata_tracks_each_provider_switch() {
         let now = chrono::Utc::now();
         let mut session = Session {
@@ -1619,6 +1777,7 @@ mod tests {
             owner_token: None,
             activated_deferred_tools: Vec::new(),
             editable_turn: None,
+            host_context: Default::default(),
         };
 
         assert!(retarget_resumed_session(
@@ -1676,7 +1835,9 @@ mod tests {
             editable_turn: Some(EditableTurnCheckpoint {
                 source_message_id: "message-root".into(),
                 start_len: 2,
+                prior_host_context: Default::default(),
             }),
+            host_context: Default::default(),
         };
 
         let repair = sanitize_resumed_session(&mut session, false);
@@ -1715,11 +1876,10 @@ mod tests {
         assert_eq!(metadata.model, "resolved-fallback-model");
     }
 
-    // ----- output-language directive (thinking + reply follow system language) -----
+    // ----- output-language directive (follow each current user request) -----
 
     /// Minimal mock settings repo for `read_app_language`: yields a fixed result
-    /// (`Err(())` simulates a DB read failure). Mirrors the McpServerRepo mock in
-    /// factory/acp.rs.
+    /// (`Err(())` simulates a DB read failure).
     struct MockSettingsRepo(Result<Option<nomifun_db::models::SystemSettings>, ()>);
 
     #[async_trait::async_trait]
@@ -1763,24 +1923,15 @@ mod tests {
     }
 
     #[test]
-    fn output_language_directive_maps_supported_and_defaults_to_english() {
-        // zh-CN steers BOTH reply and thinking to Simplified Chinese.
-        let zh = output_language_directive("zh-CN");
-        assert!(zh.contains("简体中文"));
-        assert!(zh.contains("思考"), "zh directive must cover the thinking process: {zh}");
-        // en-US, unknown codes, and the empty string all resolve to English.
-        for lang in ["en-US", "fr-FR", "zh-TW", ""] {
-            let d = output_language_directive(lang);
-            assert!(
-                d.contains("in English"),
-                "{lang} should map to English: {d}"
-            );
-            assert!(
-                d.contains("think"),
-                "{lang} directive must cover the thinking process: {d}"
-            );
-            assert!(!d.contains("简体中文"), "{lang} must not select Chinese");
-        }
+    fn output_language_directive_follows_each_current_user_request() {
+        let directive = output_language_directive();
+        assert!(directive.contains("latest"));
+        assert!(directive.contains("think in that language"));
+        assert!(directive.contains("final response"));
+        assert!(directive.contains("Re-evaluate"));
+        assert!(!directive.contains("English"));
+        assert!(!directive.contains("简体中文"));
+        assert!(!directive.contains("app UI language"));
     }
 
     #[test]
@@ -1802,7 +1953,7 @@ mod tests {
         for zh in ["zh", "zh-CN", "zh_CN", "zh-Hans", "zh-Hans-CN", "ZH-cn"] {
             assert_eq!(normalize_lang(zh), "zh-CN", "{zh} must fold to zh-CN");
         }
-        // Non-Chinese tags are returned normalized (→ English directive).
+        // Non-Chinese tags are returned normalized unchanged.
         assert_eq!(normalize_lang("en_US"), "en-US");
         assert_eq!(normalize_lang("fr-FR"), "fr-FR");
     }
@@ -1907,213 +2058,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_nomi_base_url_strips_v1() {
-        assert_eq!(
-            normalize_nomi_base_url("https://api.openai.com/v1"),
-            "https://api.openai.com"
-        );
-        assert_eq!(
-            normalize_nomi_base_url("https://api.openai.com/v1/"),
-            "https://api.openai.com"
-        );
-        assert_eq!(
-            normalize_nomi_base_url("https://api.anthropic.com"),
-            "https://api.anthropic.com"
-        );
-        assert_eq!(
-            normalize_nomi_base_url("https://api.deepseek.com/"),
-            "https://api.deepseek.com"
-        );
-        assert_eq!(
-            normalize_nomi_base_url("http://localhost:11434"),
-            "http://localhost:11434"
-        );
-        assert_eq!(normalize_nomi_base_url(""), "");
-    }
-
-    #[test]
-    fn map_nomi_provider_known_platforms() {
-        assert_eq!(map_nomi_provider("anthropic", None), "anthropic");
-        assert_eq!(map_nomi_provider("bedrock", None), "bedrock");
-        assert_eq!(map_nomi_provider("gemini-vertex-ai", None), "vertex");
-    }
-
-    #[test]
-    fn map_nomi_provider_custom_and_others_default_to_openai() {
-        assert_eq!(map_nomi_provider("custom", None), "openai");
-        assert_eq!(map_nomi_provider("gemini", None), "openai");
-        assert_eq!(map_nomi_provider("new-api", None), "openai");
-        assert_eq!(map_nomi_provider("unknown", None), "openai");
-    }
-
-    #[test]
-    fn map_nomi_provider_new_api_with_anthropic_protocol() {
-        assert_eq!(
-            map_nomi_provider("new-api", Some("anthropic")),
-            "anthropic"
-        );
-        assert_eq!(map_nomi_provider("new-api", Some("openai")), "openai");
-        assert_eq!(map_nomi_provider("new-api", None), "openai");
-    }
-
-    #[test]
-    fn map_nomi_provider_non_new_api_ignores_protocol_override() {
-        assert_eq!(map_nomi_provider("custom", Some("anthropic")), "openai");
-    }
-
-    #[test]
-    fn is_openai_host_detects_official_api() {
-        assert!(is_openai_host("https://api.openai.com/v1"));
-        assert!(is_openai_host("https://api.openai.com"));
-        assert!(is_openai_host("https://API.OPENAI.COM/v1"));
-        assert!(!is_openai_host("https://api.deepseek.com/v1"));
-        assert!(!is_openai_host("https://openai.example.com/v1"));
-        assert!(!is_openai_host(""));
-        assert!(!is_openai_host("not-a-url"));
-    }
-
-    #[test]
-    fn resolve_openai_official_sets_max_completion_tokens() {
-        let (base_url, compat) =
-            resolve_nomi_url_and_compat("custom", "https://api.openai.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.openai.com"));
-        assert_eq!(
-            compat.max_tokens_field.as_deref(),
-            Some("max_completion_tokens")
-        );
-        assert!(compat.api_path.is_none());
-    }
-
-    #[test]
-    fn resolve_non_openai_keeps_default_max_tokens() {
-        let (base_url, compat) =
-            resolve_nomi_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
-        assert!(compat.max_tokens_field.is_none());
-    }
-
-    #[test]
-    fn resolve_gemini_prepends_path_and_sets_api_path() {
-        let (base_url, compat) = resolve_nomi_url_and_compat(
-            "gemini",
-            "https://generativelanguage.googleapis.com",
-            "openai",
-            false,
-        );
-        assert_eq!(
-            base_url.as_deref(),
-            Some("https://generativelanguage.googleapis.com/v1beta/openai")
-        );
-        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
-        assert!(compat.max_tokens_field.is_none());
-    }
-
-    #[test]
-    fn resolve_anthropic_no_compat_overrides() {
-        let (base_url, compat) = resolve_nomi_url_and_compat(
-            "anthropic",
-            "https://api.anthropic.com",
-            "anthropic",
-            false,
-        );
-        assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
-        assert!(compat.max_tokens_field.is_none());
-        assert!(compat.api_path.is_none());
-    }
-
-    #[test]
-    fn resolve_full_url_mode_uses_url_as_is() {
-        let (base_url, compat) = resolve_nomi_url_and_compat(
-            "custom",
-            "https://proxy.example.com/v1/chat/completions",
-            "openai",
-            true,
-        );
-        assert_eq!(
-            base_url.as_deref(),
-            Some("https://proxy.example.com/v1/chat/completions")
-        );
-        assert_eq!(compat.api_path.as_deref(), Some(""));
-        assert!(compat.max_tokens_field.is_none());
-    }
-
-    #[test]
-    fn resolve_full_url_mode_strips_trailing_slash() {
-        let (base_url, compat) = resolve_nomi_url_and_compat(
-            "custom",
-            "https://proxy.example.com/v1/chat/completions/",
-            "openai",
-            true,
-        );
-        assert_eq!(
-            base_url.as_deref(),
-            Some("https://proxy.example.com/v1/chat/completions")
-        );
-        assert_eq!(compat.api_path.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn resolve_full_url_false_still_normalizes() {
-        let (base_url, compat) =
-            resolve_nomi_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
-        assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
-        assert!(compat.api_path.is_none());
-    }
-
-    #[test]
-    fn resolve_domestic_openai_compatible_platforms_use_configured_chat_base() {
-        for (platform, base) in [
-            ("ark", "https://ark.cn-beijing.volces.com/api/v3"),
-            ("stepfun", "https://api.stepfun.com/v1"),
-            ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
-            ("qianfan", "https://qianfan.baidubce.com/v2"),
-        ] {
-            let (base_url, compat) = resolve_nomi_url_and_compat(platform, base, "openai", false);
-            assert_eq!(base_url.as_deref(), Some(base), "platform={platform}");
-            assert_eq!(
-                compat.api_path.as_deref(),
-                Some("/chat/completions"),
-                "platform={platform}"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_coding_plan_platforms_use_chat_completions_at_configured_base() {
-        for (platform, base) in [
-            (
-                "ark-coding-plan",
-                "https://ark.cn-beijing.volces.com/api/coding/v3",
-            ),
-            (
-                "ark-agent-plan",
-                "https://ark.cn-beijing.volces.com/api/plan/v3",
-            ),
-            ("stepfun-plan", "https://api.stepfun.com/step_plan/v1"),
-            (
-                "dashscope-coding",
-                "https://coding.dashscope.aliyuncs.com/v1",
-            ),
-            (
-                "glm-coding-plan",
-                "https://open.bigmodel.cn/api/coding/paas/v4",
-            ),
-            (
-                "qianfan-coding-plan",
-                "https://qianfan.baidubce.com/v2/coding",
-            ),
-        ] {
-            let (base_url, compat) = resolve_nomi_url_and_compat(platform, base, "openai", false);
-            assert_eq!(base_url.as_deref(), Some(base), "platform={platform}");
-            assert_eq!(
-                compat.api_path.as_deref(),
-                Some("/chat/completions"),
-                "platform={platform}"
-            );
-        }
-    }
-
-    #[test]
     fn resolve_mcp_servers_empty_when_no_config() {
         let overrides = NomiBuildExtra::default();
         let (result, leases) = resolve_mcp_servers(&overrides, "conv-3");
@@ -2133,6 +2077,7 @@ mod tests {
                 url: None,
                 headers: None,
                 deferred: Some(false),
+                request_timeout_secs: None,
             },
         )]);
 
@@ -2170,19 +2115,27 @@ mod tests {
 
     #[test]
     fn resolve_bedrock_config_access_key() {
-        let json = r#"{"auth_method":"accessKey","region":"us-west-2","access_key_id":"AKIA123","secret_access_key":"secret456"}"#;
-        let result = resolve_bedrock_config(Some(json)).unwrap();
+        let json = r#"{"auth_method":"accessKey","region":"us-west-2"}"#;
+        let result = resolve_bedrock_config(
+            Some(json),
+            &serde_json::json!({
+                "access_key_id": "AKIA123",
+                "secret_access_key": "secret456",
+                "session_token": "sts789"
+            }),
+        )
+        .unwrap();
         assert_eq!(result.region.as_deref(), Some("us-west-2"));
         assert_eq!(result.access_key_id.as_deref(), Some("AKIA123"));
         assert_eq!(result.secret_access_key.as_deref(), Some("secret456"));
         assert!(result.profile.is_none());
-        assert!(result.session_token.is_none());
+        assert_eq!(result.session_token.as_deref(), Some("sts789"));
     }
 
     #[test]
     fn resolve_bedrock_config_profile() {
         let json = r#"{"auth_method":"profile","region":"eu-west-1","profile":"my-profile"}"#;
-        let result = resolve_bedrock_config(Some(json)).unwrap();
+        let result = resolve_bedrock_config(Some(json), &serde_json::json!({})).unwrap();
         assert_eq!(result.region.as_deref(), Some("eu-west-1"));
         assert_eq!(result.profile.as_deref(), Some("my-profile"));
         assert!(result.access_key_id.is_none());
@@ -2190,13 +2143,33 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bedrock_config_default_chain_requires_empty_credentials() {
+        let json = r#"{"auth_method":"defaultChain","region":"ap-southeast-1"}"#;
+        let result = resolve_bedrock_config(Some(json), &serde_json::json!({})).unwrap();
+        assert_eq!(result.region.as_deref(), Some("ap-southeast-1"));
+        assert!(result.access_key_id.is_none());
+        assert!(result.secret_access_key.is_none());
+        assert!(result.session_token.is_none());
+        assert!(result.profile.is_none());
+        assert!(
+            resolve_bedrock_config(
+                Some(json),
+                &serde_json::json!({"access_key_id":"must-not-be-used"}),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn resolve_bedrock_config_none_when_json_missing() {
-        assert!(resolve_bedrock_config(None).is_none());
+        assert!(resolve_bedrock_config(None, &serde_json::json!({})).is_none());
     }
 
     #[test]
     fn resolve_bedrock_config_none_when_json_invalid() {
-        assert!(resolve_bedrock_config(Some("not-json")).is_none());
+        assert!(
+            resolve_bedrock_config(Some("not-json"), &serde_json::json!({})).is_none()
+        );
     }
 
     #[test]
@@ -2331,6 +2304,50 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_search_prompt_matches_the_effective_tool_surface() {
+        let unrestricted = Vec::<String>::new();
+        assert!(super::should_expose_knowledge_search(
+            true,
+            true,
+            true,
+            &unrestricted,
+        ));
+        assert!(!super::should_expose_knowledge_search(
+            false,
+            true,
+            true,
+            &unrestricted,
+        ));
+        assert!(!super::should_expose_knowledge_search(
+            true,
+            false,
+            true,
+            &unrestricted,
+        ));
+        assert!(!super::should_expose_knowledge_search(
+            true,
+            true,
+            false,
+            &unrestricted,
+        ));
+
+        let only_search = vec!["knowledge_search".to_owned()];
+        assert!(!super::should_expose_knowledge_search(
+            true,
+            true,
+            true,
+            &only_search,
+        ));
+        let complete_surface = vec!["knowledge_search".to_owned(), "knowledge_read".to_owned()];
+        assert!(super::should_expose_knowledge_search(
+            true,
+            true,
+            true,
+            &complete_surface,
+        ));
+    }
+
+    #[test]
     fn native_write_root_unrestricted_only_for_local_desktop() {
         // 本地桌面(无渠道)→ None(OS 用户全权,今日行为)。
         assert_eq!(resolve_native_write_root(None, "/ws"), None);
@@ -2348,11 +2365,11 @@ mod tests {
     fn append_knowledge_context_without_mounts_is_passthrough() {
         let config = NomiBuildExtra::default();
         assert_eq!(
-            append_knowledge_context(None, &config, true),
+            append_knowledge_context(None, &config, true, true),
             None
         );
         assert_eq!(
-            append_knowledge_context(Some("hello".into()), &config, true),
+            append_knowledge_context(Some("hello".into()), &config, true, true),
             Some("hello".into())
         );
     }
@@ -2378,14 +2395,14 @@ mod tests {
         };
 
         let readonly =
-            append_knowledge_context(Some("base".into()), &config, true).unwrap();
+            append_knowledge_context(Some("base".into()), &config, true, true).unwrap();
         assert!(readonly.starts_with("base\n\n"));
         assert!(readonly.contains("## Knowledge bases"));
         assert!(readonly.contains("领域知识"));
         assert!(readonly.contains("intro.md — 简介"));
         assert!(readonly.contains("READ-ONLY"));
         // Hit-rate contract: retrieval protocol (once), per-base summary and
-        // when-to-consult guidance — same shared builder as the ACP path.
+        // when-to-consult guidance — the shared context builder.
         assert_eq!(readonly.matches("Retrieval protocol").count(), 1);
         assert!(readonly.contains("Covers deployment flows and runbooks."));
         assert!(readonly.contains("When to consult"));
@@ -2393,7 +2410,7 @@ mod tests {
         // nomi surface has the native tool → the write-back contract points at
         // it, and no session id or inbox path can leak into the prompt any more.
         config.knowledge_writeback = true;
-        let tooled = append_knowledge_context(None, &config, true).unwrap();
+        let tooled = append_knowledge_context(None, &config, true, true).unwrap();
         assert!(tooled.contains("Write-back is ENABLED"));
         assert!(tooled.contains("knowledge_write"));
         assert!(!tooled.contains("STAGED"));
@@ -2403,13 +2420,13 @@ mod tests {
             "the contract must not carry a session id: {tooled}"
         );
         // Flag plumbs through: without the tool, the file-based prose returns.
-        let file_based = append_knowledge_context(None, &config, false).unwrap();
+        let file_based = append_knowledge_context(None, &config, true, false).unwrap();
         assert!(file_based.contains("knowledge base directory"));
         assert!(!file_based.contains("knowledge_write"));
         // Disposition (回写意识) threads from build-extra → contract.
         assert!(tooled.contains("Disposition — MANUAL"));
         config.knowledge_writeback_eagerness = Some("auto".into());
-        let eager = append_knowledge_context(None, &config, true).unwrap();
+        let eager = append_knowledge_context(None, &config, true, true).unwrap();
         assert!(eager.contains("Disposition — AUTO"));
     }
 
@@ -2436,10 +2453,7 @@ mod tests {
             Some("auto")
         );
 
-        let prompt = append_knowledge_context(
-            None, &overrides, true,
-        )
-        .unwrap();
+        let prompt = append_knowledge_context(None, &overrides, true, true).unwrap();
         assert!(prompt.contains("Knowledge bases"));
         assert!(prompt.contains("运维手册"));
         assert!(prompt.contains("knowledge_write"));
@@ -2491,374 +2505,4 @@ mod tests {
         let enabled = resolve_write_policy(WriteSurface::ExternalChannel, &reconstruct(&on));
         assert!(matches!(enabled.mode, WriteMode::Direct));
     }
-}
-
-/// P2 Task 6 behavior snapshot for the chat-path platform mapping.
-///
-/// Locks the EXACT `(provider, base_url, api_path, compat)` outputs of
-/// `map_nomi_provider` + `resolve_nomi_url_and_compat` over the full platform
-/// matrix — every `MODEL_PLATFORMS` entry from
-/// `ui/src/renderer/utils/model/modelPlatforms.ts` (kept per-entry, so custom
-/// presets with distinct base URLs each get a row) × representative base_url
-/// variants (configured / trailing slash / toggled `/v1` / empty / full-URL),
-/// plus new-api per-model protocol-override edge cases.
-///
-/// `SNAPSHOT` was generated by CALLING the pre-refactor implementation
-/// (2026-07-29, commit eff19c8f working tree). It must stay byte-identical —
-/// UNCHANGED — through the `platform_table` refactor; any diff means the
-/// chat-path behavior regressed.
-#[cfg(test)]
-mod platform_chat_snapshot {
-    use super::{map_nomi_provider, resolve_nomi_url_and_compat};
-
-    /// Every `MODEL_PLATFORMS` entry as `(platform key, configured base_url)`,
-    /// in file order. Entries without a preset base_url (Custom / New API /
-    /// Bedrock) use a representative or empty base. Two extra rows:
-    /// the managed free-model platform and an unknown platform (default row).
-    const PLATFORM_MATRIX: &[(&str, &str)] = &[
-        ("custom", "https://api.example.com/v1"), // Custom (user-supplied base)
-        ("new-api", "https://gateway.example.com/v1"), // New API gateway
-        ("gemini", "https://generativelanguage.googleapis.com"),
-        ("openai", "https://api.openai.com/v1"),
-        ("anthropic", "https://api.anthropic.com"),
-        ("bedrock", ""),
-        ("deepseek", "https://api.deepseek.com/v1"),
-        ("mimo", "https://api.xiaomimimo.com/v1"),
-        ("mimo-token-plan-cn", "https://token-plan-cn.xiaomimimo.com/v1"),
-        ("mimo-token-plan-sgp", "https://token-plan-sgp.xiaomimimo.com/v1"),
-        ("mimo-token-plan-ams", "https://token-plan-ams.xiaomimimo.com/v1"),
-        ("minimax", "https://api.minimaxi.com/v1"),
-        ("minimax-code", "https://api.minimax.io/v1"),
-        ("minimax-coding-plan", "https://api.minimaxi.com/v1"),
-        ("novita", "https://api.novita.ai/openai/v1"),
-        ("openrouter", "https://openrouter.ai/api/v1"),
-        ("dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        ("dashscope-coding", "https://coding.dashscope.aliyuncs.com/v1"),
-        ("siliconflow", "https://api.siliconflow.cn/v1"), // SiliconFlow-CN
-        ("siliconflow", "https://api.siliconflow.com/v1"), // SiliconFlow
-        ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
-        ("glm-coding-plan", "https://open.bigmodel.cn/api/coding/paas/v4"),
-        ("moonshot-cn", "https://api.moonshot.cn/v1"),
-        ("moonshot-global", "https://api.moonshot.ai/v1"),
-        ("xai", "https://api.x.ai/v1"),
-        ("ark", "https://ark.cn-beijing.volces.com/api/v3"),
-        ("ark-coding-plan", "https://ark.cn-beijing.volces.com/api/coding/v3"),
-        ("ark-agent-plan", "https://ark.cn-beijing.volces.com/api/plan/v3"),
-        ("qianfan", "https://qianfan.baidubce.com/v2"),
-        ("qianfan-coding-plan", "https://qianfan.baidubce.com/v2/coding"),
-        ("hunyuan", "https://tokenhub.tencentmaas.com/v1"),
-        ("hunyuan-global", "https://tokenhub-intl.tencentmaas.com/v1"),
-        ("lingyi", "https://api.lingyiwanwu.com/v1"),
-        ("poe", "https://api.poe.com/v1"),
-        ("ppio", "https://api.ppio.com/openai/v1"),
-        ("modelscope", "https://api-inference.modelscope.cn/v1"),
-        ("infiniai", "https://cloud.infini-ai.com/maas/v1"),
-        ("ctyun", "https://wishub-x6.ctyun.cn/v1"),
-        ("stepfun", "https://api.stepfun.com/v1"),
-        ("stepfun-plan", "https://api.stepfun.com/step_plan/v1"),
-        ("nomifun-free-model", "https://free.nomifun.example/v1"), // managed free model
-        ("totally-unknown", "https://api.example.org/v1"), // default row
-    ];
-
-    /// `(platform, base_url, is_full_url, protocol)` extras: the new-api
-    /// per-model protocol override, its interaction with the api.openai.com
-    /// host rule, and full-URL edge cases (empty base; full-URL beating the
-    /// gemini / domestic-whitelist platform rules).
-    const EXTRA_CASES: &[(&str, &str, bool, Option<&str>)] = &[
-        ("new-api", "https://gateway.example.com/v1", false, Some("anthropic")),
-        ("new-api", "https://gateway.example.com/v1", false, Some("openai")),
-        ("new-api", "https://gateway.example.com/v1", false, Some("gemini")),
-        ("custom", "https://api.example.com/v1", false, Some("anthropic")),
-        ("anthropic", "https://api.anthropic.com", false, Some("openai")),
-        ("new-api", "https://api.openai.com/v1", false, None),
-        ("new-api", "https://api.openai.com/v1", false, Some("anthropic")),
-        ("custom", "", true, None),
-        ("gemini", "https://proxy.example.com/gemini/chat", true, None),
-        ("ark", "https://proxy.example.com/ark/chat", true, None),
-    ];
-
-    /// Base-url variants per platform row: configured / trailing slash /
-    /// toggled `/v1` (stripped when present, appended when absent) / empty /
-    /// full-URL (`is_full_url = true`).
-    fn variants(base: &str) -> Vec<(String, bool)> {
-        let toggled_v1 = match base.strip_suffix("/v1") {
-            Some(stripped) => stripped.to_owned(),
-            None => format!("{base}/v1"),
-        };
-        vec![
-            (base.to_owned(), false),
-            (format!("{base}/"), false),
-            (toggled_v1, false),
-            (String::new(), false),
-            (format!("{base}/chat/completions"), true),
-        ]
-    }
-
-    /// Mirrors the production call sequence (`provider_config.rs` /
-    /// `provider_health.rs`): map the platform first, then resolve URL/compat
-    /// with the MAPPED provider.
-    fn render_case(platform: &str, base: &str, full: bool, proto: Option<&str>) -> String {
-        let provider = map_nomi_provider(platform, proto);
-        let (base_url, compat) = resolve_nomi_url_and_compat(platform, base, &provider, full);
-        format!(
-            "{platform} | in={base:?} | full={full} | proto={proto:?} => provider={provider} \
-             | base={base_url:?} | api_path={:?} | max_tokens={:?} | image={:?} | reasoning={:?}",
-            compat.api_path,
-            compat.max_tokens_field,
-            compat.supports_image,
-            compat.require_reasoning_content,
-        )
-    }
-
-    fn render_all() -> String {
-        let mut out = String::new();
-        for (platform, base) in PLATFORM_MATRIX {
-            for (variant, full) in variants(base) {
-                out.push_str(&render_case(platform, &variant, full, None));
-                out.push('\n');
-            }
-        }
-        for (platform, base, full, proto) in EXTRA_CASES {
-            out.push_str(&render_case(platform, base, *full, *proto));
-            out.push('\n');
-        }
-        out
-    }
-
-    #[test]
-    fn platform_chat_rules_snapshot_locked() {
-        let actual = render_all();
-        if actual != SNAPSHOT {
-            println!("=== ACTUAL SNAPSHOT BEGIN ===");
-            print!("{actual}");
-            println!("=== ACTUAL SNAPSHOT END ===");
-            panic!(
-                "platform chat snapshot changed — chat-path (provider, base_url, api_path, \
-                 compat) must stay byte-identical to the pre-table behavior"
-            );
-        }
-    }
-
-    #[rustfmt::skip]
-    const SNAPSHOT: &str = r#"custom | in="https://api.example.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-custom | in="https://api.example.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-custom | in="https://api.example.com" | full=false | proto=None => provider=openai | base=Some("https://api.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-custom | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-custom | in="https://api.example.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.example.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com/v1" | full=false | proto=None => provider=openai | base=Some("https://gateway.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://gateway.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com" | full=false | proto=None => provider=openai | base=Some("https://gateway.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://gateway.example.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-gemini | in="https://generativelanguage.googleapis.com" | full=false | proto=None => provider=openai | base=Some("https://generativelanguage.googleapis.com/v1beta/openai") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-gemini | in="https://generativelanguage.googleapis.com/" | full=false | proto=None => provider=openai | base=Some("https://generativelanguage.googleapis.com/v1beta/openai") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-gemini | in="https://generativelanguage.googleapis.com/v1" | full=false | proto=None => provider=openai | base=Some("https://generativelanguage.googleapis.com/v1/v1beta/openai") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-gemini | in="" | full=false | proto=None => provider=openai | base=Some("/v1beta/openai") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-gemini | in="https://generativelanguage.googleapis.com/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://generativelanguage.googleapis.com/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-openai | in="https://api.openai.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.openai.com") | api_path=None | max_tokens=Some("max_completion_tokens") | image=None | reasoning=None
-openai | in="https://api.openai.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.openai.com") | api_path=None | max_tokens=Some("max_completion_tokens") | image=None | reasoning=None
-openai | in="https://api.openai.com" | full=false | proto=None => provider=openai | base=Some("https://api.openai.com") | api_path=None | max_tokens=Some("max_completion_tokens") | image=None | reasoning=None
-openai | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-openai | in="https://api.openai.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.openai.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-anthropic | in="https://api.anthropic.com" | full=false | proto=None => provider=anthropic | base=Some("https://api.anthropic.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-anthropic | in="https://api.anthropic.com/" | full=false | proto=None => provider=anthropic | base=Some("https://api.anthropic.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-anthropic | in="https://api.anthropic.com/v1" | full=false | proto=None => provider=anthropic | base=Some("https://api.anthropic.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-anthropic | in="" | full=false | proto=None => provider=anthropic | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-anthropic | in="https://api.anthropic.com/chat/completions" | full=true | proto=None => provider=anthropic | base=Some("https://api.anthropic.com/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-bedrock | in="" | full=false | proto=None => provider=bedrock | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-bedrock | in="/" | full=false | proto=None => provider=bedrock | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-bedrock | in="/v1" | full=false | proto=None => provider=bedrock | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-bedrock | in="" | full=false | proto=None => provider=bedrock | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-bedrock | in="/chat/completions" | full=true | proto=None => provider=bedrock | base=Some("/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-deepseek | in="https://api.deepseek.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.deepseek.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-deepseek | in="https://api.deepseek.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.deepseek.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-deepseek | in="https://api.deepseek.com" | full=false | proto=None => provider=openai | base=Some("https://api.deepseek.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-deepseek | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-deepseek | in="https://api.deepseek.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.deepseek.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-mimo | in="https://api.xiaomimimo.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo | in="https://api.xiaomimimo.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo | in="https://api.xiaomimimo.com" | full=false | proto=None => provider=openai | base=Some("https://api.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo | in="https://api.xiaomimimo.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.xiaomimimo.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-cn | in="https://token-plan-cn.xiaomimimo.com/v1" | full=false | proto=None => provider=openai | base=Some("https://token-plan-cn.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-cn | in="https://token-plan-cn.xiaomimimo.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://token-plan-cn.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-cn | in="https://token-plan-cn.xiaomimimo.com" | full=false | proto=None => provider=openai | base=Some("https://token-plan-cn.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-cn | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-cn | in="https://token-plan-cn.xiaomimimo.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://token-plan-cn.xiaomimimo.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-sgp | in="https://token-plan-sgp.xiaomimimo.com/v1" | full=false | proto=None => provider=openai | base=Some("https://token-plan-sgp.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-sgp | in="https://token-plan-sgp.xiaomimimo.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://token-plan-sgp.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-sgp | in="https://token-plan-sgp.xiaomimimo.com" | full=false | proto=None => provider=openai | base=Some("https://token-plan-sgp.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-sgp | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-sgp | in="https://token-plan-sgp.xiaomimimo.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://token-plan-sgp.xiaomimimo.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-ams | in="https://token-plan-ams.xiaomimimo.com/v1" | full=false | proto=None => provider=openai | base=Some("https://token-plan-ams.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-ams | in="https://token-plan-ams.xiaomimimo.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://token-plan-ams.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-ams | in="https://token-plan-ams.xiaomimimo.com" | full=false | proto=None => provider=openai | base=Some("https://token-plan-ams.xiaomimimo.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-ams | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-mimo-token-plan-ams | in="https://token-plan-ams.xiaomimimo.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://token-plan-ams.xiaomimimo.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-minimax | in="https://api.minimaxi.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.minimaxi.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax | in="https://api.minimaxi.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.minimaxi.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax | in="https://api.minimaxi.com" | full=false | proto=None => provider=openai | base=Some("https://api.minimaxi.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax | in="https://api.minimaxi.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.minimaxi.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-minimax-code | in="https://api.minimax.io/v1" | full=false | proto=None => provider=openai | base=Some("https://api.minimax.io") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-code | in="https://api.minimax.io/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.minimax.io") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-code | in="https://api.minimax.io" | full=false | proto=None => provider=openai | base=Some("https://api.minimax.io") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-code | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-code | in="https://api.minimax.io/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.minimax.io/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-minimax-coding-plan | in="https://api.minimaxi.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.minimaxi.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-coding-plan | in="https://api.minimaxi.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.minimaxi.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-coding-plan | in="https://api.minimaxi.com" | full=false | proto=None => provider=openai | base=Some("https://api.minimaxi.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-coding-plan | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-minimax-coding-plan | in="https://api.minimaxi.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.minimaxi.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-novita | in="https://api.novita.ai/openai/v1" | full=false | proto=None => provider=openai | base=Some("https://api.novita.ai/openai") | api_path=None | max_tokens=None | image=None | reasoning=None
-novita | in="https://api.novita.ai/openai/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.novita.ai/openai") | api_path=None | max_tokens=None | image=None | reasoning=None
-novita | in="https://api.novita.ai/openai" | full=false | proto=None => provider=openai | base=Some("https://api.novita.ai/openai") | api_path=None | max_tokens=None | image=None | reasoning=None
-novita | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-novita | in="https://api.novita.ai/openai/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.novita.ai/openai/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-openrouter | in="https://openrouter.ai/api/v1" | full=false | proto=None => provider=openai | base=Some("https://openrouter.ai/api") | api_path=None | max_tokens=None | image=None | reasoning=None
-openrouter | in="https://openrouter.ai/api/v1/" | full=false | proto=None => provider=openai | base=Some("https://openrouter.ai/api") | api_path=None | max_tokens=None | image=None | reasoning=None
-openrouter | in="https://openrouter.ai/api" | full=false | proto=None => provider=openai | base=Some("https://openrouter.ai/api") | api_path=None | max_tokens=None | image=None | reasoning=None
-openrouter | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-openrouter | in="https://openrouter.ai/api/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://openrouter.ai/api/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-dashscope | in="https://dashscope.aliyuncs.com/compatible-mode/v1" | full=false | proto=None => provider=openai | base=Some("https://dashscope.aliyuncs.com/compatible-mode") | api_path=None | max_tokens=None | image=None | reasoning=None
-dashscope | in="https://dashscope.aliyuncs.com/compatible-mode/v1/" | full=false | proto=None => provider=openai | base=Some("https://dashscope.aliyuncs.com/compatible-mode") | api_path=None | max_tokens=None | image=None | reasoning=None
-dashscope | in="https://dashscope.aliyuncs.com/compatible-mode" | full=false | proto=None => provider=openai | base=Some("https://dashscope.aliyuncs.com/compatible-mode") | api_path=None | max_tokens=None | image=None | reasoning=None
-dashscope | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-dashscope | in="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-dashscope-coding | in="https://coding.dashscope.aliyuncs.com/v1" | full=false | proto=None => provider=openai | base=Some("https://coding.dashscope.aliyuncs.com/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-dashscope-coding | in="https://coding.dashscope.aliyuncs.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://coding.dashscope.aliyuncs.com/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-dashscope-coding | in="https://coding.dashscope.aliyuncs.com" | full=false | proto=None => provider=openai | base=Some("https://coding.dashscope.aliyuncs.com") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-dashscope-coding | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-dashscope-coding | in="https://coding.dashscope.aliyuncs.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://coding.dashscope.aliyuncs.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.cn/v1" | full=false | proto=None => provider=openai | base=Some("https://api.siliconflow.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.cn/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.siliconflow.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.cn" | full=false | proto=None => provider=openai | base=Some("https://api.siliconflow.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.cn/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.siliconflow.cn/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.siliconflow.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.siliconflow.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.com" | full=false | proto=None => provider=openai | base=Some("https://api.siliconflow.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-siliconflow | in="https://api.siliconflow.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.siliconflow.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-zhipu | in="https://open.bigmodel.cn/api/paas/v4" | full=false | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/paas/v4") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-zhipu | in="https://open.bigmodel.cn/api/paas/v4/" | full=false | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/paas/v4") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-zhipu | in="https://open.bigmodel.cn/api/paas/v4/v1" | full=false | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/paas/v4/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-zhipu | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-zhipu | in="https://open.bigmodel.cn/api/paas/v4/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/paas/v4/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-glm-coding-plan | in="https://open.bigmodel.cn/api/coding/paas/v4" | full=false | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/coding/paas/v4") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-glm-coding-plan | in="https://open.bigmodel.cn/api/coding/paas/v4/" | full=false | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/coding/paas/v4") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-glm-coding-plan | in="https://open.bigmodel.cn/api/coding/paas/v4/v1" | full=false | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/coding/paas/v4/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-glm-coding-plan | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-glm-coding-plan | in="https://open.bigmodel.cn/api/coding/paas/v4/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-moonshot-cn | in="https://api.moonshot.cn/v1" | full=false | proto=None => provider=openai | base=Some("https://api.moonshot.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-cn | in="https://api.moonshot.cn/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.moonshot.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-cn | in="https://api.moonshot.cn" | full=false | proto=None => provider=openai | base=Some("https://api.moonshot.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-cn | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-cn | in="https://api.moonshot.cn/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.moonshot.cn/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-moonshot-global | in="https://api.moonshot.ai/v1" | full=false | proto=None => provider=openai | base=Some("https://api.moonshot.ai") | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-global | in="https://api.moonshot.ai/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.moonshot.ai") | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-global | in="https://api.moonshot.ai" | full=false | proto=None => provider=openai | base=Some("https://api.moonshot.ai") | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-global | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-moonshot-global | in="https://api.moonshot.ai/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.moonshot.ai/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-xai | in="https://api.x.ai/v1" | full=false | proto=None => provider=openai | base=Some("https://api.x.ai") | api_path=None | max_tokens=None | image=None | reasoning=None
-xai | in="https://api.x.ai/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.x.ai") | api_path=None | max_tokens=None | image=None | reasoning=None
-xai | in="https://api.x.ai" | full=false | proto=None => provider=openai | base=Some("https://api.x.ai") | api_path=None | max_tokens=None | image=None | reasoning=None
-xai | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-xai | in="https://api.x.ai/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.x.ai/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-ark | in="https://ark.cn-beijing.volces.com/api/v3" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/v3") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark | in="https://ark.cn-beijing.volces.com/api/v3/" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/v3") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark | in="https://ark.cn-beijing.volces.com/api/v3/v1" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/v3/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark | in="https://ark.cn-beijing.volces.com/api/v3/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/v3/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-ark-coding-plan | in="https://ark.cn-beijing.volces.com/api/coding/v3" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/coding/v3") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-coding-plan | in="https://ark.cn-beijing.volces.com/api/coding/v3/" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/coding/v3") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-coding-plan | in="https://ark.cn-beijing.volces.com/api/coding/v3/v1" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/coding/v3/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-coding-plan | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-coding-plan | in="https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-ark-agent-plan | in="https://ark.cn-beijing.volces.com/api/plan/v3" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/plan/v3") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-agent-plan | in="https://ark.cn-beijing.volces.com/api/plan/v3/" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/plan/v3") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-agent-plan | in="https://ark.cn-beijing.volces.com/api/plan/v3/v1" | full=false | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/plan/v3/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-agent-plan | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-ark-agent-plan | in="https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-qianfan | in="https://qianfan.baidubce.com/v2" | full=false | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan | in="https://qianfan.baidubce.com/v2/" | full=false | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan | in="https://qianfan.baidubce.com/v2/v1" | full=false | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan | in="https://qianfan.baidubce.com/v2/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-qianfan-coding-plan | in="https://qianfan.baidubce.com/v2/coding" | full=false | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2/coding") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan-coding-plan | in="https://qianfan.baidubce.com/v2/coding/" | full=false | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2/coding") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan-coding-plan | in="https://qianfan.baidubce.com/v2/coding/v1" | full=false | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2/coding/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan-coding-plan | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-qianfan-coding-plan | in="https://qianfan.baidubce.com/v2/coding/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://qianfan.baidubce.com/v2/coding/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-hunyuan | in="https://tokenhub.tencentmaas.com/v1" | full=false | proto=None => provider=openai | base=Some("https://tokenhub.tencentmaas.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan | in="https://tokenhub.tencentmaas.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://tokenhub.tencentmaas.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan | in="https://tokenhub.tencentmaas.com" | full=false | proto=None => provider=openai | base=Some("https://tokenhub.tencentmaas.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan | in="https://tokenhub.tencentmaas.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://tokenhub.tencentmaas.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-hunyuan-global | in="https://tokenhub-intl.tencentmaas.com/v1" | full=false | proto=None => provider=openai | base=Some("https://tokenhub-intl.tencentmaas.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan-global | in="https://tokenhub-intl.tencentmaas.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://tokenhub-intl.tencentmaas.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan-global | in="https://tokenhub-intl.tencentmaas.com" | full=false | proto=None => provider=openai | base=Some("https://tokenhub-intl.tencentmaas.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan-global | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-hunyuan-global | in="https://tokenhub-intl.tencentmaas.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://tokenhub-intl.tencentmaas.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-lingyi | in="https://api.lingyiwanwu.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.lingyiwanwu.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-lingyi | in="https://api.lingyiwanwu.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.lingyiwanwu.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-lingyi | in="https://api.lingyiwanwu.com" | full=false | proto=None => provider=openai | base=Some("https://api.lingyiwanwu.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-lingyi | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-lingyi | in="https://api.lingyiwanwu.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.lingyiwanwu.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-poe | in="https://api.poe.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.poe.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-poe | in="https://api.poe.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.poe.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-poe | in="https://api.poe.com" | full=false | proto=None => provider=openai | base=Some("https://api.poe.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-poe | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-poe | in="https://api.poe.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.poe.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-ppio | in="https://api.ppio.com/openai/v1" | full=false | proto=None => provider=openai | base=Some("https://api.ppio.com/openai") | api_path=None | max_tokens=None | image=None | reasoning=None
-ppio | in="https://api.ppio.com/openai/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.ppio.com/openai") | api_path=None | max_tokens=None | image=None | reasoning=None
-ppio | in="https://api.ppio.com/openai" | full=false | proto=None => provider=openai | base=Some("https://api.ppio.com/openai") | api_path=None | max_tokens=None | image=None | reasoning=None
-ppio | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-ppio | in="https://api.ppio.com/openai/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.ppio.com/openai/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-modelscope | in="https://api-inference.modelscope.cn/v1" | full=false | proto=None => provider=openai | base=Some("https://api-inference.modelscope.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-modelscope | in="https://api-inference.modelscope.cn/v1/" | full=false | proto=None => provider=openai | base=Some("https://api-inference.modelscope.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-modelscope | in="https://api-inference.modelscope.cn" | full=false | proto=None => provider=openai | base=Some("https://api-inference.modelscope.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-modelscope | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-modelscope | in="https://api-inference.modelscope.cn/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api-inference.modelscope.cn/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-infiniai | in="https://cloud.infini-ai.com/maas/v1" | full=false | proto=None => provider=openai | base=Some("https://cloud.infini-ai.com/maas") | api_path=None | max_tokens=None | image=None | reasoning=None
-infiniai | in="https://cloud.infini-ai.com/maas/v1/" | full=false | proto=None => provider=openai | base=Some("https://cloud.infini-ai.com/maas") | api_path=None | max_tokens=None | image=None | reasoning=None
-infiniai | in="https://cloud.infini-ai.com/maas" | full=false | proto=None => provider=openai | base=Some("https://cloud.infini-ai.com/maas") | api_path=None | max_tokens=None | image=None | reasoning=None
-infiniai | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-infiniai | in="https://cloud.infini-ai.com/maas/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://cloud.infini-ai.com/maas/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-ctyun | in="https://wishub-x6.ctyun.cn/v1" | full=false | proto=None => provider=openai | base=Some("https://wishub-x6.ctyun.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-ctyun | in="https://wishub-x6.ctyun.cn/v1/" | full=false | proto=None => provider=openai | base=Some("https://wishub-x6.ctyun.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-ctyun | in="https://wishub-x6.ctyun.cn" | full=false | proto=None => provider=openai | base=Some("https://wishub-x6.ctyun.cn") | api_path=None | max_tokens=None | image=None | reasoning=None
-ctyun | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-ctyun | in="https://wishub-x6.ctyun.cn/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://wishub-x6.ctyun.cn/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-stepfun | in="https://api.stepfun.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.stepfun.com/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun | in="https://api.stepfun.com/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.stepfun.com/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun | in="https://api.stepfun.com" | full=false | proto=None => provider=openai | base=Some("https://api.stepfun.com") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun | in="https://api.stepfun.com/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.stepfun.com/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-stepfun-plan | in="https://api.stepfun.com/step_plan/v1" | full=false | proto=None => provider=openai | base=Some("https://api.stepfun.com/step_plan/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun-plan | in="https://api.stepfun.com/step_plan/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.stepfun.com/step_plan/v1") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun-plan | in="https://api.stepfun.com/step_plan" | full=false | proto=None => provider=openai | base=Some("https://api.stepfun.com/step_plan") | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun-plan | in="" | full=false | proto=None => provider=openai | base=None | api_path=Some("/chat/completions") | max_tokens=None | image=None | reasoning=None
-stepfun-plan | in="https://api.stepfun.com/step_plan/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.stepfun.com/step_plan/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-nomifun-free-model | in="https://free.nomifun.example/v1" | full=false | proto=None => provider=openai | base=Some("https://free.nomifun.example") | api_path=None | max_tokens=None | image=None | reasoning=None
-nomifun-free-model | in="https://free.nomifun.example/v1/" | full=false | proto=None => provider=openai | base=Some("https://free.nomifun.example") | api_path=None | max_tokens=None | image=None | reasoning=None
-nomifun-free-model | in="https://free.nomifun.example" | full=false | proto=None => provider=openai | base=Some("https://free.nomifun.example") | api_path=None | max_tokens=None | image=None | reasoning=None
-nomifun-free-model | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-nomifun-free-model | in="https://free.nomifun.example/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://free.nomifun.example/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-totally-unknown | in="https://api.example.org/v1" | full=false | proto=None => provider=openai | base=Some("https://api.example.org") | api_path=None | max_tokens=None | image=None | reasoning=None
-totally-unknown | in="https://api.example.org/v1/" | full=false | proto=None => provider=openai | base=Some("https://api.example.org") | api_path=None | max_tokens=None | image=None | reasoning=None
-totally-unknown | in="https://api.example.org" | full=false | proto=None => provider=openai | base=Some("https://api.example.org") | api_path=None | max_tokens=None | image=None | reasoning=None
-totally-unknown | in="" | full=false | proto=None => provider=openai | base=None | api_path=None | max_tokens=None | image=None | reasoning=None
-totally-unknown | in="https://api.example.org/v1/chat/completions" | full=true | proto=None => provider=openai | base=Some("https://api.example.org/v1/chat/completions") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com/v1" | full=false | proto=Some("anthropic") => provider=anthropic | base=Some("https://gateway.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com/v1" | full=false | proto=Some("openai") => provider=openai | base=Some("https://gateway.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="https://gateway.example.com/v1" | full=false | proto=Some("gemini") => provider=openai | base=Some("https://gateway.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-custom | in="https://api.example.com/v1" | full=false | proto=Some("anthropic") => provider=openai | base=Some("https://api.example.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-anthropic | in="https://api.anthropic.com" | full=false | proto=Some("openai") => provider=anthropic | base=Some("https://api.anthropic.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-new-api | in="https://api.openai.com/v1" | full=false | proto=None => provider=openai | base=Some("https://api.openai.com") | api_path=None | max_tokens=Some("max_completion_tokens") | image=None | reasoning=None
-new-api | in="https://api.openai.com/v1" | full=false | proto=Some("anthropic") => provider=anthropic | base=Some("https://api.openai.com") | api_path=None | max_tokens=None | image=None | reasoning=None
-custom | in="" | full=true | proto=None => provider=openai | base=Some("") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-gemini | in="https://proxy.example.com/gemini/chat" | full=true | proto=None => provider=openai | base=Some("https://proxy.example.com/gemini/chat") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-ark | in="https://proxy.example.com/ark/chat" | full=true | proto=None => provider=openai | base=Some("https://proxy.example.com/ark/chat") | api_path=Some("") | max_tokens=None | image=None | reasoning=None
-"#;
 }

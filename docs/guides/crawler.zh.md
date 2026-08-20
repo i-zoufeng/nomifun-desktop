@@ -85,6 +85,6 @@
 ## 代码位置
 
 - 后端：[`crates/backend/nomifun-crawl/`](../../crates/backend/nomifun-crawl/)
-- 表结构：[`031_crawl_jobs_and_tasks.sql`](../../crates/backend/nomifun-db/migrations/031_crawl_jobs_and_tasks.sql)
+- 表结构：[`036_crawl_jobs_and_tasks.sql`](../../crates/backend/nomifun-db/migrations/036_crawl_jobs_and_tasks.sql)
 - 前端：[`ui/src/renderer/pages/crawl/`](../../ui/src/renderer/pages/crawl/)
 - 设计文档：[`docs/specs/2026-08-05-distributed-crawler-design.zh.md`](../specs/2026-08-05-distributed-crawler-design.zh.md)

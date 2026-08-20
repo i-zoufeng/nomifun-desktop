@@ -898,63 +898,10 @@ const SendBox: React.FC<{
     },
     [conversationContext?.type, handleExternalSelectionAppend]
   );
-  useAddEventListener(
-    'acp.selected.file.append',
-    (items: FileSelectionItem[]) => {
-      if (conversationContext?.type === 'acp') {
-        handleExternalSelectionAppend(items);
-      }
-    },
-    [conversationContext?.type, handleExternalSelectionAppend]
-  );
-  useAddEventListener(
-    'remote.selected.file.append',
-    (items: FileSelectionItem[]) => {
-      if (conversationContext?.type === 'remote') {
-        handleExternalSelectionAppend(items);
-      }
-    },
-    [conversationContext?.type, handleExternalSelectionAppend]
-  );
-  useAddEventListener(
-    'openclaw-gateway.selected.file.append',
-    (items: FileSelectionItem[]) => {
-      if (conversationContext?.type === 'openclaw-gateway') {
-        handleExternalSelectionAppend(items);
-      }
-    },
-    [conversationContext?.type, handleExternalSelectionAppend]
-  );
-  useAddEventListener(
-    'nanobot.selected.file.append',
-    (items: FileSelectionItem[]) => {
-      if (conversationContext?.type === 'nanobot') {
-        handleExternalSelectionAppend(items);
-      }
-    },
-    [conversationContext?.type, handleExternalSelectionAppend]
-  );
-
   const emitSelectedFileAppend = useCallback(
     (item: FileOrFolderItem) => {
-      switch (conversationContext?.type) {
-        case 'nomi':
-          emitter.emit('nomi.selected.file.append', [item]);
-          break;
-        case 'acp':
-          emitter.emit('acp.selected.file.append', [item]);
-          break;
-        case 'remote':
-          emitter.emit('remote.selected.file.append', [item]);
-          break;
-        case 'openclaw-gateway':
-          emitter.emit('openclaw-gateway.selected.file.append', [item]);
-          break;
-        case 'nanobot':
-          emitter.emit('nanobot.selected.file.append', [item]);
-          break;
-        default:
-          break;
+      if (conversationContext?.type === 'nomi') {
+        emitter.emit('nomi.selected.file.append', [item]);
       }
     },
     [conversationContext?.type]
@@ -1368,6 +1315,11 @@ const SendBox: React.FC<{
 
   const steerMessageHandler = () => {
     if (!onSteer || isUploading || isStopping) return;
+    // The draft is cleared eagerly so an in-flight steer cannot overwrite text
+    // the user types while it resolves. Recovery on failure is the handler's
+    // job, not this layer's: the Nomi handler diverts a failed interjection into
+    // the persisted command queue, which survives navigation in a way restoring
+    // local state would not.
     const finalMessage = composeAndClear();
     if (finalMessage == null) return;
     setIsLoading(true);
@@ -1453,22 +1405,26 @@ const SendBox: React.FC<{
   const renderActionButtons = () => {
     if (isStopping) return stopButton;
     if (allowSendWhileLoading && (isLoading || loading)) {
-      // Keep a single action slot while processing: show stop when the draft is empty,
-      // and only switch back to send once the user has prepared a queued message.
-      if (compactActions || !hasDraftToSend || disabled || isUploading) {
+      // Stop is an independent safety action. A non-empty draft must never
+      // replace or hide it: users may need to cancel the current turn even
+      // while preparing a queued message.
+      if (!hasDraftToSend || disabled || isUploading) {
         return stopButton;
       }
-      // Opt-in: offer "steer now" alongside the (enqueue) send button when a
-      // consumer has wired it up and the affordance is available.
-      if (onSteer && steerAvailable) {
-        return (
-          <div className='flex items-center gap-2'>
-            {steerButton}
-            {sendButton}
-          </div>
-        );
-      }
-      return sendButton;
+      const queuedActions = compactActions ? (
+        sendButton
+      ) : (
+        <>
+          {onSteer && steerAvailable ? steerButton : null}
+          {sendButton}
+        </>
+      );
+      return (
+        <div className='flex items-center gap-2' data-testid='sendbox-busy-actions'>
+          {stopButton}
+          {queuedActions}
+        </div>
+      );
     }
 
     if (isLoading || loading) {

@@ -75,13 +75,11 @@ reason, the detail page offers a one-click repair to your local zone.
 
 ### Agent
 
-Pick the agent that runs each fire. Three flavours show up in the picker:
+Pick what runs each fire. Two flavours show up in the picker:
 
-- **CLI agents** — `claude` / `codex` / `gemini` (whatever the backend
-  detected on `PATH`). The job records the backend label and uses ACP
-  end-to-end.
 - **Nomi (built-in)** — uses Nomi's own engine with your selected
-  provider/model.
+  provider/model. This is the only agent that can run a scheduled
+  conversation.
 - **Presets** — reusable launch configurations; the job records the preset id,
   revision, and resolved snapshot.
 
@@ -129,7 +127,6 @@ The detail page also lists the conversations created by this job, sorted
 by activity — useful when the job runs in `new_conversation` mode and
 fans out one thread per fire.
 
-![Scheduled task detail](../images/cron-03-detail.png)
 
 ## Keep-Awake
 

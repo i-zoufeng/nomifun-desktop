@@ -23,7 +23,6 @@ import {
   parseMcpServerId,
   parseCompanionId,
   parseProviderId,
-  parseRemoteAgentId,
 } from '../types/ids';
 
 export type ApiProviderWithModel = {
@@ -65,7 +64,8 @@ export function fromApiModel(raw: ApiProviderWithModel): TProviderWithModel {
     platform: '',
     name: '',
     base_url: '',
-    api_key: '',
+    auth_scheme: '',
+    has_credentials: false,
     use_model: raw.use_model ?? raw.model,
   };
 }
@@ -203,14 +203,6 @@ export function fromApiConversation(raw: unknown): TChatConversation {
     };
   }
 
-  // Remote-agent conversations use one canonical logical-reference field.
-  if (extra && 'remote_agent_id' in extra) {
-    extra = {
-      ...extra,
-      remote_agent_id: parseRemoteAgentId(extra.remote_agent_id),
-    };
-  }
-
   if (extra && 'mcp_server_ids' in extra) {
     if (!Array.isArray(extra.mcp_server_ids)) {
       throw new TypeError('conversation extra.mcp_server_ids must be an array');
@@ -258,13 +250,6 @@ export function fromApiConversation(raw: unknown): TChatConversation {
           ),
         };
       }),
-    };
-  }
-
-  if (extra && extra.acp_session_conversation_id != null) {
-    extra = {
-      ...extra,
-      acp_session_conversation_id: parseConversationId(extra.acp_session_conversation_id),
     };
   }
 

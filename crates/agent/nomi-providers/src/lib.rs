@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod anthropic_shared;
 pub mod bedrock;
+pub mod gemini;
 pub mod openai;
 pub mod retry;
 pub mod vertex;
@@ -10,14 +11,44 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use nomifun_net::secret_redaction::SecretRedactor;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use nomi_config::config::{Config, ProviderType};
+use nomi_config::compat::ProviderCompat;
 use nomi_types::llm::{LlmEvent, LlmRequest};
 
 const MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16 * 1024;
+const PROVIDER_ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const TRUNCATED_PROVIDER_ERROR_BODY: &str = "\n[provider error body truncated]";
+
+fn merge_json_value(target: &mut Value, incoming: &Value) {
+    match (target, incoming) {
+        (Value::Object(target), Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                match target.get_mut(key) {
+                    Some(existing) => merge_json_value(existing, value),
+                    None => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, incoming) => *target = incoming.clone(),
+    }
+}
+
+/// Merge provider-native body extensions first, then recursively overlay the
+/// serializer's typed protocol body. Unknown extensions survive while typed
+/// model/messages/tools/token fields always remain authoritative.
+pub(crate) fn request_body_with_extra(compat: &ProviderCompat, typed: Value) -> Value {
+    let mut body = Value::Object(compat.extra_body());
+    merge_json_value(&mut body, &typed);
+    body
+}
 
 /// Unified interface for LLM API providers
 #[async_trait]
@@ -29,7 +60,7 @@ pub trait LlmProvider: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     #[error("API error {status}: {message}")]
     Api { status: u16, message: String },
     #[error("SSE parse error: {0}")]
@@ -43,12 +74,70 @@ pub enum ProviderError {
     PromptTooLong(String),
     #[error("Connection error: {0}")]
     Connection(String),
+    /// The HTTP transport closed cleanly, but the provider never emitted the
+    /// protocol's commit marker. This is retryable only while no replay-unsafe
+    /// content has crossed the provider boundary; the stream outcome carries
+    /// that separate empty/partial distinction.
+    #[error("Provider stream truncated: {0}")]
+    StreamTruncated(String),
+    /// The address answered with a document instead of an API payload — a
+    /// gateway serving its web UI at a near-miss path. Never retryable: the
+    /// same wrong URL will answer the same way.
+    #[error("Provider returned a web page, not an API response{}: {message}", content_type.as_ref().map(|value| format!(" (content-type {value})")).unwrap_or_default())]
+    NonApiResponse {
+        content_type: Option<String>,
+        message: String,
+    },
 }
 
 impl ProviderError {
+    /// Remove every exact runtime credential representation before an error
+    /// crosses the provider boundary or is written to a log/health record.
+    pub(crate) fn redacted(self, redactor: &SecretRedactor) -> Self {
+        match self {
+            Self::Http(error) => Self::Http(error.without_url()),
+            Self::Api { status, message } => Self::Api {
+                status,
+                message: redactor.redact(&message),
+            },
+            Self::Parse(message) => Self::Parse(redactor.redact(&message)),
+            Self::RateLimited {
+                retry_after_ms,
+                message,
+            } => Self::RateLimited {
+                retry_after_ms,
+                message: redactor.redact(&message),
+            },
+            Self::PromptTooLong(message) => Self::PromptTooLong(redactor.redact(&message)),
+            Self::Connection(message) => Self::Connection(redactor.redact(&message)),
+            Self::StreamTruncated(message) => {
+                Self::StreamTruncated(redactor.redact(&message))
+            }
+            Self::NonApiResponse {
+                content_type,
+                message,
+            } => Self::NonApiResponse {
+                content_type,
+                message: redactor.redact(&message),
+            },
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         match self {
-            ProviderError::RateLimited { .. } | ProviderError::Connection(_) => true,
+            ProviderError::Http(error) => {
+                error.is_connect()
+                    || error.is_timeout()
+                    || error.is_body()
+                    // `Response::bytes_stream` can wrap a transport body reset
+                    // in an outer reqwest Decode error (the inner source is
+                    // still Body). On an empty stream this is safe to retry.
+                    || error.is_decode()
+                    || error.is_request()
+            }
+            ProviderError::RateLimited { .. }
+            | ProviderError::Connection(_)
+            | ProviderError::StreamTruncated(_) => true,
             // Transient server-side faults (500/502/503/504) from an overloaded
             // gateway are the most common spurious failure and are safe to retry
             // on the pre-response / empty-content paths. 4xx are terminal.
@@ -102,6 +191,15 @@ impl ProviderError {
     }
 }
 
+impl From<reqwest::Error> for ProviderError {
+    fn from(error: reqwest::Error) -> Self {
+        // Request URLs can contain query-key authentication. Preserve the
+        // transport classification while ensuring the URL never reaches an
+        // error string, warning, or persisted health diagnostic.
+        Self::Http(error.without_url())
+    }
+}
+
 /// Split the stored provider credential into individual API keys.
 ///
 /// Provider settings persist multiple credentials as a comma-separated string;
@@ -127,9 +225,32 @@ pub(crate) fn is_api_key_rotation_error(error: &ProviderError) -> bool {
     )
 }
 
+/// Reject a response whose content type shows the address served a document.
+///
+/// Applied before the status check so a `200 OK` HTML page — what an
+/// OpenAI-compatible gateway returns for a near-miss path such as
+/// `/chat/completions` when it wants `/v1/chat/completions` — is reported as a
+/// wrong address instead of flowing into the SSE reader, which discards every
+/// non-`data:` line and then blames the model for a truncated stream.
+pub(crate) fn reject_non_api_response(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, ProviderError> {
+    match nomifun_net::api_response::is_non_api_content_type(response.headers()) {
+        Some(content_type) => Err(ProviderError::NonApiResponse {
+            content_type: Some(content_type),
+            message: format!(
+                "HTTP {} — {}",
+                response.status().as_u16(),
+                nomifun_net::api_response::NON_API_DIAGNOSTIC
+            ),
+        }),
+        None => Ok(response),
+    }
+}
+
 /// Send the initial streaming request with bounded transient-failure retry.
 ///
-/// Shared by the API-key-based providers (Anthropic, OpenAI): posts `body`
+/// Shared by the API-key-based providers (Anthropic, OpenAI, Gemini): posts `body`
 /// with `headers`, surfaces 429 as `RateLimited` (honouring `Retry-After`)
 /// and any other non-2xx as `Api`.
 pub(crate) async fn send_initial(
@@ -137,6 +258,7 @@ pub(crate) async fn send_initial(
     url: &str,
     headers: &HeaderMap,
     body: &Value,
+    redactor: &SecretRedactor,
 ) -> Result<reqwest::Response, ProviderError> {
     retry::with_initial_request_retry(|| async {
         let response = client
@@ -145,12 +267,13 @@ pub(crate) async fn send_initial(
             .json(body)
             .send()
             .await?;
+        let response = reject_non_api_response(response)?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
         let retry_after_ms = parse_retry_after_ms(response.headers()).unwrap_or(5000);
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = read_provider_error_body(response, redactor).await;
         if status.as_u16() == 429 {
             return Err(ProviderError::RateLimited {
                 retry_after_ms,
@@ -163,6 +286,68 @@ pub(crate) async fn send_initial(
         })
     })
     .await
+}
+
+/// Read an untrusted non-success response without allowing a provider or proxy
+/// to turn diagnostics into an unbounded allocation. The returned text is
+/// credential-aware and strips every embedded URL query before it can enter a
+/// log, transcript, or frontend error payload.
+pub(crate) async fn read_provider_error_body(
+    response: reqwest::Response,
+    redactor: &SecretRedactor,
+) -> String {
+    use futures::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(MAX_PROVIDER_ERROR_BODY_BYTES.min(1024));
+    let mut truncated = false;
+    let deadline = tokio::time::Instant::now() + PROVIDER_ERROR_BODY_READ_TIMEOUT;
+    loop {
+        let chunk = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(None) => break,
+            Ok(Some(Err(_))) | Err(_) => {
+                truncated = true;
+                break;
+            }
+        };
+        let remaining = MAX_PROVIDER_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() == MAX_PROVIDER_ERROR_BODY_BYTES {
+            // Do not perform one more read merely to distinguish an exactly
+            // full body from a larger or stalled one. The diagnostic marker is
+            // preferable to extending an error path by the idle-read timeout.
+            truncated = true;
+            break;
+        }
+    }
+
+    if truncated {
+        // Exact redaction cannot recognize a credential whose prefix is the
+        // retained buffer tail and whose remainder fell beyond the cap (or a
+        // failed/timed-out body read). Drop only the longest credential-prefix
+        // suffix before decoding; this also covers encoded variants.
+        let safe_boundary = redactor.redaction_safe_truncation_boundary(&body);
+        body.truncate(safe_boundary);
+    }
+    let mut text = redactor.redact(&String::from_utf8_lossy(&body));
+    if text.len() > MAX_PROVIDER_ERROR_BODY_BYTES {
+        let mut boundary = MAX_PROVIDER_ERROR_BODY_BYTES;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+        truncated = true;
+    }
+    if truncated {
+        text.push_str(TRUNCATED_PROVIDER_ERROR_BODY);
+    }
+    text
 }
 
 /// Send the initial streaming request, rotating through the configured API
@@ -181,6 +366,7 @@ pub(crate) async fn send_initial_with_key_rotation(
     provider_label: &'static str,
     build_headers: impl Fn(&str) -> Result<HeaderMap, ProviderError>,
 ) -> Result<(reqwest::Response, HeaderMap), ProviderError> {
+    let redactor = SecretRedactor::new(api_keys);
     let mut last_error = None;
     let key_count = api_keys.len();
     let start_index = current_api_key.load(Ordering::Acquire) % key_count.max(1);
@@ -189,7 +375,7 @@ pub(crate) async fn send_initial_with_key_rotation(
         let index = (start_index + offset) % key_count;
         let api_key = &api_keys[index];
         let headers = build_headers(api_key)?;
-        match send_initial(client, url, &headers, body).await {
+        match send_initial(client, url, &headers, body, &redactor).await {
             Ok(response) => {
                 current_api_key.store(index, Ordering::Release);
                 return Ok((response, headers));
@@ -214,6 +400,56 @@ pub(crate) async fn send_initial_with_key_rotation(
     Err(last_error.unwrap_or_else(|| {
         ProviderError::Connection("No usable API key configured".to_owned())
     }))
+}
+
+struct SecretRedactingProvider {
+    inner: Arc<dyn LlmProvider>,
+    redactor: SecretRedactor,
+}
+
+#[async_trait]
+impl LlmProvider for SecretRedactingProvider {
+    async fn stream(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        let mut source = self
+            .inner
+            .stream(request)
+            .await
+            .map_err(|error| error.redacted(&self.redactor))?;
+        let redactor = self.redactor.clone();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(event) = source.recv().await {
+                let event = match event {
+                    LlmEvent::Error(message) => LlmEvent::Error(redactor.redact(&message)),
+                    other => other,
+                };
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
+}
+
+fn provider_secret_redactor(config: &Config) -> SecretRedactor {
+    let mut secrets = parse_api_keys(&config.api_key);
+    if let Some(bedrock) = &config.bedrock {
+        secrets.extend(
+            [
+                bedrock.access_key_id.as_ref(),
+                bedrock.secret_access_key.as_ref(),
+                bedrock.session_token.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned(),
+        );
+    }
+    SecretRedactor::new(secrets)
 }
 
 /// Parse the completed argument payload of a provider-emitted tool call.
@@ -337,10 +573,9 @@ pub(crate) fn http_client_build_count() -> usize {
 /// converts into `LlmEvent::Error` (surfaced as `Nomi agent error: ...`) instead
 /// of an indefinite hang. The detected proxy is captured at first build; a
 /// runtime proxy change takes effect on the next app start.
-pub(crate) fn http_client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
+pub(crate) fn http_client() -> Result<reqwest::Client, ProviderError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
             #[cfg(test)]
             HTTP_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
 
@@ -349,9 +584,11 @@ pub(crate) fn http_client() -> reqwest::Client {
                 .read_timeout(HTTP_READ_TIMEOUT);
             nomifun_net::proxy::apply_detected_proxy(builder)
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
-        })
-        .clone()
+                .map_err(|error| format!("Failed to build bounded provider HTTP client: {error}"))
+        }) {
+        Ok(client) => Ok(client.clone()),
+        Err(message) => Err(ProviderError::Connection(message.clone())),
+    }
 }
 
 pub(crate) fn non_empty_rate_limit_message(body: String) -> String {
@@ -365,13 +602,19 @@ pub(crate) fn non_empty_rate_limit_message(body: String) -> String {
 /// Create a provider from resolved config
 pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
     let compat = config.compat.clone();
+    let redactor = provider_secret_redactor(config);
 
-    match config.provider {
+    let inner: Arc<dyn LlmProvider> = match config.provider {
         ProviderType::Anthropic => Arc::new(
             anthropic::AnthropicProvider::new(&config.api_key, &config.base_url, compat)
                 .with_cache(config.prompt_caching),
         ),
         ProviderType::OpenAI => Arc::new(openai::OpenAIProvider::new(
+            &config.api_key,
+            &config.base_url,
+            compat,
+        )),
+        ProviderType::Gemini => Arc::new(gemini::GeminiProvider::new(
             &config.api_key,
             &config.base_url,
             compat,
@@ -408,16 +651,243 @@ pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
                 compat,
             ))
         }
-    }
+    };
+    Arc::new(SecretRedactingProvider { inner, redactor })
 }
 
 #[cfg(test)]
 mod retryable_tests {
-    use super::ProviderError;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use nomi_types::llm::{LlmEvent, LlmRequest};
+    use nomifun_net::secret_redaction::SecretRedactor;
+    use tokio::sync::mpsc;
+
+    use super::{
+        read_provider_error_body, LlmProvider, ProviderError, SecretRedactingProvider,
+        MAX_PROVIDER_ERROR_BODY_BYTES, TRUNCATED_PROVIDER_ERROR_BODY,
+    };
     use super::{
         is_api_key_rotation_error, parse_api_keys, parse_retry_after_ms,
         parse_tool_call_arguments, MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES,
     };
+
+    const REFLECTED_SECRET: &str = "sk live/+?=token";
+    const URL_ENCODED_SECRET: &str = "sk%20live%2F%2B%3F%3Dtoken";
+
+    struct ReflectingProvider {
+        initial_error: Option<String>,
+        stream_error: Option<String>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ReflectingProvider {
+        async fn stream(
+            &self,
+            _request: &LlmRequest,
+        ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+            if let Some(message) = &self.initial_error {
+                return Err(ProviderError::Api {
+                    status: 401,
+                    message: message.clone(),
+                });
+            }
+            let (tx, rx) = mpsc::channel(1);
+            if let Some(message) = &self.stream_error {
+                tx.send(LlmEvent::Error(message.clone())).await.unwrap();
+            }
+            drop(tx);
+            Ok(rx)
+        }
+    }
+
+    fn empty_request() -> LlmRequest {
+        LlmRequest {
+            model: "test".to_owned(),
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 1,
+            thinking: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn assert_secret_absent(message: &str) {
+        assert!(!message.contains(REFLECTED_SECRET), "raw secret leaked: {message}");
+        assert!(
+            !message.contains(URL_ENCODED_SECRET),
+            "URL-encoded secret leaked: {message}"
+        );
+        assert!(message.contains("[REDACTED]"), "redaction marker missing: {message}");
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_is_bounded_and_sanitized() {
+        let secret = "gateway-secret";
+        let body = format!(
+            "Post \"https://gateway.test/responses?access_token={secret}\": EOF\n{}",
+            "x".repeat(MAX_PROVIDER_ERROR_BODY_BYTES + 4096)
+        );
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(500)
+                .body(body)
+                .expect("test response"),
+        );
+
+        let sanitized =
+            read_provider_error_body(response, &SecretRedactor::default()).await;
+
+        assert!(!sanitized.contains(secret));
+        assert!(sanitized.contains("https://gateway.test/responses?<redacted>"));
+        assert!(sanitized.ends_with(TRUNCATED_PROVIDER_ERROR_BODY));
+        assert!(
+            sanitized.len()
+                <= MAX_PROVIDER_ERROR_BODY_BYTES + TRUNCATED_PROVIDER_ERROR_BODY.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_provider_body_drops_raw_and_encoded_secret_prefixes_at_the_cap() {
+        let redactor = SecretRedactor::new([REFLECTED_SECRET]);
+        for reflected in [REFLECTED_SECRET, URL_ENCODED_SECRET] {
+            let retained_secret_prefix_len = reflected.len() - 3;
+            let padding_len = MAX_PROVIDER_ERROR_BODY_BYTES - retained_secret_prefix_len;
+            let body = format!("{}{}", "x".repeat(padding_len), reflected);
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(500)
+                    .body(body)
+                    .expect("test response"),
+            );
+
+            let sanitized = read_provider_error_body(response, &redactor).await;
+
+            assert_eq!(
+                sanitized,
+                format!("{}{}", "x".repeat(padding_len), TRUNCATED_PROVIDER_ERROR_BODY),
+                "a credential prefix crossing the byte cap must be removed: {reflected}"
+            );
+            assert!(
+                sanitized.len()
+                    <= MAX_PROVIDER_ERROR_BODY_BYTES + TRUNCATED_PROVIDER_ERROR_BODY.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_provider_body_keeps_an_unrelated_plain_tail() {
+        let ordinary_tail = "ordinary diagnostic tail";
+        let padding_len = MAX_PROVIDER_ERROR_BODY_BYTES - ordinary_tail.len();
+        let body = format!(
+            "{}{}overflow beyond cap",
+            "x".repeat(padding_len),
+            ordinary_tail
+        );
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(500)
+                .body(body)
+                .expect("test response"),
+        );
+
+        let sanitized = read_provider_error_body(
+            response,
+            &SecretRedactor::new(["gateway-secret"]),
+        )
+        .await;
+
+        assert!(sanitized.ends_with(&format!(
+            "{ordinary_tail}{TRUNCATED_PROVIDER_ERROR_BODY}"
+        )));
+        assert_eq!(
+            sanitized.len(),
+            MAX_PROVIDER_ERROR_BODY_BYTES + TRUNCATED_PROVIDER_ERROR_BODY.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_marker_expansion_still_respects_the_diagnostic_cap() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(500)
+                .body("x".repeat(MAX_PROVIDER_ERROR_BODY_BYTES + 1))
+                .expect("test response"),
+        );
+
+        let sanitized =
+            read_provider_error_body(response, &SecretRedactor::new(["x"])).await;
+
+        assert!(!sanitized.contains('x'));
+        assert!(sanitized.ends_with(TRUNCATED_PROVIDER_ERROR_BODY));
+        assert_eq!(
+            sanitized.len(),
+            MAX_PROVIDER_ERROR_BODY_BYTES + TRUNCATED_PROVIDER_ERROR_BODY.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn small_provider_error_body_is_not_marked_truncated() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(500)
+                .body("upstream EOF".to_owned())
+                .expect("test response"),
+        );
+
+        let body = read_provider_error_body(response, &SecretRedactor::default()).await;
+
+        assert_eq!(body, "upstream EOF");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_provider_error_body_has_its_own_short_deadline() {
+        let stalled = futures::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(500)
+                .body(reqwest::Body::wrap_stream(stalled))
+                .expect("test response"),
+        );
+
+        let body = read_provider_error_body(response, &SecretRedactor::default()).await;
+
+        assert_eq!(body, TRUNCATED_PROVIDER_ERROR_BODY);
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_redacts_reflected_secrets_from_errors_and_stream_events() {
+        let redactor = SecretRedactor::new([REFLECTED_SECRET]);
+        let initial = SecretRedactingProvider {
+            inner: Arc::new(ReflectingProvider {
+                initial_error: Some(format!(
+                    "upstream echoed raw={REFLECTED_SECRET} encoded={URL_ENCODED_SECRET}"
+                )),
+                stream_error: None,
+            }),
+            redactor: redactor.clone(),
+        };
+        let error = initial.stream(&empty_request()).await.unwrap_err();
+        assert_secret_absent(&error.to_string());
+
+        let streaming = SecretRedactingProvider {
+            inner: Arc::new(ReflectingProvider {
+                initial_error: None,
+                stream_error: Some(format!(
+                    "upstream echoed raw={REFLECTED_SECRET} encoded={URL_ENCODED_SECRET}"
+                )),
+            }),
+            redactor,
+        };
+        let mut events = streaming.stream(&empty_request()).await.unwrap();
+        let event = events.recv().await.expect("reflected stream error event");
+        let LlmEvent::Error(message) = event else {
+            panic!("expected stream error event");
+        };
+        assert_secret_absent(&message);
+    }
 
     #[test]
     fn parse_retry_after_seconds_clamped() {
@@ -462,6 +932,7 @@ mod retryable_tests {
             .is_retryable()
         );
         assert!(ProviderError::Connection("x".to_string()).is_retryable());
+        assert!(ProviderError::StreamTruncated("x".to_string()).is_retryable());
         assert!(!ProviderError::PromptTooLong("x".to_string()).is_retryable());
         assert!(!ProviderError::Parse("x".to_string()).is_retryable());
     }

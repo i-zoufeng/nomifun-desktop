@@ -1,16 +1,9 @@
-pub mod acp_assembler;
 #[cfg(feature = "browser-use")]
 pub mod browser_lane;
 pub mod provider_config;
 
-mod acp;
-pub(crate) mod construction_guard;
 mod context;
-mod nanobot;
 pub(crate) mod nomi;
-pub(crate) mod platform_table;
-mod openclaw;
-mod remote;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,21 +11,16 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use nomi_agent::companion_tools::{CompanionMemorySink, CompanionSkillSink};
 use nomi_agent::requirement_tools::RequirementSink;
-use nomifun_api_types::{
-    BrowserMcpConfig, ComputerMcpConfig, GatewayMcpConfig, OpenMcpConfig, RequirementMcpConfig,
-};
-use nomifun_common::{AgentType, AppError, ExecutionAuthority};
-use nomifun_db::{
-    IClientPreferenceRepository, IMcpServerRepository, IProviderRepository, IRemoteAgentRepository,
-    ISettingsRepository,
-};
+use nomifun_api_types::{GatewayMcpConfig, ModelTask};
+use nomifun_common::{AppError, ExecutionAuthority};
+use nomifun_db::{IClientPreferenceRepository, IMcpServerRepository, ISettingsRepository};
+use nomifun_model_invoke::{ModelInvokeService, ModelRef};
 
 use crate::runtime_handle::AgentRuntimeHandle;
-use crate::capability::skill_manager::AcpSkillManager;
 use crate::factory::context::FactoryContext;
-use crate::persistence::AcpSessionSyncService;
-use crate::registry::AgentRegistry;
-use crate::runtime_registry::AgentRuntimeFactory;
+use crate::runtime_registry::{
+    AgentRuntimeFactory, AgentRuntimeModelConfigResolver, RuntimeModelConfigBinding,
+};
 use crate::types::AgentRuntimeBuildOptions;
 
 /// Builds the persona system prompt for companion-companion conversations that do
@@ -107,15 +95,14 @@ pub struct AgentFactoryDeps {
     /// compares the persisted Conversation owner id against this immutable id
     /// before injecting host-wide MCP bridges or native singleton-domain tools.
     pub authoritative_user_id: Arc<str>,
-    pub skill_manager: Arc<AcpSkillManager>,
-    pub remote_agent_repo: Arc<dyn IRemoteAgentRepository>,
-    pub provider_repo: Arc<dyn IProviderRepository>,
-    /// Authoritative per-model rows (protocol/context-limit overrides for the
-    /// selected model live here since migration 016).
-    pub provider_model_repo: Arc<dyn nomifun_db::IProviderModelRepository>,
+    /// Single task-capability and connection resolver used by every Nomi Chat
+    /// build and by native image generation.
+    pub model_invoke: Arc<ModelInvokeService>,
+    /// Native image generation uses the same process-wide invoke service as
+    /// chat when this capability is enabled. `None` is reserved for
+    /// lightweight tests and standalone hosts that must not expose the tool.
+    pub model_invoke_service: Option<Arc<ModelInvokeService>>,
     pub encryption_key: [u8; 32],
-    pub agent_registry: Arc<AgentRegistry>,
-    pub acp_agent_service: Arc<AcpSessionSyncService>,
     pub data_dir: PathBuf,
     /// Root for auto-provisioned managed workspaces
     /// (`{work_dir}/conversations/{uuidv7}`). Defaults to the data
@@ -124,44 +111,10 @@ pub struct AgentFactoryDeps {
     /// which provisions under `AppConfig.work_dir` — a `--work-dir` /
     /// `NOMIFUN_WORK_DIR` override must not split the two roots.
     pub work_dir: PathBuf,
-    /// Absolute path to the backend binary, reused as the `command` of stdio MCP
-    /// bridges injected into ACP `session/new`.
-    /// Captured once at app startup (`std::env::current_exe()`).
-    pub backend_binary_path: Arc<PathBuf>,
-    /// Requirement MCP server config. When `Some`, injected into ACP agent
-    /// sessions so the agent gets the `requirement_complete` /
-    /// `requirement_update_status` declaration tools — the ACP soft-failure fix
-    /// (a clean turn with no declaration becomes `needs_review`, not silent
-    /// `done`). `None` when the requirement MCP server failed to start.
-    pub requirement_mcp_config: Option<RequirementMcpConfig>,
-    /// Wiring for the scoped knowledge-search MCP. Injected into ACP sessions
-    /// ONLY when they have bound knowledge bases (`!knowledge_mounts.is_empty()`).
-    /// Its token reaches only the knowledge_search server, never the platform
-    /// gateway. `None` disables ACP knowledge_search.
-    pub knowledge_mcp_config: Option<nomifun_api_types::KnowledgeMcpConfig>,
     /// Platform Gateway MCP server config. When `Some`, the factory injects it
     /// only after resolving installation-owner authority. `None` when the
     /// gateway server failed to start (graceful degradation).
     pub gateway_mcp_config: Option<GatewayMcpConfig>,
-    /// Reliable-launch (`open`) MCP server config. When `Some`, injected
-    /// UNCONDITIONALLY into every ACP session so the agent gets the `open` tool
-    /// (ShellExecute a URL/file/app) instead of fragile `cmd /c start` shell
-    /// commands. Populated on Windows only — `None` on macOS/Linux (which launch
-    /// reliably already) and so never injected there.
-    pub open_mcp_config: Option<OpenMcpConfig>,
-    /// Computer-use discrete-tool MCP server config. When `Some`, injected
-    /// UNCONDITIONALLY into every ACP session so the agent gets discrete desktop
-    /// tools (snapshot / click / type / launch / …). Populated on Windows only and
-    /// only when the host binary has the `computer-use` feature — `None`
-    /// otherwise, and so never injected there.
-    pub computer_mcp_config: Option<ComputerMcpConfig>,
-    /// Browser-use discrete-tool MCP server config. When `Some`, injected
-    /// UNCONDITIONALLY into every ACP session so the agent gets discrete browser
-    /// tools (navigate / observe / click / type / …). Populated on every desktop
-    /// OS only when the host binary has the `browser-use` feature — `None`
-    /// otherwise (web/headless), and so never injected there. Symmetric with
-    /// `computer_mcp_config`.
-    pub browser_mcp_config: Option<BrowserMcpConfig>,
     /// Late-wired issuer for native Browser Platform capabilities.
     ///
     /// `Some(slot)` means this host requires the process-wide Hub path. If the
@@ -176,16 +129,14 @@ pub struct AgentFactoryDeps {
     /// Read live per session so toggling the setting affects new sessions without
     /// a restart.
     pub client_prefs: Option<Arc<dyn IClientPreferenceRepository>>,
-    /// System-settings repo for reading the app UI language at session-build
-    /// time. Companion-owned sessions (local 桌面伙伴 chat + IM Channel Agent)
-    /// get a reply-language directive built from `SystemSettings.language` so the
-    /// companion answers in the app's language instead of a hardcoded one.
-    /// `Option` so tests can omit it (then the "en-US" default applies). Read live
-    /// per build (mirrors `client_prefs`) so switching the language takes effect on
-    /// the next agent (re)build.
+    /// System-settings repo for localized deterministic native messages (for
+    /// example image-generation acknowledgements). Agent reasoning and replies
+    /// follow the language of each current user request instead of this UI
+    /// setting. `Option` lets tests omit the repository and use the host/default
+    /// locale.
     pub settings_repo: Option<Arc<dyn ISettingsRepository>>,
-    /// User-configured MCP servers repository. Used by ACP factory to
-    /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
+    /// User-configured MCP servers repository. Used by the nomi factory to
+    /// inject enabled servers into the session's MCP client set.
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
     /// Optional sink enabling nomi native requirement tools. When `Some`,
@@ -237,15 +188,45 @@ pub struct AgentFactoryDeps {
 ///
 /// [`AgentRuntimeFactory`] is async: the returned `BoxFuture` is driven by
 /// [`crate::runtime_registry::AgentRuntimeRegistry::get_or_create_runtime`] on whatever
-/// runtime is currently polling it. This lets us spawn CLI processes and
-/// await ACP handshakes directly, without the scoped-thread + `block_on`
-/// bridge the old sync-factory version needed.
+/// runtime is currently polling it. This lets construction await IO directly,
+/// without the scoped-thread + `block_on` bridge the old sync-factory version
+/// needed.
 pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentRuntimeFactory {
     let deps = Arc::new(deps);
 
     Arc::new(move |options: AgentRuntimeBuildOptions| {
         let deps = deps.clone();
         async move { build_agent(deps, options).await }.boxed()
+    })
+}
+
+/// Build the exact provider-configuration revision resolver used to fence
+/// long-lived Nomi runtime reuse. It intentionally reuses ModelInvoke's Chat
+/// resolver so runtime admission and the factory consume one capability graph.
+pub fn build_agent_model_config_resolver(
+    model_invoke: Arc<ModelInvokeService>,
+) -> AgentRuntimeModelConfigResolver {
+    Arc::new(move |selection| {
+        let model_invoke = Arc::clone(&model_invoke);
+        async move {
+            let model = selection.use_model.unwrap_or(selection.model);
+            let resolved = model_invoke
+                .resolve_task_config(
+                    &ModelRef {
+                        provider_id: selection.provider_id,
+                        model,
+                    },
+                    ModelTask::Chat,
+                )
+                .await
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            Ok(RuntimeModelConfigBinding {
+                provider_id: resolved.provider_id,
+                model: resolved.model,
+                config_revision: resolved.config_revision,
+            })
+        }
+        .boxed()
     })
 }
 
@@ -265,26 +246,11 @@ async fn build_agent(
         deps.authoritative_user_id.as_ref(),
     );
 
-    // External ACP/OpenClaw/Nanobot/Remote runtimes execute arbitrary code as
-    // the backend OS user.  Without an OS/container sandbox they can never be
-    // made safe by hiding individual tools, so model-only principals are
-    // rejected at the single factory boundary.  Nomi remains available under
-    // the model-only ceiling applied in its factory.
-    if !authority.controls_host() && options.agent_type != AgentType::Nomi {
-        return Err(AppError::Forbidden(format!(
-            "Agent runtime '{}' requires the installation owner; non-owner sessions are model-only",
-            options.agent_type.serde_name()
-        )));
-    }
-
+    // Nomi is the only executor, and it is safe for a model-only principal:
+    // its own factory applies the model-only capability ceiling. There is no
+    // longer a host-code-executing engine to reject at this boundary.
     let ctx = FactoryContext::resolve(&deps, &options).await?;
-    match options.agent_type {
-        AgentType::Acp => acp::build(deps, options, ctx).await,
-        AgentType::OpenclawGateway => openclaw::build(deps, options, ctx).await,
-        AgentType::Nanobot => nanobot::build(deps, options, ctx).await,
-        AgentType::Remote => remote::build(deps, options, ctx).await,
-        AgentType::Nomi => nomi::build(deps, options, ctx, authority).await,
-    }
+    nomi::build(deps, options, ctx, authority).await
 }
 
 #[cfg(test)]

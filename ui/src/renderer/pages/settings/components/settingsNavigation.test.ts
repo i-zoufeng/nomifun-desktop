@@ -14,20 +14,21 @@ describe('settings navigation', () => {
     const siderSource = readSource(new URL('./SettingsSider.tsx', import.meta.url));
     const pageWrapperSource = readSource(new URL('./SettingsPageWrapper.tsx', import.meta.url));
 
-    for (const id of ['system', 'execution-engines', 'browser-use', 'computer-use', 'about']) {
+    for (const id of ['system', 'execution-engines', 'computer-use', 'about']) {
       expect(siderSource.includes(`'${id}'`)).toBe(true);
       expect(pageWrapperSource.includes(`id: '${id}'`)).toBe(true);
     }
 
+    expect(siderSource.includes("'browser-use'")).toBe(false);
+    expect(pageWrapperSource.includes("id: 'browser-use'")).toBe(false);
     expect(siderSource.indexOf("'system'")).toBeLessThan(siderSource.indexOf("'execution-engines'"));
-    expect(siderSource.indexOf("'execution-engines'")).toBeLessThan(siderSource.indexOf("'browser-use'"));
-    expect(siderSource.indexOf("'browser-use'")).toBeLessThan(siderSource.indexOf("'computer-use'"));
+    expect(siderSource.indexOf("'execution-engines'")).toBeLessThan(siderSource.indexOf("'computer-use'"));
     expect(siderSource.indexOf("'computer-use'")).toBeLessThan(siderSource.indexOf("'about'"));
   });
 
   test('routes execution engines directly and keeps legacy links compatible', () => {
     const routerSource = readSource(new URL('../../../components/layout/Router.tsx', import.meta.url));
-    const engineTabsSource = readSource(
+    const engineContentSource = readSource(
       new URL('../../../components/settings/SettingsModal/contents/AgentModalContent.tsx', import.meta.url)
     );
 
@@ -36,11 +37,18 @@ describe('settings navigation', () => {
     }
 
     expect(routerSource.includes("import('@renderer/pages/settings/AgentSettings')")).toBe(true);
-    expect(routerSource.includes("to='/settings/execution-engines?tab=runtime'")).toBe(true);
+    expect(routerSource.includes("to='/settings/execution-engines'")).toBe(true);
     expect(routerSource.includes("to='/models?section=agents'")).toBe(false);
-    expect(engineTabsSource.includes("key='runtime'")).toBe(true);
-    expect(engineTabsSource.includes('<AgentRuntimeSettingsContent />')).toBe(true);
-    expect(routerSource.includes("path='/settings/browser-use' element={<Navigate to='/settings/system'")).toBe(false);
+    // One engine means one surface: no tab strip, and no separate runtime
+    // timeout panel.
+    expect(engineContentSource.includes('Tabs')).toBe(false);
+    expect(engineContentSource.includes('AgentRuntimeSettingsContent')).toBe(false);
+    expect(engineContentSource.includes('<LocalAgents />')).toBe(true);
+    expect(
+      routerSource.includes(
+        "path='/settings/browser-use' element={<Navigate to='/browser?tab=settings' replace />}"
+      )
+    ).toBe(true);
     expect(routerSource.includes("path='/settings/computer-use' element={<Navigate to='/settings/system'")).toBe(false);
   });
 });

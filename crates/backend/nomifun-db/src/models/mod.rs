@@ -1,4 +1,3 @@
-mod acp_session;
 mod agent_metadata;
 mod agent_execution;
 mod agent_execution_template;
@@ -21,7 +20,6 @@ mod provider;
 mod provider_connection;
 mod provider_model;
 mod preset;
-mod remote_agent;
 mod requirement;
 mod skill_tag;
 mod ssh_host;
@@ -33,16 +31,20 @@ mod user;
 mod webhook;
 mod workshop;
 
-pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
 pub use agent_execution::*;
 pub use agent_execution_template::*;
 pub use attachment::AttachmentRow;
 pub use channel::{
+    CHANNEL_CHAT_KIND_DIRECT, CHANNEL_CHAT_KIND_GROUP, CHANNEL_CHAT_KIND_UNKNOWN,
+    CHANNEL_GROUP_ACCESS_MODE_ALL_MEMBERS, CHANNEL_GROUP_ACCESS_MODE_ALLOWLIST,
+    CHANNEL_GROUP_ACCESS_MODE_DISABLED,
     CHANNEL_OWNER_DOMAIN_COMPANION, CHANNEL_OWNER_DOMAIN_CUSTOMER_SERVICE,
+    CHANNEL_USER_AUTHORIZATION_APPROVED, CHANNEL_USER_AUTHORIZATION_AUTO_GROUP,
     ChannelInboundReceiptRow, ChannelPairingCodeRow, ChannelPendingPromptRow, ChannelPluginRow,
     ChannelSessionRow, ChannelUserRow, NewChannelInboundReceiptRow, NewChannelPairingCodeRow,
     NewChannelPendingPromptRow, NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow,
+    default_channel_chat_kind, default_channel_user_authorization_kind, default_group_access_mode,
     default_owner_domain,
 };
 pub use client_preference::ClientPreference;
@@ -68,9 +70,10 @@ pub use miniapp::{MiniAppDocumentRow, MiniAppRow};
 pub use oauth_token::OAuthTokenRow;
 pub use provider::Provider;
 pub use provider_connection::{ProviderConnectionRow, UpsertProviderConnectionParams};
-pub use provider_model::{NewProviderModel, ProviderModelRow, ProviderModelUpdate};
+pub use provider_model::{
+    NewProviderModel, NewProviderModelCapability, ProviderModelCapabilityRow, ProviderModelRow,
+};
 pub use preset::*;
-pub use remote_agent::RemoteAgentRow;
 pub use requirement::{NewRequirementRow, RequirementRow, RequirementRowUpdate, RequirementTagRow};
 pub use skill_tag::{SkillTagRow, UpsertSkillTagParams};
 pub use ssh_host::SshHostRow;

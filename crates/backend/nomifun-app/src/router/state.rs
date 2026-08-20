@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nomifun_ai_agent::{
-    AgentRouterState, AgentRuntimeRegistry, AgentService, RemoteAgentRouterState,
-    RemoteAgentService,
+    AgentRouterState, AgentRuntimeRegistry, AgentService,
 };
 use nomifun_api_types::TerminalExitEvent;
 use nomifun_preset::{BuiltinPresetRegistry, PresetRouterState, PresetService};
@@ -20,14 +19,14 @@ use nomifun_conversation::service::QuiescentOrphanReconciliation;
 use nomifun_conversation::{ConversationRouterState, ConversationService};
 use nomifun_cron::{CronEventEmitter, CronRouterState};
 use nomifun_db::{
-    IAcpSessionRepository, IAgentExecutionRepository, IAgentExecutionTemplateRepository,
+    IAgentExecutionRepository, IAgentExecutionTemplateRepository,
     IAgentMetadataRepository,
     IIdmmInterventionRepository, IPresetRepository, IPresetStateRepository, IPresetTagRepository,
-    IProviderRepository, SqliteAcpSessionRepository, SqliteAgentExecutionRepository,
+    IProviderRepository, SqliteAgentExecutionRepository,
     SqliteAgentExecutionTemplateRepository,
     SqliteAgentMetadataRepository, SqlitePresetRepository, SqlitePresetStateRepository,
     SqlitePresetTagRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteIdmmInterventionRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteIdmmInterventionRepository, SqliteProviderRepository, SqliteSettingsRepository,
     MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE,
 };
 use nomifun_extension::{
@@ -45,7 +44,7 @@ use nomifun_mcp::{
 };
 use nomifun_office::{
     OfficeRouterState, OfficecliWatchManager, ProxyService,
-    SnapshotService as OfficeSnapshotService, StarOfficeDetector,
+    SnapshotService as OfficeSnapshotService,
 };
 use nomifun_agent_execution::{AgentExecutionEngine, AgentExecutionEngineConfig};
 use nomifun_companion::CompanionRouterState;
@@ -55,7 +54,7 @@ use nomifun_realtime::WsHandlerState;
 use nomifun_requirement::RequirementRouterState;
 use nomifun_shell::ShellRouterState;
 use nomifun_system::{
-    ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService, ProtocolDetectionService,
+    ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService,
     ProviderService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use nomifun_terminal::TerminalRouterState;
@@ -70,7 +69,6 @@ use crate::services::AppServices;
 pub struct ModuleStates {
     pub system: SystemRouterState,
     pub conversation: ConversationRouterState,
-    pub remote_agent: RemoteAgentRouterState,
     pub ssh_host: nomifun_ssh::SshHostRouterState,
     pub agent: AgentRouterState,
 
@@ -526,14 +524,8 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     let (channel_state, channel_components) = build_channel_state(services, ext_state.registry.clone()).await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
-    let pool = services.database.pool().clone();
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool));
-    let encryption_key = services.encryption_key;
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
-        provider_repo,
-        services.provider_model_repo.clone(),
-        encryption_key,
         services.data_dir.clone(),
         services.model_invoke_service.clone(),
     );
@@ -561,7 +553,6 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     let states = ModuleStates {
         system: build_system_state(services),
         conversation,
-        remote_agent: build_remote_agent_state(services),
         ssh_host: build_ssh_host_state(services),
         agent: AgentRouterState {
             agent_registry: services.agent_registry.clone(),
@@ -621,7 +612,9 @@ pub fn build_preset_state(services: &AppServices, extension_registry: ExtensionR
     let provider_repo: Arc<dyn IProviderRepository> =
         Arc::new(SqliteProviderRepository::new(pool.clone()));
     let provider_model_repo: Arc<dyn nomifun_db::IProviderModelRepository> =
-        Arc::new(nomifun_db::SqliteProviderModelRepository::new(pool));
+        Arc::new(nomifun_db::SqliteProviderModelRepository::new(pool.clone()));
+    let provider_model_capability_repo: Arc<dyn nomifun_db::IProviderModelCapabilityRepository> =
+        Arc::new(nomifun_db::SqliteProviderModelCapabilityRepository::new(pool));
     let builtin = Arc::new(BuiltinPresetRegistry::load());
     let service = Arc::new(PresetService::new(
         repo,
@@ -630,6 +623,7 @@ pub fn build_preset_state(services: &AppServices, extension_registry: ExtensionR
         agent_repo,
         provider_repo,
         provider_model_repo,
+        provider_model_capability_repo,
         builtin,
         extension_registry,
         services.data_dir.clone(),
@@ -642,6 +636,13 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let encryption_key = services.encryption_key;
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let provider_model_repo = services.provider_model_repo.clone();
+    let capability_repo = Arc::new(
+        nomifun_db::SqliteProviderModelCapabilityRepository::new(pool.clone()),
+    );
+    let connection_repo = Arc::new(
+        nomifun_db::SqliteProviderConnectionRepository::new(pool.clone()),
+    );
 
     // Cross-subsystem provider-deletion guard: aggregate every hard binding
     // (companion, public Agent, active Agent Execution) and strip soft
@@ -665,25 +666,26 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool.clone()))),
         provider_service: ProviderService::new(
             provider_repo.clone(),
-            Arc::new(nomifun_db::SqliteProviderModelRepository::new(pool.clone())),
+            provider_model_repo.clone(),
+            capability_repo.clone(),
+            connection_repo.clone(),
             encryption_key,
         )
         .with_deletion_coordinator(deletion_coordinator),
         provider_connection_service: nomifun_system::ProviderConnectionService::new(
-            Arc::new(nomifun_db::SqliteProviderConnectionRepository::new(pool.clone())),
+            connection_repo.clone(),
             provider_repo.clone(),
+            capability_repo.clone(),
             encryption_key,
         ),
-        model_fetch_service: ModelFetchService::new_dynamic(provider_repo, encryption_key),
-        model_profile_service: nomifun_system::ModelProfileService::new(
-            services.provider_model_repo.clone(),
-        ),
+        model_fetch_service: ModelFetchService::new_dynamic(provider_repo.clone(), encryption_key),
         provider_model_service: nomifun_system::ProviderModelService::new(
-            services.provider_model_repo.clone(),
-            Arc::new(SqliteProviderRepository::new(pool.clone())),
+            provider_model_repo,
+            capability_repo,
+            provider_repo,
+            connection_repo,
         ),
         managed_model_service: Some(services.managed_model_service.clone()),
-        protocol_detection_service: ProtocolDetectionService::new_dynamic(),
         version_check_service: VersionCheckService::new_dynamic(env!("CARGO_PKG_VERSION").to_owned()),
         data_dir: services.data_dir.clone(),
         work_dir: services.work_dir.clone(),
@@ -700,7 +702,6 @@ pub fn build_conversation_state(
     let conversaion_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let skill_resolver = Arc::new(nomifun_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
     ));
@@ -712,7 +713,6 @@ pub fn build_conversation_state(
         services.agent_runtime_registry.clone(),
         conversaion_repo,
         agent_metadata_repo,
-        acp_session_repo,
         services.execution_conversation_boundary.clone(),
     )
     .with_runtime_state(services.conversation_runtime_state.clone());
@@ -725,6 +725,7 @@ pub fn build_conversation_state(
     conversation_service.with_failover_deps(
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         Arc::new(nomifun_db::SqliteProviderModelRepository::new(services.database.pool().clone())),
+        services.provider_model_capability_repo.clone(),
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone())),
     );
     // Drop the conversation's knowledge binding when the conversation goes away.
@@ -776,16 +777,6 @@ pub fn build_conversation_state(
     ConversationRouterState {
         service: conversation_service,
         runtime_registry: services.agent_runtime_registry.clone(),
-    }
-}
-
-/// Build the default `RemoteAgentRouterState` from application services.
-pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterState {
-    let encryption_key = services.encryption_key;
-    let pool = services.database.pool().clone();
-    let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
-    RemoteAgentRouterState {
-        service: Arc::new(RemoteAgentService::new(repo, encryption_key)),
     }
 }
 
@@ -990,12 +981,16 @@ pub async fn build_channel_state(
         encryption_key,
         message_tx,
     ));
+    let group_policy_fence = manager.group_policy_fence();
 
-    let pairing_service = Arc::new(nomifun_channel::pairing::PairingService::new(
-        repo.clone(),
-        services.event_bus.clone(),
-        owner_user_id.clone(),
-    ));
+    let pairing_service = Arc::new(
+        nomifun_channel::pairing::PairingService::new(
+            repo.clone(),
+            services.event_bus.clone(),
+            owner_user_id.clone(),
+        )
+        .with_group_policy_fence(Arc::clone(&group_policy_fence)),
+    );
 
     // Expired pairing codes are purged only by this background sweep —the
     // timer existed but had no caller, so stale codes lingered in the DB
@@ -1055,9 +1050,6 @@ pub async fn build_channel_state(
     let agent_metadata_repo: Arc<dyn nomifun_db::IAgentMetadataRepository> = Arc::new(
         nomifun_db::SqliteAgentMetadataRepository::new(services.database.pool().clone()),
     );
-    let acp_session_repo: Arc<dyn nomifun_db::IAcpSessionRepository> = Arc::new(
-        nomifun_db::SqliteAcpSessionRepository::new(services.database.pool().clone()),
-    );
     let conversation_svc = Arc::new(
         ConversationService::new(
             services.authoritative_user_id.clone(),
@@ -1067,7 +1059,6 @@ pub async fn build_channel_state(
             services.agent_runtime_registry.clone(),
             conv_repo,
             agent_metadata_repo,
-            acp_session_repo,
             services.execution_conversation_boundary.clone(),
         )
         .with_runtime_state(services.conversation_runtime_state.clone()),
@@ -1086,6 +1077,7 @@ pub async fn build_channel_state(
     conversation_svc.with_failover_deps(
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         Arc::new(nomifun_db::SqliteProviderModelRepository::new(services.database.pool().clone())),
+        services.provider_model_capability_repo.clone(),
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone())),
     );
     if let Some(hook) = services.runtime_registry_delete_hook.clone() {
@@ -1144,7 +1136,8 @@ pub async fn build_channel_state(
         Arc::clone(&message_service),
         Arc::clone(&session_manager),
         manager.clone() as Arc<dyn nomifun_channel::stream_relay::ChannelSender>,
-    );
+    )
+    .with_group_policy_fence(group_policy_fence);
 
     let state = ChannelRouterState {
         manager: Arc::clone(&manager),
@@ -1260,7 +1253,6 @@ pub fn build_requirement_state(services: &AppServices) -> (RequirementRouterStat
         Arc::new(SqliteConversationRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let skill_resolver = Arc::new(nomifun_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
     ));
@@ -1272,7 +1264,6 @@ pub fn build_requirement_state(services: &AppServices) -> (RequirementRouterStat
         services.agent_runtime_registry.clone(),
         conv_repo.clone(),
         agent_metadata_repo,
-        acp_session_repo,
         services.execution_conversation_boundary.clone(),
     )
     .with_runtime_state(services.conversation_runtime_state.clone());
@@ -1287,6 +1278,7 @@ pub fn build_requirement_state(services: &AppServices) -> (RequirementRouterStat
     conv_service.with_failover_deps(
         Arc::new(SqliteProviderRepository::new(pool.clone())),
         Arc::new(nomifun_db::SqliteProviderModelRepository::new(pool.clone())),
+        services.provider_model_capability_repo.clone(),
         Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
     );
 
@@ -1418,11 +1410,12 @@ pub fn build_agent_execution_engine(
         template_repository,
         provider_repository,
         provider_model_repository,
+        provider_model_capability_repository: services.provider_model_capability_repo.clone(),
         preset_service,
         realtime: services.ws_manager.clone(),
         conversation,
         runtime_registry: services.agent_runtime_registry.clone(),
-        encryption_key: services.encryption_key,
+        model_invoke: services.model_invoke_service.clone(),
         workspace_root: services.work_dir.clone(),
     }));
     {
@@ -1439,8 +1432,7 @@ pub fn build_agent_execution_engine(
 /// Build the `IdmmRouterState` (the IDMM supervisor manager + service). Shares
 /// the caller's `ConversationService` / conversation repo / terminal driver so
 /// IDMM supervises the same live sessions AutoWork + the UI drive. Constructs a
-/// fresh provider repo from the pool, while reusing the process-wide persistent
-/// data-encryption key from [`AppServices`].
+/// the process-wide model invoke resolver from [`AppServices`].
 pub fn build_idmm_state(
     services: &AppServices,
     conv_service: ConversationService,
@@ -1448,16 +1440,12 @@ pub fn build_idmm_state(
     terminal_driver: Arc<dyn nomifun_terminal::TerminalDriver>,
 ) -> IdmmRouterState {
     let pool = services.database.pool().clone();
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let records: Arc<dyn IIdmmInterventionRepository> = Arc::new(SqliteIdmmInterventionRepository::new(pool));
-    let encryption_key = services.encryption_key;
 
     // The sidecar's one-shot completions run against a backup provider; use the
     // data dir as the (unused-for-supervision) workspace root.
     let completer: Arc<dyn nomifun_idmm::Completer> = Arc::new(nomifun_idmm::LiveCompleter {
-        provider_repo,
-        provider_model_repo: services.provider_model_repo.clone(),
-        encryption_key,
+        model_invoke: services.model_invoke_service.clone(),
         workspace: services.data_dir.clone(),
     });
     let sidecar = Arc::new(nomifun_idmm::SidecarClient::new(completer));
@@ -1534,7 +1522,6 @@ pub fn build_companion_state(
         Arc::new(SqliteConversationRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let skill_resolver = Arc::new(nomifun_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
     ));
@@ -1546,7 +1533,6 @@ pub fn build_companion_state(
         services.agent_runtime_registry.clone(),
         conv_repo,
         agent_metadata_repo,
-        acp_session_repo,
         services.execution_conversation_boundary.clone(),
     )
     .with_runtime_state(services.conversation_runtime_state.clone());
@@ -1562,6 +1548,7 @@ pub fn build_companion_state(
     conv_service.with_failover_deps(
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         Arc::new(nomifun_db::SqliteProviderModelRepository::new(services.database.pool().clone())),
+        services.provider_model_capability_repo.clone(),
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone())),
     );
     if let Some(hook) = services.runtime_registry_delete_hook.clone() {
@@ -2010,7 +1997,6 @@ pub fn build_cron_state(
         Arc::new(SqliteConversationRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let skill_resolver = Arc::new(nomifun_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
     ));
@@ -2022,7 +2008,6 @@ pub fn build_cron_state(
         services.agent_runtime_registry.clone(),
         conv_repo.clone(),
         agent_metadata_repo,
-        acp_session_repo,
         services.execution_conversation_boundary.clone(),
     )
     .with_runtime_state(services.conversation_runtime_state.clone());
@@ -2037,6 +2022,7 @@ pub fn build_cron_state(
     conv_service.with_failover_deps(
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         Arc::new(nomifun_db::SqliteProviderModelRepository::new(services.database.pool().clone())),
+        services.provider_model_capability_repo.clone(),
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone())),
     );
 
@@ -2106,13 +2092,11 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));
 
     let snapshot_service = Arc::new(OfficeSnapshotService::new(data_dir));
-    let star_office_detector = Arc::new(StarOfficeDetector::local());
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
 
     OfficeRouterState {
         watch_manager,
         snapshot_service,
-        star_office_detector,
         proxy_service,
         allowed_roots,
     }
@@ -2124,7 +2108,13 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
     let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     let client_pref_service = ClientPrefService::new(client_pref_repo);
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let provider_model_repo = Arc::new(nomifun_db::SqliteProviderModelRepository::new(pool));
+    let provider_model_repo = Arc::new(nomifun_db::SqliteProviderModelRepository::new(pool.clone()));
+    let capability_repo = Arc::new(
+        nomifun_db::SqliteProviderModelCapabilityRepository::new(pool.clone()),
+    );
+    let connection_repo = Arc::new(
+        nomifun_db::SqliteProviderConnectionRepository::new(pool),
+    );
 
     ShellRouterState {
         shell_service: Arc::new(nomifun_shell::ShellService::new(Arc::new(
@@ -2137,6 +2127,8 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
         provider_service: Some(ProviderService::new(
             provider_repo,
             provider_model_repo,
+            capability_repo,
+            connection_repo,
             services.encryption_key,
         )),
         // The process-wide invoke singleton (assembled in AppServices next to

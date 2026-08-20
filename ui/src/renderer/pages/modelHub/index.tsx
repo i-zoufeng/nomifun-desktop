@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import { Navigate, useSearchParams } from 'react-router-dom';
 import classNames from 'classnames';
 import {
+  BroadcastRadio,
   Comment,
   HeadsetOne,
   LinkCloud,
@@ -32,20 +33,26 @@ import FreeModelsContent from './FreeModelsContent';
 import SpeechToTextContent from './SpeechToTextContent';
 import TextToSpeechContent from './TextToSpeechContent';
 import ChatModelsContent from './ChatModelsContent';
+import RealtimeModelsContent from './RealtimeModelsContent';
 import VisionModelsContent from './VisionModelsContent';
 import ImageModelsContent from './ImageModelsContent';
+import ImageEditModelsContent from './ImageEditModelsContent';
 import VideoModelsContent from './VideoModelsContent';
 import EmbeddingModelsContent from './EmbeddingModelsContent';
+import RerankModelsContent from './RerankModelsContent';
 
 type Section =
   | 'models'
   | 'chat'
+  | 'realtime'
   | 'asr'
   | 'tts'
   | 'vision'
   | 'image'
+  | 'image-edit'
   | 'video'
   | 'embedding'
+  | 'rerank'
   | 'free'
   | 'failover';
 
@@ -66,12 +73,15 @@ const LEGACY_SECTIONS: Record<string, Section> = {
 const SECTION_KEYS: readonly Section[] = [
   'models',
   'chat',
+  'realtime',
   'asr',
   'tts',
   'vision',
   'image',
+  'image-edit',
   'video',
   'embedding',
+  'rerank',
   'free',
   'failover',
 ];
@@ -126,6 +136,11 @@ const SECTION_GROUPS: SectionGroup[] = [
         icon: <Comment theme='outline' size='16' strokeWidth={3} />,
       },
       {
+        key: 'realtime',
+        labelKey: 'settings.modelHub.sectionRealtime',
+        icon: <BroadcastRadio theme='outline' size='16' strokeWidth={3} />,
+      },
+      {
         key: 'asr',
         labelKey: 'settings.modelHub.sectionAsr',
         icon: <HeadsetOne theme='outline' size='16' strokeWidth={3} />,
@@ -146,6 +161,11 @@ const SECTION_GROUPS: SectionGroup[] = [
         icon: <Pic theme='outline' size='16' strokeWidth={3} />,
       },
       {
+        key: 'image-edit',
+        labelKey: 'settings.modelHub.sectionImageEdit',
+        icon: <Pic theme='outline' size='16' strokeWidth={3} />,
+      },
+      {
         key: 'video',
         labelKey: 'settings.modelHub.sectionVideo',
         icon: <VideoTwo theme='outline' size='16' strokeWidth={3} />,
@@ -153,6 +173,11 @@ const SECTION_GROUPS: SectionGroup[] = [
       {
         key: 'embedding',
         labelKey: 'settings.modelHub.sectionEmbedding',
+        icon: <SafeRetrieval theme='outline' size='16' strokeWidth={3} />,
+      },
+      {
+        key: 'rerank',
+        labelKey: 'settings.modelHub.sectionRerank',
         icon: <SafeRetrieval theme='outline' size='16' strokeWidth={3} />,
       },
     ],
@@ -243,23 +268,25 @@ const ModelHubPage: React.FC = () => {
     <>
       {section === 'models' && <ModelModalContent />}
       {section === 'chat' && <ChatModelsContent />}
+      {section === 'realtime' && <RealtimeModelsContent />}
       {section === 'asr' && <SpeechToTextContent />}
       {section === 'tts' && <TextToSpeechContent />}
       {section === 'vision' && <VisionModelsContent />}
       {section === 'image' && <ImageModelsContent />}
+      {section === 'image-edit' && <ImageEditModelsContent />}
       {section === 'video' && <VideoModelsContent />}
       {section === 'embedding' && <EmbeddingModelsContent />}
+      {section === 'rerank' && <RerankModelsContent />}
       {section === 'free' && <FreeModelsContent />}
       {section === 'failover' && <ModelFailoverContent />}
     </>
   );
 
   // Compatibility for bookmarks and links from builds where execution engines
-  // were embedded in model management. Preserve the local/remote sub-tab.
+  // were embedded in model management. The engine page has a single surface
+  // now, so every legacy sub-tab resolves to it.
   if (searchParams.get('section') === 'agents') {
-    const tab = searchParams.get('tab');
-    const target = tab === 'remote' ? '/settings/execution-engines?tab=remote' : '/settings/execution-engines?tab=local';
-    return <Navigate to={target} replace />;
+    return <Navigate to='/settings/execution-engines' replace />;
   }
 
   // Mobile: horizontal segmented nav above the content (no left sidebar).

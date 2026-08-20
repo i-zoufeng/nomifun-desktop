@@ -29,7 +29,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// maximum-size image.
 const MAX_BATCH_IMAGE_DATA_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
 
-/// Amazon Bedrock Converse, the strictest supported provider, accepts at most
+/// Amazon Bedrock Claude Anthropic Messages, the strictest supported provider, accepts at most
 /// 20 images in one request.
 const MAX_BATCH_IMAGES: usize = 20;
 
@@ -146,10 +146,12 @@ impl ReadTool {
         // return a short stub instead of full content.
         if let (Some(cache_arc), Some(current_mtime)) = (&self.file_cache, mtime_ms)
             && let Ok(mut cache) = cache_arc.write()
+            && !cache.needs_model_refresh(Path::new(file_path))
             && let Some(cached) = cache.get(Path::new(file_path))
             && cached.offset == offset
             && cached.limit == limit
             && cached.mtime_ms == current_mtime
+            && cached.dedup_eligible
         {
             return ToolResult {
                 content: FILE_UNCHANGED_STUB.to_string(),
@@ -254,6 +256,7 @@ impl ReadTool {
                     mtime_ms: mtime,
                     offset,
                     limit,
+                    dedup_eligible: true,
                 },
             );
         }

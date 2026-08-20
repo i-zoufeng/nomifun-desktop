@@ -32,6 +32,14 @@ type UseSpeechInputOptions = {
   onTranscript: (transcript: string) => void;
 };
 
+/**
+ * Browser-preference order: whichever the platform can actually encode wins.
+ * Reordering this to suit one provider is a per-platform lottery — Chromium
+ * cannot record Ogg/Opus and Linux/WebKitGTK cannot record AAC, so a
+ * provider-driven order silently falls through to a different container per
+ * platform. The provider-compatibility half of this belongs in the ASR
+ * adapters, which normalize the recorded MIME (parameters included) instead.
+ */
 const RECORDING_MIME_TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
 const SPEECH_WAVEFORM_SAMPLE_COUNT = 40;
 const SPEECH_WAVEFORM_MIN_LEVEL = 0.015;
@@ -114,8 +122,6 @@ const mapSpeechInputError = (error: unknown): SpeechInputErrorCode => {
   const message = error instanceof Error ? error.message : String(error);
 
   if (
-    message.includes('STT_OPENAI_NOT_CONFIGURED') ||
-    message.includes('STT_DEEPGRAM_NOT_CONFIGURED') ||
     message.includes('STT_DISABLED') ||
     message.includes('ASR_NOT_CONFIGURED') ||
     message.includes('ASR_NOT_READY')

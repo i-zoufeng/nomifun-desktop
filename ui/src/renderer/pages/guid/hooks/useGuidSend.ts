@@ -55,7 +55,6 @@ export type GuidSendDeps = {
   selectedAgentKey: string;
   selectedAgentInfo: AvailableAgent | undefined;
   selectedMode: string;
-  selectedAcpModel: string | null;
 
   current_model: TProviderWithModel | undefined;
 
@@ -112,7 +111,7 @@ export type GuidSendResult = {
 };
 
 /**
- * Hook that manages the send logic for all conversation types (openclaw/nanobot/acp).
+ * Hook that manages the send logic for conversation creation.
  */
 export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
   const {
@@ -128,7 +127,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedAgentKey,
     selectedAgentInfo,
     selectedMode,
-    selectedAcpModel,
     current_model,
     findAgentByKey,
     getEffectiveAgentType,
@@ -191,131 +189,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       .map((server) => toSessionMcpServer(server));
 
     const finalEffectiveAgentType = effectiveAgentType;
-
-    // OpenClaw Gateway path
-    if (selectedAgent === 'openclaw-gateway') {
-      const openclawAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
-      const openclawConversationParams = buildAgentConversationParams({
-        backend: openclawAgentInfo?.backend || 'openclaw-gateway',
-        name: entryPlan.conversationName,
-        agent_name: openclawAgentInfo?.name,
-        preset_id,
-        workspace: finalWorkspace,
-        model: current_model!,
-        cli_path: openclawAgentInfo?.cli_path,
-        custom_workspace: isCustomWorkspace,
-        is_preset,
-        extra: {
-          default_files: files,
-          runtime_validation: {
-            expected_workspace: finalWorkspace,
-            expected_backend: openclawAgentInfo?.backend,
-            expected_agent_name: openclawAgentInfo?.name,
-            expected_cli_path: openclawAgentInfo?.cli_path,
-            expected_model: current_model?.use_model,
-            switched_at: Date.now(),
-          },
-          preset_enabled_skills: enabled_skills_to_send,
-          exclude_auto_inject_skills: excludeBuiltinSkills,
-        },
-      });
-
-      try {
-        const conversation = await ipcBridge.conversation.create.invoke(openclawConversationParams);
-
-        if (!conversation || !conversation.id) {
-          Message.error(t('conversation.createFailed'));
-          return;
-        }
-        assertCreatedConversationPreset(conversation, preset_id);
-
-        // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
-        // the new conversation before navigating, so they are live when the
-        // conversation page consumes the initial message.
-        await applyAdvancedConfig?.(conversation.id);
-
-        emitter.emit('chat.history.refresh');
-
-        const initialMessage = {
-          conversation_id: conversation.id,
-          initial_admission_epoch: 0,
-          input,
-          files: files.length > 0 ? files : undefined,
-          idempotency_key: uuidv7(),
-        };
-        if (entryPlan.sendInitialMessage) {
-          sessionStorage.setItem(
-            sessionStorageKey('initial-message-openclaw', conversationTarget(conversation.id)),
-            JSON.stringify(initialMessage)
-          );
-        }
-
-        seedConversationCache(conversation);
-        await navigate(`/conversation/${conversation.id}`);
-      } catch (error: unknown) {
-        console.error('Failed to create OpenClaw conversation:', error);
-        throw error;
-      }
-      return;
-    }
-
-    // Nanobot path
-    if (selectedAgent === 'nanobot') {
-      const nanobotAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
-      const nanobotConversationParams = buildAgentConversationParams({
-        backend: nanobotAgentInfo?.backend || 'nanobot',
-        name: entryPlan.conversationName,
-        agent_name: nanobotAgentInfo?.name,
-        preset_id,
-        workspace: finalWorkspace,
-        model: current_model!,
-        custom_workspace: isCustomWorkspace,
-        is_preset,
-        extra: {
-          default_files: files,
-          preset_enabled_skills: enabled_skills_to_send,
-          exclude_auto_inject_skills: excludeBuiltinSkills,
-        },
-      });
-
-      try {
-        const conversation = await ipcBridge.conversation.create.invoke(nanobotConversationParams);
-
-        if (!conversation || !conversation.id) {
-          Message.error(t('conversation.createFailed'));
-          return;
-        }
-        assertCreatedConversationPreset(conversation, preset_id);
-
-        // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
-        // the new conversation before navigating, so they are live when the
-        // conversation page consumes the initial message.
-        await applyAdvancedConfig?.(conversation.id);
-
-        emitter.emit('chat.history.refresh');
-
-        const initialMessage = {
-          conversation_id: conversation.id,
-          initial_admission_epoch: 0,
-          input,
-          files: files.length > 0 ? files : undefined,
-          idempotency_key: uuidv7(),
-        };
-        if (entryPlan.sendInitialMessage) {
-          sessionStorage.setItem(
-            sessionStorageKey('initial-message-nanobot', conversationTarget(conversation.id)),
-            JSON.stringify(initialMessage)
-          );
-        }
-
-        seedConversationCache(conversation);
-        await navigate(`/conversation/${conversation.id}`);
-      } catch (error: unknown) {
-        console.error('Failed to create Nanobot conversation:', error);
-        throw error;
-      }
-      return;
-    }
 
     // Nomi path (direct selection or preset preset with nomi as main agent)
     if (selectedAgent === 'nomi' || (is_preset && finalEffectiveAgentType === 'nomi')) {
@@ -384,50 +257,37 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       return;
     }
 
-    // Remaining agent path (ACP/remote/custom, including preset fallbacks)
+    // Remaining agent path (custom rows, including preset fallbacks)
     {
-      // Agent-type fallback only applies to preset presets whose primary agent
-      // was unavailable and got switched. For non-preset
-      // agents (including extension-contributed ACP adapters with backend='custom'),
-      // we must keep the original selectedAgent so the correct backend/cli_path is used.
+      // Agent-type fallback only applies to presets whose primary agent was
+      // unavailable and got switched. For non-preset agents we must keep the
+      // original selectedAgent so the correct backend/cli_path is used.
       const agent_typeChanged = is_preset && selectedAgent !== finalEffectiveAgentType;
-      const acpBackend: string | undefined = agent_typeChanged
-        ? finalEffectiveAgentType
-        : is_preset
-          ? finalEffectiveAgentType
-          : selectedAgent;
+      const resolvedBackend: string | undefined = is_preset ? finalEffectiveAgentType : selectedAgent;
 
-      const acpAgentInfo = agent_typeChanged
-        ? findAgentByKey(acpBackend as string)
+      const resolvedAgentInfo = agent_typeChanged
+        ? findAgentByKey(resolvedBackend as string)
         : agentInfo || findAgentByKey(selectedAgentKey);
 
-      if (!acpAgentInfo && !is_preset) {
-        console.warn(`${acpBackend} CLI not found, but proceeding to let conversation panel handle it.`);
+      if (!resolvedAgentInfo && !is_preset) {
+        console.warn(`${resolvedBackend} agent not found, but proceeding to let conversation panel handle it.`);
       }
-      const agentBackend = acpBackend || selectedAgent;
+      const agentBackend = resolvedBackend || selectedAgent;
       const agentConversationParams = buildAgentConversationParams({
         backend: agentBackend,
         name: entryPlan.conversationName,
-        // For row-scoped rows (custom ACP / remote) the backend factory
-        // needs the actual catalog id — `backend` collapses to the `custom`
-        // slot so it cannot discriminate between rows on its own.
-        agent_id: acpAgentInfo?.id,
-        agent_name: acpAgentInfo?.name,
+        // For row-scoped rows the backend factory needs the actual catalog
+        // id — `backend` collapses to the `custom` slot so it cannot
+        // discriminate between rows on its own.
+        agent_id: resolvedAgentInfo?.id,
+        agent_name: resolvedAgentInfo?.name,
         preset_id,
         workspace: finalWorkspace,
         model: current_model!,
-        cli_path: acpAgentInfo?.cli_path,
-        remote_agent_id: acpAgentInfo?.remote_agent_id,
+        cli_path: resolvedAgentInfo?.cli_path,
         custom_workspace: isCustomWorkspace,
         is_preset,
         session_mode: selectedMode,
-        // Only an EXPLICIT user pick (or a preset preference resolved into
-        // selectedAcpModel) travels with the new conversation. Falling back
-        // to the cached handshake model here would pin the session to a
-        // possibly-stale snapshot and override the agent CLI's local default
-        // config — model initialization must follow the CLI default unless
-        // the user chose otherwise.
-        current_model_id: selectedAcpModel || undefined,
         extra: {
           default_files: files,
           exclude_auto_inject_skills: excludeBuiltinSkills,
@@ -441,7 +301,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       try {
         const conversation = await ipcBridge.conversation.create.invoke(agentConversationParams);
         if (!conversation || !conversation.id) {
-          console.error('Failed to create ACP conversation - conversation object is null or missing id');
+          console.error('Failed to create agent conversation - conversation object is null or missing id');
           return;
         }
         assertCreatedConversationPreset(conversation, preset_id);
@@ -459,17 +319,14 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         };
         if (entryPlan.sendInitialMessage) {
           const target = conversationTarget(conversation.id);
-          const initialMessageKey = sessionStorageKey(
-            agentConversationParams.type === 'remote' ? 'initial-message-remote' : 'initial-message-acp',
-            target
-          );
+          const initialMessageKey = sessionStorageKey('initial-message-nomi', target);
           sessionStorage.setItem(initialMessageKey, JSON.stringify(initialMessage));
         }
 
         seedConversationCache(conversation);
         await navigate(`/conversation/${conversation.id}`);
       } catch (error: unknown) {
-        console.error('Failed to create ACP conversation:', error);
+        console.error('Failed to create agent conversation:', error);
         throw error;
       }
     }
@@ -481,7 +338,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedAgentKey,
     selectedAgentInfo,
     selectedMode,
-    selectedAcpModel,
     current_model,
     findAgentByKey,
     getEffectiveAgentType,

@@ -4,11 +4,15 @@ use nomifun_ai_agent::AgentRuntimeRegistry;
 use nomifun_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, SearchMessagesQuery, WebSocketMessage,
 };
-use nomifun_common::{AgentKillReason, AppError, ConversationStatus, TimestampMs, now_ms};
+use nomifun_common::{AgentKillReason, AppError, ConversationStatus, now_ms};
 use nomifun_conversation::ConversationService;
 use nomifun_conversation::skill_resolver::SkillResolver;
 use nomifun_db::models::MessageRow;
-use nomifun_db::{IProviderRepository, IConversationRepository, SqliteConversationRepository};
+use nomifun_db::{
+    IConversationRepository, IProviderModelRepository, IProviderRepository, NewProviderModel,
+    NewProviderModelCapability, SqliteConversationRepository,
+    SqliteProviderModelRepository,
+};
 use nomifun_realtime::UserEventSink;
 use serde_json::json;
 use std::sync::Mutex;
@@ -58,12 +62,27 @@ impl AgentRuntimeRegistry for NoopAgentRuntimeRegistry {
         // This registry never spawns a process, so teardown is trivially proven.
         Box::pin(std::future::ready(Ok(())))
     }
+    /// Nomi is the only agent type, so reset/clear-context always reaches the
+    /// persisted-session seam. This registry never persisted a session, so the
+    /// exact generation is trivially already absent.
+    fn reset_persisted_nomi_session(
+        &self,
+        _: &str,
+        _: i64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<nomifun_ai_agent::NomiSessionResetOutcome, AppError>,
+                > + Send,
+        >,
+    > {
+        Box::pin(std::future::ready(Ok(
+            nomifun_ai_agent::NomiSessionResetOutcome::AlreadyAbsent,
+        )))
+    }
     fn terminate_all(&self) {}
     fn active_runtime_count(&self) -> usize {
         0
-    }
-    fn collect_idle_runtimes(&self, _: TimestampMs) -> Vec<String> {
-        vec![]
     }
 }
 
@@ -97,12 +116,77 @@ async fn setup() -> (
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let provider_repo = nomifun_db::SqliteProviderRepository::new(db.pool().clone());
-    provider_repo.create(nomifun_db::CreateProviderParams { provider_id: Some("0190f5fe-7c00-7a00-8000-000000000001"), platform: "openai", name: "test", base_url: "https://example.invalid", api_key_encrypted: "", models: "[\"m1\",\"gpt-4o\",\"claude-sonnet-4-20250514\"]", enabled: true, model_context_limits: None, model_protocols: None, model_descriptions: None, model_enabled: None, bedrock_config: None, is_full_url: false, sort_order: Some(0) }).await.unwrap();
+    let chat = [NewProviderModelCapability {
+        task: "chat",
+        traits: "[]",
+        protocol: "openai.chat_text",
+        connection_role: "default",
+        provider_params: "{}",
+        ..Default::default()
+    }];
+    let initial_model = NewProviderModel {
+        model: "m1",
+        enabled: true,
+        sort_order: 0,
+        description: None,
+        capabilities: &chat,
+    };
+    let encrypted_credentials = nomifun_common::encrypt_string(
+        r#"{"api_keys":["test-only"]}"#,
+        &[0x42; 32],
+    )
+    .unwrap();
+    provider_repo
+        .create(
+            nomifun_db::CreateProviderParams {
+                provider_id: Some("0190f5fe-7c00-7a00-8000-000000000001"),
+                platform: "openai",
+                name: "test",
+                base_url: "https://example.invalid",
+                auth_scheme: "bearer",
+                credentials_encrypted: &encrypted_credentials,
+                enabled: true,
+                bedrock_config: None,
+                sort_order: Some(0),
+            },
+            &initial_model,
+            &[],
+        )
+        .await
+        .unwrap();
+    let model_repo = SqliteProviderModelRepository::new(db.pool().clone());
+    for (sort_order, model) in [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "claude-sonnet-4-20250514",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let config_revision = provider_repo
+            .find_by_id("0190f5fe-7c00-7a00-8000-000000000001")
+            .await
+            .unwrap()
+            .unwrap()
+            .config_revision;
+        model_repo
+            .save(
+                "0190f5fe-7c00-7a00-8000-000000000001",
+                config_revision,
+                &NewProviderModel {
+                    model,
+                    enabled: true,
+                    sort_order: sort_order as i64 + 1,
+                    description: None,
+                    capabilities: &chat,
+                },
+            )
+            .await
+            .unwrap();
+    }
     let broadcaster = Arc::new(TestBroadcaster::new());
     let agent_metadata_repo: Arc<dyn nomifun_db::IAgentMetadataRepository> =
         Arc::new(nomifun_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
-    let acp_session_repo: Arc<dyn nomifun_db::IAcpSessionRepository> =
-        Arc::new(nomifun_db::SqliteAcpSessionRepository::new(db.pool().clone()));
     let runtime_registry: Arc<dyn AgentRuntimeRegistry> = Arc::new(NoopAgentRuntimeRegistry);
     let svc = ConversationService::new(
         Arc::<str>::from(USER_ID),
@@ -112,14 +196,12 @@ async fn setup() -> (
         runtime_registry,
         repo.clone(),
         agent_metadata_repo,
-        acp_session_repo,
         Arc::new(nomifun_conversation::NoExecutionConversationBoundary),
     );
     (svc, repo, broadcaster)
 }
 
 const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
-const TEST_ACP_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
 
 async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbError> {
     nomifun_db::init_database_memory_with_owner(
@@ -130,9 +212,9 @@ async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbEr
 
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
-        "type": "acp",
+        "type": "nomi",
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
         "extra": {
-            "agent_id": TEST_ACP_AGENT_ID,
             "workspace": "/home/user/project"
         }
     }))
@@ -155,27 +237,19 @@ fn make_message(conv_id: String, content: &str, offset_ms: i64) -> MessageRow {
     }
 }
 
-fn make_acp_tool_message(conv_id: String, id: &str, output: &str, offset_ms: i64) -> MessageRow {
+fn make_tool_message(conv_id: String, id: &str, output: &str, offset_ms: i64) -> MessageRow {
     MessageRow {
         id: 0,
         message_id: id.to_string(),
         conversation_id: conv_id,
         msg_id: Some(id.to_string()),
-        r#type: "acp_tool_call".to_string(),
+        r#type: "tool_call".to_string(),
         content: json!({
-            "session_id": "session-1",
-            "update": {
-                "session_update": "tool_call",
-                "tool_call_id": id,
-                "status": "completed",
-                "title": "rg",
-                "kind": "search",
-                "raw_input": { "pattern": "needle", "path": "." },
-                "content": [{
-                    "type": "content",
-                    "content": { "type": "text", "text": output }
-                }]
-            }
+            "call_id": id,
+            "name": "rg",
+            "args": { "pattern": "needle", "path": "." },
+            "status": "completed",
+            "output": output,
         })
         .to_string(),
         position: Some("left".to_string()),
@@ -193,9 +267,10 @@ async fn t6_2_clone_without_source() {
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
         "conversation": {
-            "type": "acp",
+            "type": "nomi",
             "name": "Direct",
-            "extra": { "agent_id": TEST_ACP_AGENT_ID }
+            "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+            "extra": {}
         }
     }))
     .unwrap();
@@ -341,7 +416,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
     let large_output = "match line\n".repeat(10_000);
 
     let message_id = nomifun_common::MessageId::new();
-    repo.insert_message(&make_acp_tool_message(
+    repo.insert_message(&make_tool_message(
         conv.conversation_id.clone(),
         message_id.as_str(),
         &large_output,
@@ -354,12 +429,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
         .list_messages(USER_ID, &conv.conversation_id.to_string(), ListMessagesQuery::default())
         .await
         .unwrap();
-    assert_eq!(
-        full.items[0].content["update"]["content"][0]["content"]["text"]
-            .as_str()
-            .unwrap(),
-        large_output
-    );
+    assert_eq!(full.items[0].content["output"].as_str().unwrap(), large_output);
 
     let compact = svc
         .list_messages(
@@ -373,9 +443,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
         .await
         .unwrap();
     let compact_content = &compact.items[0].content;
-    let preview = compact_content["update"]["content"][0]["content"]["text"]
-        .as_str()
-        .unwrap();
+    let preview = compact_content["output"].as_str().unwrap();
 
     assert!(compact_content["_compact"]["truncated"].as_bool().unwrap());
     assert!(compact_content["_compact"]["original_size"].as_u64().unwrap() > preview.len() as u64);
@@ -390,7 +458,7 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
     let large_output = "wide rg output\n".repeat(10_000);
 
     let message_id = nomifun_common::MessageId::new();
-    repo.insert_message(&make_acp_tool_message(
+    repo.insert_message(&make_tool_message(
         conv.conversation_id.clone(),
         message_id.as_str(),
         &large_output,
@@ -416,12 +484,7 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
         .await
         .unwrap();
 
-    assert_eq!(
-        detail.content["update"]["content"][0]["content"]["text"]
-            .as_str()
-            .unwrap(),
-        large_output
-    );
+    assert_eq!(detail.content["output"].as_str().unwrap(), large_output);
 }
 
 #[tokio::test]
@@ -600,26 +663,29 @@ async fn t10_1_same_workspace() {
     let (svc, _repo, _b) = setup().await;
 
     let req1: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "acp",
+        "type": "nomi",
         "name": "Conv A",
-        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/shared/path" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+        "extra": { "workspace": "/shared/path" }
     }))
     .unwrap();
     let conv1 = svc.create(USER_ID, req1).await.unwrap();
 
     let req2: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "acp",
+        "type": "nomi",
         "name": "Conv B",
-        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/shared/path" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+        "extra": { "workspace": "/shared/path" }
     }))
     .unwrap();
     let conv2 = svc.create(USER_ID, req2).await.unwrap();
 
     // Different workspace
     let req3: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "acp",
+        "type": "nomi",
         "name": "Conv C",
-        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/other/path" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+        "extra": { "workspace": "/other/path" }
     }))
     .unwrap();
     svc.create(USER_ID, req3).await.unwrap();
@@ -634,8 +700,9 @@ async fn t10_2_no_associated() {
     let (svc, _repo, _b) = setup().await;
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "acp",
-        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/unique/path" }
+        "type": "nomi",
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+        "extra": { "workspace": "/unique/path" }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();

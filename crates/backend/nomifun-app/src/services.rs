@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nomifun_ai_agent::{
-    AcpSessionSyncService, AcpSkillManager, AgentFactoryDeps, AgentRegistry, AgentRuntimeRegistry,
-    InMemoryAgentRuntimeRegistry, build_agent_factory,
+    AgentFactoryDeps, AgentRegistry, AgentRuntimeRegistry,
+    InMemoryAgentRuntimeRegistry, build_agent_factory, build_agent_model_config_resolver,
 };
 use nomifun_api_types::{GatewayMcpConfig, RequirementMcpConfig};
 use nomifun_auth::{
@@ -19,13 +19,16 @@ use nomifun_conversation::{
     ExecutionConversationBoundary, RepositoryExecutionConversationBoundary,
 };
 use nomifun_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, ICompanionTokenRepository,
-    IConversationRepository, IMcpServerRepository, IProviderModelRepository, IProviderRepository,
-    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    Database, IAgentMetadataRepository, ICompanionTokenRepository,
+    IConversationRepository, IMcpServerRepository, IProviderModelCapabilityRepository,
+    IProviderModelRepository, IProviderRepository,
+    IUserRepository, SqliteAgentMetadataRepository,
     SqliteCompanionTokenRepository, SqliteConversationRepository, SqliteMcpServerRepository,
-    SqliteProviderModelRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteProviderModelCapabilityRepository, SqliteProviderModelRepository,
+    SqliteProviderRepository,
     SqliteTerminalRepository, SqliteUserRepository,
 };
+#[cfg(feature = "browser-use")]
 use nomifun_db::{IClientPreferenceRepository, SqliteClientPreferenceRepository};
 use nomifun_realtime::{BroadcastEventBus, WebSocketManager};
 use nomifun_terminal::{TerminalEventEmitter, TerminalLifecycleServer, TerminalService};
@@ -38,6 +41,45 @@ fn require_utf8_executable_path(path: &std::path::Path) -> anyhow::Result<String
             "backend executable path is not valid Unicode; refusing to configure child-process bridges or lifecycle hooks: {path:?}"
         )
     })
+}
+
+/// Workshop text-node executor over the production Agent Chat stack.
+///
+/// The selected model's persisted Chat capability is resolved by
+/// `ModelInvokeService`, then the shared Agent provider factory performs the
+/// completion. Consequently OpenAI-compatible, Anthropic Messages, Gemini and
+/// Bedrock text calls use the same serializer/auth rules as live conversations;
+/// this bridge contains no platform-name routing table.
+struct AgentCreationTextExecutor {
+    model_invoke: Arc<nomifun_model_invoke::ModelInvokeService>,
+    workspace: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl nomifun_creation::CreationTextExecutor for AgentCreationTextExecutor {
+    async fn complete(
+        &self,
+        request: nomifun_creation::CreationTextRequest,
+    ) -> Result<String, nomifun_creation::CreationError> {
+        let config = nomifun_ai_agent::factory::provider_config::resolve_provider_config(
+            self.model_invoke.as_ref(),
+            &request.provider_id,
+            &request.model,
+            &self.workspace,
+        )
+        .await
+        .map_err(|error| nomifun_creation::CreationError::config(error.to_string()))?;
+        nomifun_ai_agent::factory::provider_config::one_shot_completion(
+            &config,
+            &request.system,
+            vec![nomifun_ai_agent::factory::provider_config::user_message(
+                request.prompt,
+            )],
+            request.max_tokens,
+        )
+        .await
+        .map_err(|error| nomifun_creation::CreationError::provider_error(error.to_string()))
+    }
 }
 
 #[cfg(feature = "browser-use")]
@@ -345,12 +387,14 @@ struct BrowserStartupPreferences {
 impl Default for BrowserStartupPreferences {
     fn default() -> Self {
         Self {
-            // New installs default to truly silent Agent browsing: routine
-            // Browser Use launches Chromium `--headless=new` and never opens
-            // an operating-system window. A user may explicitly choose the
-            // `external` default-visible policy in Settings; the removed
-            // embedded viewer is never selected as a presentation surface.
-            display_mode: "headless",
+            // New installs let the trusted host choose per Lane: routine Agent
+            // browsing launches Chromium `--headless=new` and never opens an
+            // operating-system window, but a moment that needs the user's
+            // supervision may surface one. A user may still pin `headless`
+            // (never visible) or `external` (always visible) in Settings; the
+            // removed embedded viewer is never selected as a presentation
+            // surface.
+            display_mode: "auto",
             source: "system".to_owned(),
             full_power: false,
             persistent_login: true,
@@ -360,30 +404,57 @@ impl Default for BrowserStartupPreferences {
 
 /// Resolve the trusted application-level browser visibility policy.
 ///
-/// The two supported values are user preferences, not Agent capabilities:
-/// `headless` (default) keeps routine Primary work invisible; `external` is a
-/// user's explicit choice to launch the Primary Host with a visible window.
-/// Version 2 makes an external window an explicitly user-selected policy.
-/// Any pre-versioned value (including a historical `external` value inferred
-/// from the removed `silent=false` setting) is migrated once to `headless`.
-/// Once the v2 marker is present, either valid user choice is preserved.
-/// Missing or malformed v2 state fails closed to `headless` and is repaired.
+/// The three supported values are user preferences, not Agent capabilities:
+/// - `headless` keeps every Primary launch invisible, and forbids the Agent from
+///   surfacing a window even at an attended moment.
+/// - `auto` (default) lets the trusted host decide per Lane from the Agent's
+///   declared intent and the action's risk tier: routine work stays silent, and
+///   a moment that needs supervision (a login wall, an irreversible action) may
+///   open a window. The Agent proposes; the host decides.
+/// - `external` launches the Primary Host with a visible window unconditionally.
+///
+/// Version 3 introduces `auto` and makes it the default. Migration is lineage
+/// aware, because not every stored `external` is a trustworthy user choice:
+/// - **Unversioned** (pre-v2) state migrates to `auto` and never preserves
+///   `external`. A pre-v2 `external` may have been *inferred* from the removed
+///   `silent=false` setting rather than chosen, and version 2 deliberately
+///   stopped such state from opening an operating-system window. That decision
+///   is preserved here.
+/// - **Version 2** state carries a real user choice, so an explicit `external`
+///   is preserved — a user who opted into a visible window never silently loses
+///   it — while `headless`, which was version 2's default for every
+///   installation, moves to `auto`. That direction is safe: `auto` still keeps
+///   routine browsing silent and only adds the ability to surface a window when
+///   the user genuinely needs to intervene. Anyone who wants "never visible" can
+///   still select `headless` explicitly.
+///
+/// Malformed or missing state at the current version fails closed to `auto` and
+/// is repaired.
 #[cfg(feature = "browser-use")]
 fn resolve_browser_display_mode(
     display_mode: Option<&str>,
     policy_version: Option<&str>,
 ) -> (&'static str, bool) {
-    let is_current_version = policy_version
-        .map(|value| value.trim().trim_matches('"') == BROWSER_DISPLAY_MODE_POLICY_VERSION)
-        .unwrap_or(false);
+    let version = policy_version.map(|value| value.trim().trim_matches('"'));
+    let stored = display_mode.map(|value| value.trim().trim_matches('"'));
+    let is_current_version = version == Some(BROWSER_DISPLAY_MODE_POLICY_VERSION);
     if !is_current_version {
-        return ("headless", true);
+        // Only a version-2 marker proves the stored value was an explicit user
+        // choice. Anything older is not trustworthy as an opt-in to a visible
+        // window and must not resurrect one.
+        return match (version, stored) {
+            (Some(BROWSER_DISPLAY_MODE_PREVIOUS_POLICY_VERSION), Some("external")) => {
+                ("external", true)
+            }
+            _ => ("auto", true),
+        };
     }
 
-    match display_mode.map(|value| value.trim().trim_matches('"')) {
+    match stored {
         Some("headless") => ("headless", false),
         Some("external") => ("external", false),
-        _ => ("headless", true),
+        Some("auto") => ("auto", false),
+        _ => ("auto", true),
     }
 }
 
@@ -393,7 +464,11 @@ pub(crate) const BROWSER_DISPLAY_MODE_PREF_KEY: &str = "agent.browserUse.display
 pub(crate) const BROWSER_DISPLAY_MODE_VERSION_PREF_KEY: &str =
     "agent.browserUse.displayModeVersion";
 #[cfg(feature = "browser-use")]
-pub(crate) const BROWSER_DISPLAY_MODE_POLICY_VERSION: &str = "2";
+pub(crate) const BROWSER_DISPLAY_MODE_POLICY_VERSION: &str = "3";
+/// The previous policy lineage. A marker of this version proves the stored mode
+/// was an explicit version-2 user choice, which migration is allowed to preserve.
+#[cfg(feature = "browser-use")]
+pub(crate) const BROWSER_DISPLAY_MODE_PREVIOUS_POLICY_VERSION: &str = "2";
 
 #[cfg(feature = "browser-use")]
 const BROWSER_STARTUP_PREFERENCE_KEYS: [&str; 5] = [
@@ -477,6 +552,25 @@ where
     }
 }
 
+/// Map the stored display-mode preference onto the Hub's visibility policy.
+///
+/// `external`/`headless` pin the mechanism and forbid the Hub from resolving it;
+/// `auto` delegates. Anything unrecognized resolves to `auto`, matching
+/// [`resolve_browser_display_mode`]'s fail-closed direction — which is silent,
+/// because `auto` still launches headless and only escalates for a moment that
+/// needs the user.
+#[cfg(feature = "browser-use")]
+fn browser_visibility_policy(
+    display_mode: &str,
+) -> nomifun_browser_platform::BrowserVisibilityPolicy {
+    use nomifun_browser_platform::BrowserVisibilityPolicy;
+    match display_mode {
+        "external" => BrowserVisibilityPolicy::AlwaysHeadful,
+        "headless" => BrowserVisibilityPolicy::AlwaysHeadless,
+        _ => BrowserVisibilityPolicy::Auto,
+    }
+}
+
 #[cfg(feature = "browser-use")]
 fn primary_host_is_headful(display_mode: &str) -> bool {
     // The trusted application-level preference is the only input that can
@@ -484,7 +578,56 @@ fn primary_host_is_headful(display_mode: &str) -> bool {
     // request parameters have no path into this policy. Non-Primary Hosts
     // stay headless regardless, and explicit foregrounding remains a separate
     // trusted Host transition owned by the Hub.
+    //
+    // `auto` is deliberately *not* headful at startup: it starts silent and lets
+    // the Hub surface a window only when a Lane reaches a moment that needs the
+    // user's supervision. Only an explicit `external` preference launches
+    // visible unconditionally.
     display_mode == "external"
+}
+
+/// Per-process byte count used to attribute a managed Chromium process tree.
+///
+/// Chromium is deliberately multi-process: one browser process plus GPU,
+/// network/storage utilities, a crash handler, and one renderer per site
+/// instance. Attribution sums this value across the whole tree, so the metric
+/// has to be *additive* — a value that can be summed across sibling processes
+/// without counting the same physical memory twice.
+///
+/// On Windows the working set fails that test. `WorkingSetSize` counts every
+/// resident page a process maps, including pages **shared** with its siblings:
+/// `chrome.dll` and the other shared images are mapped into every child, so
+/// summing working sets charges those pages once per process. Measured on a
+/// nine-process Chromium tree, 41% of the summed working set was shared pages
+/// counted repeatedly (696 MiB summed working set against 413 MiB of private
+/// bytes). Attributing that inflated total to one task made an ordinary
+/// browsing session look like a leak and got its Lane reclaimed.
+///
+/// `sysinfo` exposes the private commit charge on Windows as
+/// `Process::virtual_memory` (it maps to `PROCESS_MEMORY_COUNTERS_EX::
+/// PrivateUsage`, not to an address-space size). Private commit is
+/// per-process-exclusive, so it is safe to sum.
+///
+/// On Linux and macOS `virtual_memory` really is the virtual address-space size
+/// (VSZ / `vsize`), which is meaningless here, and `sysinfo` exposes no
+/// proportional set size. Those platforms therefore keep the resident-set
+/// value. Summing RSS still over-counts shared pages, so tree totals there
+/// remain an upper bound rather than an exact figure; the per-task budget is
+/// sized to tolerate that.
+#[cfg(feature = "browser-use")]
+fn process_tree_attributable_bytes(process: &sysinfo::Process) -> u64 {
+    #[cfg(windows)]
+    {
+        // Windows: private commit charge (PrivateUsage). Additive across the
+        // tree because it excludes shared pages.
+        process.virtual_memory()
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix: resident set size. `virtual_memory` is VSZ here and must not be
+        // substituted.
+        process.memory()
+    }
 }
 
 #[cfg(feature = "browser-use")]
@@ -1263,7 +1406,7 @@ fn sample_browser_resources(
             (
                 process.pid().as_u32(),
                 process.parent().map(|pid| pid.as_u32()),
-                process.memory(),
+                process_tree_attributable_bytes(process),
                 process.start_time(),
             )
         }),
@@ -1461,6 +1604,8 @@ pub struct AppServices {
     /// Authoritative per-model catalog rows (capability profiles + health;
     /// the multimodal model hub reads/writes these).
     pub provider_model_repo: Arc<dyn IProviderModelRepository>,
+    /// Task-scoped transport and health authority for provider models.
+    pub provider_model_capability_repo: Arc<dyn IProviderModelCapabilityRepository>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
@@ -1498,7 +1643,6 @@ pub struct AppServices {
     /// loop is attached during router assembly, where the `ConversationService`
     /// the sessions dispatch through exists.
     pub robot: Option<Arc<crate::robot_wiring::RobotServices>>,
-    pub acp_session_sync: Arc<AcpSessionSyncService>,
     /// Raw JWT secret string, used only for authentication/session signing.
     pub jwt_secret_raw: String,
     /// Persistent AES-256-GCM key for encrypted app data.
@@ -2254,18 +2398,35 @@ impl AppServices {
         let encryption_key = load_or_create_data_encryption_key(&data_dir, &secret)
             .map_err(|e| anyhow::anyhow!("Failed to load data encryption key: {e}"))?;
 
-        let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let provider_model_repo: Arc<dyn IProviderModelRepository> =
             Arc::new(SqliteProviderModelRepository::new(database.pool().clone()));
+        let provider_model_capability_repo: Arc<dyn IProviderModelCapabilityRepository> = Arc::new(
+            SqliteProviderModelCapabilityRepository::new(database.pool().clone()),
+        );
+        let provider_connection_repo: Arc<dyn nomifun_db::IProviderConnectionRepository> =
+            Arc::new(nomifun_db::SqliteProviderConnectionRepository::new(
+                database.pool().clone(),
+            ));
+        let model_invoke_http = nomifun_net::http_client();
+        let model_invoke_service = Arc::new(nomifun_model_invoke::ModelInvokeService::new(
+            provider_repo.clone(),
+            provider_model_repo.clone(),
+            provider_model_capability_repo.clone(),
+            provider_connection_repo,
+            encryption_key,
+            model_invoke_http.clone(),
+            nomifun_model_invoke::AdapterRegistry::new(nomifun_model_invoke::default_adapters()),
+        ));
         // Start the stable managed-model loopback supply and provision its
-        // provider projection before any model-profile reconciliation or agent
-        // factory construction. A seed catalog makes a fresh install usable
-        // without blocking boot on third-party discovery.
+        // provider/model capability graph before agent factory construction.
+        // A seed catalog makes a fresh install usable without blocking boot on
+        // third-party discovery.
         let (managed_model_service, managed_model_server) =
             nomifun_system::start_and_provision_free_model_with_preferences(
                 provider_repo.clone(),
                 provider_model_repo.clone(),
+                provider_model_capability_repo.clone(),
                 Some(Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
                     database.pool().clone(),
                 ))),
@@ -2275,46 +2436,10 @@ impl AppServices {
             .map_err(|e| anyhow::anyhow!("Failed to provision NomiFun free model service: {e}"))?;
         // Refresh immediately, then about every six hours with jitter. Failed
         // attempts retain the current catalog and use capped exponential
-        // backoff. Successful refreshes atomically seed profiles for any newly
-        // discovered models without overwriting concurrent user edits.
-        let managed_model_refresh_task = {
-            let profile_repo = provider_model_repo.clone();
-            nomifun_system::ManagedModelRefreshTask::start_with_success_hook(
-                managed_model_service.clone(),
-                move |status| {
-                    let profile_repo = profile_repo.clone();
-                    async move {
-                        let Some(provider_id) = status.provider_id.as_deref() else {
-                            tracing::warn!("Managed free-model refresh returned no provider id");
-                            return;
-                        };
-                        let models = status
-                            .models
-                            .iter()
-                            .map(|model| model.id.as_str())
-                            .collect::<Vec<_>>();
-                        match nomifun_system::seed_missing_inferred_profiles(
-                            profile_repo.as_ref(),
-                            provider_id,
-                            nomifun_system::FREE_MODEL_PLATFORM,
-                            &models,
-                        )
-                        .await
-                        {
-                            Ok(seeded) if seeded > 0 => tracing::info!(
-                                seeded,
-                                "Managed free-model refresh seeded inferred model profiles"
-                            ),
-                            Ok(_) => {}
-                            Err(error) => tracing::warn!(
-                                error = %error,
-                                "Managed free-model profile reconciliation failed"
-                            ),
-                        }
-                    }
-                },
-            )
-        };
+        // backoff. ManagedModelService owns the single transactional graph
+        // write; there is deliberately no second profile/backfill writer.
+        let managed_model_refresh_task =
+            nomifun_system::ManagedModelRefreshTask::start(managed_model_service.clone());
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -2328,9 +2453,6 @@ impl AppServices {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to hydrate agent registry: {e}"))?;
 
-        let acp_session_repo: Arc<dyn IAcpSessionRepository> =
-            Arc::new(SqliteAcpSessionRepository::new(database.pool().clone()));
-        let acp_agent_service = AcpSessionSyncService::new(acp_session_repo.clone());
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
@@ -2464,34 +2586,6 @@ impl AppServices {
             .install_browser_platform(browser_platform_shutdown.clone())
             .await;
 
-        // Reliable-launch (`open`) MCP config — Windows only. macOS/Linux already
-        // launch URLs/apps reliably (`open`/`xdg-open`), so the agent needs no
-        // nudging there; on Windows it stops the agent from using the fragile
-        // `cmd /c start` (which mis-parses URLs as window titles and pops
-        // "Windows cannot find '\\'" dialogs). Stateless — no server to start,
-        // just the binary path so the assembler can spawn `mcp-open-stdio`.
-        let open_mcp_config =
-            cfg!(target_os = "windows").then(|| nomifun_api_types::OpenMcpConfig {
-                binary_path: backend_binary_path_utf8.clone(),
-            });
-
-        // Computer-use discrete-tool MCP config — every desktop OS (macOS /
-        // Windows / Linux), gated ONLY on the `computer-use` feature (else
-        // `mcp-computer-stdio` is a stub, so we'd inject a bridge the binary
-        // can't serve). Lets codex/ACP sessions drive the desktop (snapshot /
-        // click / type / launch) via `nomicore mcp-computer-stdio`, mirroring the
-        // in-process `ComputerTool` the nomi engine already gets on all platforms
-        // (`nomi-a11y` implements macOS AX / Windows UIA / Linux AT-SPI backends).
-        // Platform reality the bridge surfaces honestly: macOS needs the user to
-        // grant TCC (Accessibility + Screen Recording) or ops error out; Linux
-        // lacks OCR + cross-app window focus and degrades synthetic input on
-        // Wayland. None of that warrants gating the bridge off — the tools simply
-        // report `Unsupported` where the OS can't serve them.
-        let computer_mcp_config =
-            cfg!(feature = "computer-use").then(|| nomifun_api_types::ComputerMcpConfig {
-                binary_path: backend_binary_path_utf8.clone(),
-            });
-
         // Singleton knowledge service: knowledge base registry + workspace
         // mounting. Shared by the `/api/knowledge/*` routes and the
         // conversation service (mount-at-task-start).
@@ -2506,14 +2600,19 @@ impl AppServices {
                 authoritative_user_id.clone(),
             ),
         ));
+        knowledge_service.set_retrieval_runtime(
+            Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
+                database.pool().clone(),
+            )),
+            model_invoke_service.clone(),
+        );
         // Late-wire the LLM seam for knowledge autogen / snapshot compression
         // (`LiveKnowledgeCompleter` resolves the first enabled provider/model
-        // per call, so it tolerates providers configured after boot). NOTE:
-        // `provider_repo` is moved into `build_agent_factory` below — clone.
+        // per call, so it tolerates providers configured after boot).
         knowledge_service.set_completer(Arc::new(nomifun_ai_agent::LiveKnowledgeCompleter {
             provider_repo: provider_repo.clone() as Arc<dyn nomifun_db::IProviderRepository>,
             provider_model_repo: provider_model_repo.clone(),
-            encryption_key,
+            model_invoke: model_invoke_service.clone(),
             workspace: data_dir.clone(),
         }));
 
@@ -2604,35 +2703,29 @@ impl AppServices {
         };
 
         // Browser-use MCP is a scoped proxy into the process-wide Hub. Start
-        // its issuer only after orphan recovery proved safe. Failure or a
-        // degraded recovery disables ACP browser tools without falling back to
-        // child-owned Chromium.
+        // its issuer only after orphan recovery proved safe. The server is
+        // registered for shutdown; its issuer config has no consumer now that
+        // no engine spawns `mcp-browser-stdio` as a child (the nomi engine
+        // drives the Hub in-process).
         #[cfg(feature = "browser-use")]
-        let (browser_mcp_server, browser_mcp_config) = if browser_orphan_recovery.is_safe() {
+        let browser_mcp_server = if browser_orphan_recovery.is_safe() {
             match crate::browser_mcp_server::BrowserMcpServer::start().await {
                 Ok(server) => {
-                    let server = Arc::new(server);
-                    let config = server.issuer_config(backend_binary_path_utf8.clone());
                     tracing::info!("Browser MCP scoped proxy started");
-                    (Some(server), Some(config))
+                    Some(Arc::new(server))
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        "Browser MCP scoped proxy failed to start; ACP browser tools disabled"
-                    );
-                    (None, None)
+                    tracing::warn!(%error, "Browser MCP scoped proxy failed to start");
+                    None
                 }
             }
         } else {
-            (None, None)
+            None
         };
         #[cfg(feature = "browser-use")]
         browser_platform_shutdown
             .set_browser_mcp(browser_mcp_server.clone())
             .await;
-        #[cfg(not(feature = "browser-use"))]
-        let browser_mcp_config = None;
         // Boot-resume: re-fetch snapshot-mode URL sources whose create-time
         // fetch never completed (the app exited mid-run — the source is
         // persisted unstamped before fetching). Spawned after the completer
@@ -2701,7 +2794,7 @@ impl AppServices {
         terminal_service.with_title_completer(Arc::new(nomifun_ai_agent::LiveTerminalTitleCompleter {
             provider_repo: provider_repo.clone(),
             provider_model_repo: provider_model_repo.clone(),
-            encryption_key,
+            model_invoke: model_invoke_service.clone(),
             workspace: data_dir.clone(),
         }));
         // Start the terminal lifecycle server (house pattern, 4th instance):
@@ -2745,9 +2838,7 @@ impl AppServices {
         // instance via `services.companion_service`.
         let companion_completer: Arc<dyn nomifun_companion::learner::CompanionCompleter> =
             Arc::new(nomifun_companion::learner::LiveCompanionCompleter {
-                provider_repo: provider_repo.clone() as Arc<dyn nomifun_db::IProviderRepository>,
-                provider_model_repo: provider_model_repo.clone(),
-                encryption_key,
+                model_invoke: model_invoke_service.clone(),
                 workspace: data_dir.clone(),
             });
         let provider_lifecycle = Arc::new(nomifun_common::ProviderLifecycleBarrier::new());
@@ -2780,10 +2871,7 @@ impl AppServices {
             knowledge_service.clone(),
             Arc::new(nomifun_customer_service::LiveTurnRunner {
                 deps: nomifun_ai_agent::OneShotDeps {
-                    provider_repo: provider_repo.clone()
-                        as Arc<dyn nomifun_db::IProviderRepository>,
-                    provider_model_repo: provider_model_repo.clone(),
-                    encryption_key,
+                    model_invoke: model_invoke_service.clone(),
                     workspace: data_dir.clone(),
                 },
             }),
@@ -2808,24 +2896,16 @@ impl AppServices {
         }
         // The generation engine delegates model execution to the unified
         // invoke layer (provider/model/protocol resolution + adapters live
-        // there), runs over a proxy-aware HTTP client, and reads/writes canvas
-        // assets through the workshop bridge (AssetSource/AssetSink — no crate
-        // cycle). `reconcile_on_boot` (running-with-remote resume / else
+        // there), and reads/writes canvas assets through the workshop bridge
+        // (AssetSource/AssetSink — no crate cycle). Untrusted provider-returned
+        // artifact URLs use the creation engine's proxy-free, DNS-pinned safe
+        // downloader. `reconcile_on_boot` (running-with-remote resume / else
         // fail-interrupted) is driven from `build_creation_state` at router
         // assembly.
-        let creation_http = nomifun_net::http_client();
         // Unified multimodal invoke layer (P1): one process-wide singleton over
         // the catalog repos + the same proxy-aware HTTP client. The creation
         // engine and `/api/tts` consume it; later tasks (health probes) reuse
         // this exact instance.
-        let model_invoke_service = Arc::new(nomifun_model_invoke::ModelInvokeService::new(
-            Arc::new(nomifun_db::SqliteProviderRepository::new(database.pool().clone())),
-            Arc::new(nomifun_db::SqliteProviderModelRepository::new(database.pool().clone())),
-            Arc::new(nomifun_db::SqliteProviderConnectionRepository::new(database.pool().clone())),
-            encryption_key,
-            creation_http.clone(),
-            nomifun_model_invoke::AdapterRegistry::new(nomifun_model_invoke::default_adapters()),
-        ));
         let creation_asset_bridge = Arc::new(crate::workshop_bridge::WorkshopAssetBridge::new(
             data_dir.clone(),
             Arc::new(nomifun_db::SqliteWorkshopRepository::new(database.pool().clone())),
@@ -2833,8 +2913,11 @@ impl AppServices {
         let creation_service = nomifun_creation::CreationService::builder(Arc::new(
             nomifun_db::SqliteCreationTaskRepository::new(database.pool().clone()),
         ))
-        .with_http(creation_http.clone())
         .with_invoke(model_invoke_service.clone())
+        .with_text_executor(Arc::new(AgentCreationTextExecutor {
+            model_invoke: model_invoke_service.clone(),
+            workspace: data_dir.clone(),
+        }))
         .with_asset_source(creation_asset_bridge.clone())
         .with_asset_sink(creation_asset_bridge)
         .build();
@@ -2892,20 +2975,6 @@ impl AppServices {
         let provider_repo_for_services: Arc<dyn IProviderRepository> =
             provider_repo.clone() as Arc<dyn nomifun_db::IProviderRepository>;
 
-        // Seed authoritative capability profiles for any provider models that
-        // lack one (multimodal model hub). Best-effort: never blocks boot on error.
-        reconcile_model_profiles(&provider_repo_for_services, &provider_model_repo).await;
-
-        // One-time legacy speech-preference migration: pre-provider-catalog
-        // configs that still embed a raw openai/deepgram credential (and have
-        // no provider_id) are disabled and de-credentialed. Best-effort:
-        // never blocks boot on error.
-        {
-            let preference_repo =
-                SqliteClientPreferenceRepository::new(database.pool().clone());
-            migrate_legacy_speech_preference(&preference_repo).await;
-        }
-
         #[cfg(feature = "browser-use")]
         let browser_lane_provider_slot =
             nomifun_ai_agent::BrowserLaneClientProviderSlot::new();
@@ -2958,12 +3027,9 @@ impl AppServices {
             event_bus.clone(),
             model_invoke_service.clone(),
             companion_service.clone(),
-            provider_repo_for_services.clone(),
-            provider_model_repo.clone(),
             Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
                 database.pool().clone(),
             )),
-            encryption_key,
         )
         .await
         {
@@ -2976,26 +3042,12 @@ impl AppServices {
 
         let factory = build_agent_factory(AgentFactoryDeps {
             authoritative_user_id: authoritative_user_id.clone(),
-            skill_manager: AcpSkillManager::new(skill_paths.clone()),
-            remote_agent_repo,
-            provider_repo,
-            provider_model_repo: provider_model_repo.clone(),
+            model_invoke: model_invoke_service.clone(),
+            model_invoke_service: Some(model_invoke_service.clone()),
             encryption_key,
-            agent_registry: agent_registry.clone(),
-            acp_agent_service: acp_agent_service.clone(),
             data_dir: data_dir.clone(),
             work_dir: work_dir.clone(),
-            backend_binary_path: backend_binary_path.clone(),
-            requirement_mcp_config: requirement_mcp_config.clone(),
-            // Scoped knowledge-search MCP. Populated only when the server started
-            // above; the assembler further gates injection on bound bases, so a
-            // session without mounts never sees the tool. Independent of the
-            // gateway config — this token never grants gateway reach.
-            knowledge_mcp_config: knowledge_mcp_config.clone(),
             gateway_mcp_config: gateway_mcp_config.clone(),
-            open_mcp_config: open_mcp_config.clone(),
-            computer_mcp_config: computer_mcp_config.clone(),
-            browser_mcp_config: browser_mcp_config.clone(),
             #[cfg(feature = "browser-use")]
             browser_lane_provider: Some(browser_lane_provider_slot.clone()),
             client_prefs: Some(Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
@@ -3059,6 +3111,9 @@ impl AppServices {
         // relevant service calls `AgentRegistry::hydrate`.
         let runtime_registry_concrete = Arc::new(
             InMemoryAgentRuntimeRegistry::new(factory)
+                .with_model_config_resolver(build_agent_model_config_resolver(
+                    model_invoke_service.clone(),
+                ))
                 .with_nomi_session_directory(data_dir.join("nomi-sessions")),
         );
         let agent_runtime_registry: Arc<dyn AgentRuntimeRegistry> = runtime_registry_concrete.clone();
@@ -3079,6 +3134,7 @@ impl AppServices {
             _managed_model_server: managed_model_server,
             _managed_model_refresh_task: managed_model_refresh_task,
             provider_model_repo: provider_model_repo.clone(),
+            provider_model_capability_repo: provider_model_capability_repo.clone(),
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
@@ -3093,7 +3149,6 @@ impl AppServices {
             terminal_service,
             ssh_pool,
             robot,
-            acp_session_sync: acp_agent_service,
             jwt_secret_raw: secret,
             encryption_key,
             data_dir,
@@ -3188,6 +3243,12 @@ impl AppServices {
                 // constructing HostLaunchRequest; Anonymous/Replica/Isolated
                 // Hosts remain headless even in external display mode.
                 headful: primary_host_is_headful(display_mode),
+                // The policy is the separate axis deciding whether the Hub may
+                // resolve visibility per Lane at all. Without this the Hub would
+                // always see the `Auto` default, so a user who explicitly pinned
+                // `headless` would still get a window at an attended moment —
+                // exactly the override the design promises never happens.
+                visibility_policy: browser_visibility_policy(display_mode),
                 ..Default::default()
             };
             // Derive installation-wide throughput from this machine before
@@ -3288,135 +3349,6 @@ where
     browser_cleanup?;
     close_database().await;
     Ok(())
-}
-
-/// Ensure every provider catalog model has an authoritative capability
-/// profile on its [`nomifun_db::ProviderModelRow`]. Since migration 016 the
-/// rows ARE the catalog, so this is a pure backfill pass: unprofiled
-/// membership rows (`tasks == "[]"`, `source == "inferred"`) get tasks/traits
-/// from the name/platform heuristic; existing profiles (incl. user overrides)
-/// are left untouched. Best-effort — logs and returns on any error so boot
-/// never fails on profile reconciliation.
-async fn reconcile_model_profiles(
-    provider_repo: &Arc<dyn IProviderRepository>,
-    provider_model_repo: &Arc<dyn IProviderModelRepository>,
-) {
-    let providers = match provider_repo.list().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("model-profile reconcile: failed to list providers: {e}");
-            return;
-        }
-    };
-    let mut seeded = 0usize;
-    for provider in &providers {
-        match nomifun_system::seed_inferred_provider_models(
-            provider_model_repo.as_ref(),
-            &provider.provider_id,
-            &provider.platform,
-        )
-        .await
-        {
-            Ok(count) => seeded += count,
-            Err(error) => tracing::warn!(
-                provider_id = %provider.provider_id,
-                error = %error,
-                "model-profile reconcile failed"
-            ),
-        }
-    }
-    if seeded > 0 {
-        tracing::info!("model-profile reconcile: seeded {seeded} inferred profile(s)");
-    }
-}
-
-/// Preference keys holding the speech-to-text tool config, in the order the
-/// shell reads them (`nomifun-shell` STT route: namespaced key first, then
-/// the pre-namespacing legacy fallback key).
-const SPEECH_PREFERENCE_KEYS: [&str; 2] = ["tools.speechToText", "speechToText"];
-
-/// One-time boot migration for pre-provider-catalog speech configs.
-///
-/// Legacy speech preferences embedded raw `openai`/`deepgram` credential
-/// blocks instead of referencing a catalog provider (`provider_id`). The
-/// invoke layer only executes catalog-backed models — the shell STT route
-/// already rejects such configs with a "re-select your speech provider"
-/// error — so a stored config that still carries an embedded credential but
-/// no `provider_id` is rewritten here: `enabled` is forced to `false` and the
-/// embedded blocks are removed. All other fields (`model`, `language`,
-/// `auto_send`, ...) are preserved so the user only has to re-select a
-/// provider in Settings.
-///
-/// Idempotent: after the rewrite no embedded credential remains, so the next
-/// boot leaves the value untouched. Credential-less `openai`/`deepgram`
-/// shells (the frontend historically persisted empty-key blocks for
-/// unconfigured providers) are NOT legacy and keep their existing
-/// "not configured" behavior; configs that already carry a `provider_id` are
-/// never touched. Best-effort — logs and returns on any error so boot never
-/// fails on this migration.
-async fn migrate_legacy_speech_preference<R>(preference_repo: &R)
-where
-    R: IClientPreferenceRepository + ?Sized,
-{
-    let rows = match preference_repo.get_by_keys(&SPEECH_PREFERENCE_KEYS).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "legacy speech preference migration: could not read preferences; skipping"
-            );
-            return;
-        }
-    };
-    for row in rows {
-        let Some(rewritten) = rewrite_legacy_speech_preference(&row.value) else {
-            continue;
-        };
-        match preference_repo
-            .upsert_batch(&[(row.key.as_str(), rewritten.as_str())])
-            .await
-        {
-            Ok(()) => tracing::info!(
-                key = row.key.as_str(),
-                "legacy speech config disabled and its embedded credential removed; \
-                 re-select the speech provider in Settings to re-enable speech recognition"
-            ),
-            Err(error) => tracing::warn!(
-                key = row.key.as_str(),
-                %error,
-                "legacy speech preference migration: rewrite failed; value left untouched"
-            ),
-        }
-    }
-}
-
-/// Pure rewrite rule for [`migrate_legacy_speech_preference`].
-///
-/// Returns the replacement JSON when `value` is a legacy embedded-credential
-/// speech config — an object with no `provider_id` (absent or `null`) whose
-/// `openai` or `deepgram` block carries a non-empty `api_key` — and `None`
-/// when the stored value must be left untouched (already-migrated, catalog
-/// mode, credential-less shells, or anything unparseable).
-fn rewrite_legacy_speech_preference(value: &str) -> Option<String> {
-    let mut parsed: serde_json::Value = serde_json::from_str(value).ok()?;
-    let object = parsed.as_object_mut()?;
-    if object.get("provider_id").is_some_and(|id| !id.is_null()) {
-        return None;
-    }
-    let has_embedded_credential = ["openai", "deepgram"].iter().any(|block| {
-        object
-            .get(*block)
-            .and_then(|block| block.get("api_key"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|api_key| !api_key.trim().is_empty())
-    });
-    if !has_embedded_credential {
-        return None;
-    }
-    object.remove("openai");
-    object.remove("deepgram");
-    object.insert("enabled".to_owned(), serde_json::Value::Bool(false));
-    Some(parsed.to_string())
 }
 
 #[cfg(test)]
@@ -3882,52 +3814,90 @@ mod tests {
     #[cfg(feature = "browser-use")]
     #[test]
     fn browser_display_mode_migration_is_authoritative_and_persistable() {
-        // Only a versioned explicit user choice is preserved.
+        // A stored value under the current v3 marker is authoritative.
         assert_eq!(
-            resolve_browser_display_mode(Some("headless"), Some("2")),
+            resolve_browser_display_mode(Some("headless"), Some("3")),
             ("headless", false)
         );
         assert_eq!(
-            resolve_browser_display_mode(Some("external"), Some("\"2\"")),
+            resolve_browser_display_mode(Some("external"), Some("\"3\"")),
             ("external", false)
         );
-        // Every unversioned historical value converges once to the silent
-        // default, including the previous inferred external setting.
+        assert_eq!(
+            resolve_browser_display_mode(Some("auto"), Some("3")),
+            ("auto", false)
+        );
+        // A version-2 marker proves an explicit choice: an external opt-in is
+        // preserved, while v2's universal `headless` default adopts `auto`.
+        assert_eq!(
+            resolve_browser_display_mode(Some("external"), Some("\"2\"")),
+            ("external", true)
+        );
+        assert_eq!(
+            resolve_browser_display_mode(Some("headless"), Some("2")),
+            ("auto", true)
+        );
+        // Every unversioned historical value converges once on `auto`, including
+        // the previous *inferred* external setting, which was never a real user
+        // choice and must not resurrect an operating-system window.
         assert_eq!(
             resolve_browser_display_mode(Some("external"), None),
-            ("headless", true)
+            ("auto", true)
+        );
+        assert_eq!(
+            resolve_browser_display_mode(Some("external"), Some("1")),
+            ("auto", true)
         );
         assert_eq!(
             resolve_browser_display_mode(Some("headless"), Some("1")),
-            ("headless", true)
+            ("auto", true)
         );
-        assert_eq!(
-            resolve_browser_display_mode(None, None),
-            ("headless", true)
-        );
+        assert_eq!(resolve_browser_display_mode(None, None), ("auto", true));
         // Missing or invalid mode under the current marker is repaired.
         assert_eq!(
-            resolve_browser_display_mode(Some("embedded"), Some("2")),
-            ("headless", true)
+            resolve_browser_display_mode(Some("embedded"), Some("3")),
+            ("auto", true)
         );
         assert_eq!(
-            resolve_browser_display_mode(Some("invalid"), Some("2")),
-            ("headless", true)
+            resolve_browser_display_mode(Some("invalid"), Some("3")),
+            ("auto", true)
         );
         assert_eq!(
-            resolve_browser_display_mode(None, Some("2")),
-            ("headless", true),
-            "a marker without a valid mode fails safe to silent headless"
+            resolve_browser_display_mode(None, Some("3")),
+            ("auto", true),
+            "a marker without a valid mode fails safe to the auto default"
         );
         assert_eq!(
-            resolve_browser_display_mode(Some("  \"headless\"  "), Some("  \"2\"  ")),
+            resolve_browser_display_mode(Some("  \"headless\"  "), Some("  \"3\"  ")),
             ("headless", false)
         );
-        // Only the user's explicit external policy launches a visible
-        // Primary Host; everything else stays truly headless.
+        // Only the user's explicit external policy launches a visible Primary
+        // Host. `auto` starts silent and lets the Hub surface a window later.
         assert!(primary_host_is_headful("external"));
         assert!(!primary_host_is_headful("headless"));
+        assert!(!primary_host_is_headful("auto"));
         assert!(!primary_host_is_headful("embedded"));
+
+        // The policy is the separate axis: it decides whether the Hub may resolve
+        // visibility per Lane at all. A pinned choice must forbid that.
+        use nomifun_browser_platform::BrowserVisibilityPolicy;
+        assert_eq!(
+            browser_visibility_policy("external"),
+            BrowserVisibilityPolicy::AlwaysHeadful
+        );
+        assert_eq!(
+            browser_visibility_policy("headless"),
+            BrowserVisibilityPolicy::AlwaysHeadless
+        );
+        assert_eq!(
+            browser_visibility_policy("auto"),
+            BrowserVisibilityPolicy::Auto
+        );
+        assert_eq!(
+            browser_visibility_policy("embedded"),
+            BrowserVisibilityPolicy::Auto,
+            "unrecognized state fails closed to auto, which still launches silently"
+        );
     }
 
     #[cfg(feature = "browser-use")]
@@ -3947,7 +3917,7 @@ mod tests {
 
     #[cfg(feature = "browser-use")]
     #[tokio::test]
-    async fn browser_display_mode_migrates_unversioned_external_to_headless_once() {
+    async fn browser_display_mode_migrates_unversioned_external_to_auto_once() {
         let repo = BrowserPreferenceTestRepository::with_rows(&[
             (BROWSER_DISPLAY_MODE_PREF_KEY, "\"external\""),
             ("agent.browserUse.source", "\"system\""),
@@ -3955,15 +3925,16 @@ mod tests {
 
         let preferences = load_browser_startup_preferences(&repo).await;
         assert_eq!(
-            preferences.display_mode, "headless",
-            "unversioned external state must not keep opening an operating-system window"
+            preferences.display_mode, "auto",
+            "unversioned external state was never an explicit user choice, so it \
+             must not keep opening an operating-system window"
         );
         assert_eq!(
             repo.writes(),
             vec![
                 (
                     BROWSER_DISPLAY_MODE_PREF_KEY.to_owned(),
-                    "\"headless\"".to_owned()
+                    "\"auto\"".to_owned()
                 ),
                 (
                     BROWSER_DISPLAY_MODE_VERSION_PREF_KEY.to_owned(),
@@ -3973,11 +3944,62 @@ mod tests {
         );
     }
 
+    /// A user who explicitly opted into a visible window under version 2 keeps
+    /// it; the new `auto` default must not silently take it away.
     #[cfg(feature = "browser-use")]
     #[tokio::test]
-    async fn browser_display_mode_preserves_versioned_explicit_external() {
+    async fn browser_display_mode_preserves_version_two_explicit_external() {
         let repo = BrowserPreferenceTestRepository::with_rows(&[
             (BROWSER_DISPLAY_MODE_PREF_KEY, "\"external\""),
+            (
+                BROWSER_DISPLAY_MODE_VERSION_PREF_KEY,
+                BROWSER_DISPLAY_MODE_PREVIOUS_POLICY_VERSION,
+            ),
+        ]);
+
+        let preferences = load_browser_startup_preferences(&repo).await;
+        assert_eq!(preferences.display_mode, "external");
+        assert_eq!(
+            repo.writes(),
+            vec![
+                (
+                    BROWSER_DISPLAY_MODE_PREF_KEY.to_owned(),
+                    "\"external\"".to_owned()
+                ),
+                (
+                    BROWSER_DISPLAY_MODE_VERSION_PREF_KEY.to_owned(),
+                    BROWSER_DISPLAY_MODE_POLICY_VERSION.to_owned()
+                ),
+            ],
+            "the preserved choice is restamped with the current lineage marker"
+        );
+    }
+
+    /// Version 2's `headless` was the default for every installation rather than
+    /// a deliberate "never show me a window", so it adopts the new `auto`
+    /// default.
+    #[cfg(feature = "browser-use")]
+    #[tokio::test]
+    async fn browser_display_mode_migrates_version_two_headless_default_to_auto() {
+        let repo = BrowserPreferenceTestRepository::with_rows(&[
+            (BROWSER_DISPLAY_MODE_PREF_KEY, "\"headless\""),
+            (
+                BROWSER_DISPLAY_MODE_VERSION_PREF_KEY,
+                BROWSER_DISPLAY_MODE_PREVIOUS_POLICY_VERSION,
+            ),
+        ]);
+
+        let preferences = load_browser_startup_preferences(&repo).await;
+        assert_eq!(preferences.display_mode, "auto");
+    }
+
+    /// An explicit `headless` under the *current* lineage is a real "never show
+    /// me a window" choice and is preserved verbatim.
+    #[cfg(feature = "browser-use")]
+    #[tokio::test]
+    async fn browser_display_mode_preserves_current_explicit_headless() {
+        let repo = BrowserPreferenceTestRepository::with_rows(&[
+            (BROWSER_DISPLAY_MODE_PREF_KEY, "\"headless\""),
             (
                 BROWSER_DISPLAY_MODE_VERSION_PREF_KEY,
                 BROWSER_DISPLAY_MODE_POLICY_VERSION,
@@ -3985,23 +4007,23 @@ mod tests {
         ]);
 
         let preferences = load_browser_startup_preferences(&repo).await;
-        assert_eq!(preferences.display_mode, "external");
+        assert_eq!(preferences.display_mode, "headless");
         assert!(repo.writes().is_empty());
     }
 
     #[cfg(feature = "browser-use")]
     #[tokio::test]
-    async fn fresh_install_persists_headless_display_mode() {
+    async fn fresh_install_persists_auto_display_mode() {
         let repo = BrowserPreferenceTestRepository::with_rows(&[]);
 
         let preferences = load_browser_startup_preferences(&repo).await;
-        assert_eq!(preferences.display_mode, "headless");
+        assert_eq!(preferences.display_mode, "auto");
         assert_eq!(
             repo.writes(),
             vec![
                 (
                     BROWSER_DISPLAY_MODE_PREF_KEY.to_owned(),
-                    "\"headless\"".to_owned()
+                    "\"auto\"".to_owned()
                 ),
                 (
                     BROWSER_DISPLAY_MODE_VERSION_PREF_KEY.to_owned(),
@@ -4013,7 +4035,7 @@ mod tests {
 
     #[cfg(feature = "browser-use")]
     #[tokio::test]
-    async fn invalid_display_mode_is_repaired_to_headless() {
+    async fn invalid_display_mode_is_repaired_to_auto() {
         let repo = BrowserPreferenceTestRepository::with_rows(&[
             (BROWSER_DISPLAY_MODE_PREF_KEY, "\"visible\""),
             (
@@ -4023,20 +4045,21 @@ mod tests {
         ]);
 
         let preferences = load_browser_startup_preferences(&repo).await;
-        assert_eq!(preferences.display_mode, "headless");
+        assert_eq!(preferences.display_mode, "auto");
         assert_eq!(
             repo.writes(),
             vec![
                 (
                     BROWSER_DISPLAY_MODE_PREF_KEY.to_owned(),
-                    "\"headless\"".to_owned()
+                    "\"auto\"".to_owned()
                 ),
                 (
                     BROWSER_DISPLAY_MODE_VERSION_PREF_KEY.to_owned(),
                     BROWSER_DISPLAY_MODE_POLICY_VERSION.to_owned()
                 ),
             ],
-            "malformed configuration must converge to the silent headless default"
+            "malformed configuration must converge on the auto default, which \
+             still launches silently"
         );
     }
 
@@ -5330,152 +5353,4 @@ mod tests {
         services.database.close().await;
     }
 
-    // -- legacy speech preference migration --
-
-    fn legacy_speech_preference() -> serde_json::Value {
-        serde_json::json!({
-            "enabled": true,
-            "provider": "openai",
-            "model": "whisper-1",
-            "language": "zh",
-            "auto_send": true,
-            "openai": {
-                "api_key": "sk-legacy-secret",
-                "base_url": "https://api.openai.com/v1",
-                "model": "whisper-1"
-            }
-        })
-    }
-
-    #[test]
-    fn rewrite_legacy_speech_preference_disables_and_strips_credentials() {
-        let rewritten =
-            rewrite_legacy_speech_preference(&legacy_speech_preference().to_string())
-                .expect("embedded-credential config without provider_id must be rewritten");
-        let rewritten: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
-        assert_eq!(
-            rewritten,
-            serde_json::json!({
-                "enabled": false,
-                "provider": "openai",
-                "model": "whisper-1",
-                "language": "zh",
-                "auto_send": true
-            }),
-            "non-credential fields must be preserved verbatim"
-        );
-
-        // Idempotent: the rewritten value no longer matches the legacy shape.
-        assert_eq!(rewrite_legacy_speech_preference(&rewritten.to_string()), None);
-    }
-
-    #[test]
-    fn rewrite_legacy_speech_preference_handles_deepgram_and_null_provider_id() {
-        let value = serde_json::json!({
-            "enabled": true,
-            "provider": "deepgram",
-            "provider_id": null,
-            "deepgram": {"api_key": "dg-secret", "model": "nova-2"}
-        });
-        let rewritten = rewrite_legacy_speech_preference(&value.to_string())
-            .expect("null provider_id counts as absent");
-        let rewritten: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
-        assert_eq!(rewritten["enabled"], serde_json::json!(false));
-        assert!(rewritten.get("deepgram").is_none());
-        assert!(rewritten.get("openai").is_none());
-    }
-
-    #[test]
-    fn rewrite_legacy_speech_preference_leaves_non_legacy_values_untouched() {
-        for value in [
-            // Catalog mode: provider_id present (even with a stale embedded block).
-            serde_json::json!({
-                "enabled": true,
-                "provider": "openai",
-                "provider_id": "0190f5fe-7c00-7a00-8000-000000000001",
-                "model": "whisper-1",
-                "openai": {"api_key": "sk-stale", "model": "whisper-1"}
-            })
-            .to_string(),
-            // Credential-less shell (frontend historically persisted empty keys).
-            serde_json::json!({
-                "enabled": true,
-                "provider": "openai",
-                "openai": {"api_key": "  ", "model": "whisper-1"}
-            })
-            .to_string(),
-            // No embedded blocks at all.
-            serde_json::json!({"enabled": false, "provider": "openai"}).to_string(),
-            // Unparseable / non-object values are never touched.
-            "not-json".to_string(),
-            serde_json::json!(["enabled"]).to_string(),
-        ] {
-            assert_eq!(
-                rewrite_legacy_speech_preference(&value),
-                None,
-                "value must be left untouched: {value}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn migrate_legacy_speech_preference_rewrites_both_keys_and_is_idempotent() {
-        let db = nomifun_db::init_database_memory().await.unwrap();
-        let repo = SqliteClientPreferenceRepository::new(db.pool().clone());
-
-        let legacy = legacy_speech_preference().to_string();
-        let unrelated = "\"dark\"";
-        repo.upsert_batch(&[
-            ("tools.speechToText", legacy.as_str()),
-            ("speechToText", legacy.as_str()),
-            ("theme", unrelated),
-        ])
-        .await
-        .unwrap();
-
-        migrate_legacy_speech_preference(&repo).await;
-
-        let read_value = |rows: &[nomifun_db::models::ClientPreference], key: &str| {
-            rows.iter()
-                .find(|row| row.key == key)
-                .map(|row| row.value.clone())
-                .unwrap_or_else(|| panic!("preference '{key}' must survive the migration"))
-        };
-        let rows = repo.get_all().await.unwrap();
-        for key in ["tools.speechToText", "speechToText"] {
-            let migrated: serde_json::Value =
-                serde_json::from_str(&read_value(&rows, key)).unwrap();
-            assert_eq!(migrated["enabled"], serde_json::json!(false), "{key}");
-            assert!(migrated.get("openai").is_none(), "{key} keeps no credential");
-            assert_eq!(migrated["model"], serde_json::json!("whisper-1"), "{key}");
-        }
-        assert_eq!(read_value(&rows, "theme"), unrelated);
-
-        // Second boot: no-op (values byte-identical after another pass).
-        migrate_legacy_speech_preference(&repo).await;
-        let rows_after = repo.get_all().await.unwrap();
-        for key in ["tools.speechToText", "speechToText", "theme"] {
-            assert_eq!(
-                read_value(&rows_after, key),
-                read_value(&rows, key),
-                "second migration pass must not rewrite '{key}'"
-            );
-        }
-
-        db.close().await;
-    }
-
-    #[tokio::test]
-    async fn migrate_legacy_speech_preference_is_a_noop_without_speech_keys() {
-        let db = nomifun_db::init_database_memory().await.unwrap();
-        let repo = SqliteClientPreferenceRepository::new(db.pool().clone());
-        repo.upsert_batch(&[("theme", "\"light\"")]).await.unwrap();
-
-        migrate_legacy_speech_preference(&repo).await;
-
-        let rows = repo.get_all().await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, "theme");
-        db.close().await;
-    }
 }

@@ -24,11 +24,15 @@ use nomifun_common::{
 use nomifun_conversation::ConversationService;
 use nomifun_conversation::runtime_state::ConversationRuntimeStateService;
 use nomifun_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
-use nomifun_db::models::{NewChannelPluginRow, NewChannelUserRow};
+use nomifun_db::models::{
+    CHANNEL_GROUP_ACCESS_MODE_ALLOWLIST, CHANNEL_USER_AUTHORIZATION_APPROVED,
+    NewChannelPluginRow, NewChannelUserRow,
+};
 use nomifun_db::{
     CreateProviderParams, IChannelRepository, IClientPreferenceRepository, IProviderRepository,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteChannelRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteProviderRepository,
+    NewProviderModel, NewProviderModelCapability,
+    SqliteAgentMetadataRepository, SqliteChannelRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteProviderRepository,
 };
 use nomifun_realtime::UserEventSink;
 use tokio::sync::{broadcast, mpsc};
@@ -54,6 +58,9 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
         ),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
+        // The integration harness models Telegram private-chat delivery.
+        chat_kind: nomifun_channel::types::ChatKind::Direct,
+        mention_state: nomifun_channel::types::MentionState::Unknown,
         user: UnifiedUser {
             id: user_id.into(),
             username: None,
@@ -81,6 +88,10 @@ fn make_chat_action_message(user_id: &str, chat_id: &str, action_name: &str) -> 
         ),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
+        // These fixtures model action callbacks from a private chat. Unknown
+        // callback scope is intentionally rejected before authorization.
+        chat_kind: nomifun_channel::types::ChatKind::Direct,
+        mention_state: nomifun_channel::types::MentionState::Unknown,
         user: UnifiedUser {
             id: user_id.into(),
             username: None,
@@ -138,6 +149,7 @@ async fn unauthorized_user_gets_pairing_response() {
         companion_id: None,
         bot_key: None,
         owner_domain: "companion".into(),
+        group_access_mode: CHANNEL_GROUP_ACCESS_MODE_ALLOWLIST.into(),
         created_at: now_ms(),
         updated_at: now_ms(),
     })
@@ -297,10 +309,6 @@ impl AgentRuntimeRegistry for RecordingAgentRuntimeRegistry {
     fn active_runtime_count(&self) -> usize {
         self.agents.lock().unwrap().len()
     }
-
-    fn collect_idle_runtimes(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
-        Vec::new()
-    }
 }
 
 /// Everything needed to drive the message loop end-to-end with an in-memory
@@ -329,23 +337,38 @@ async fn build_harness() -> Harness {
     // Seed the platform model through the same repositories used in production
     // so this full-pipeline fixture exercises a valid channel configuration.
     let provider_repo = SqliteProviderRepository::new(pool.clone());
+    let chat = [NewProviderModelCapability {
+        task: "chat",
+        traits: "[]",
+        protocol: "openai.chat_text",
+        connection_role: "default",
+        provider_params: "{}",
+        ..Default::default()
+    }];
+    let initial_model = NewProviderModel {
+        model: "channel-test-model",
+        enabled: true,
+        sort_order: 0,
+        description: None,
+        capabilities: &chat,
+    };
+    let credentials_encrypted = nomifun_common::encrypt_string(
+        r#"{"api_keys":["test-only"]}"#,
+        &[0x42; 32],
+    )
+    .unwrap();
     provider_repo
         .create(CreateProviderParams {
             provider_id: Some(TEST_PROVIDER),
             platform: "openai",
             name: "Channel test provider",
-            base_url: "https://example.invalid/v1",
-            api_key_encrypted: "test-only",
-            models: r#"["channel-test-model"]"#,
+            base_url: "https://example.invalid",
+            auth_scheme: "bearer",
+            credentials_encrypted: &credentials_encrypted,
             enabled: true,
-            model_context_limits: None,
-            model_protocols: None,
-            model_descriptions: None,
-            model_enabled: None,
             bedrock_config: None,
-            is_full_url: false,
             sort_order: None,
-        })
+        }, &initial_model, &[])
         .await
         .unwrap();
     let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
@@ -379,6 +402,7 @@ async fn build_harness() -> Harness {
             companion_id: None,
             bot_key: None,
             owner_domain: "companion".into(),
+            group_access_mode: CHANNEL_GROUP_ACCESS_MODE_ALLOWLIST.into(),
             created_at: now_ms(),
             updated_at: now_ms(),
         })
@@ -392,6 +416,7 @@ async fn build_harness() -> Harness {
             platform_type: "telegram".into(),
             channel_plugin_id: Some(plugin.channel_plugin_id.clone()),
             display_name: Some("Test".into()),
+            authorization_kind: CHANNEL_USER_AUTHORIZATION_APPROVED.into(),
             authorized_at: now_ms(),
             last_active: None,
         })
@@ -409,7 +434,6 @@ async fn build_harness() -> Harness {
             Arc::clone(&runtime_registry),
             Arc::new(SqliteConversationRepository::new(pool.clone())),
             Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
-            Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
             Arc::new(nomifun_conversation::NoExecutionConversationBoundary),
         )
         .with_runtime_state(Arc::clone(&runtime)),

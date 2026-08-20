@@ -14,7 +14,7 @@ use async_trait::async_trait;
 /// Which persisted evidence source must vouch for one orphaned generation.
 ///
 /// Mirrors `RunningOrphanDisposition` for the provable backends; the
-/// `ExternalTerminalProofRequired` disposition never reaches a provider.
+/// A disposition with no local evidence source never reaches a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanProofRequirement {
     /// In-process turn owner with audited parent-death containment for every
@@ -24,10 +24,6 @@ pub enum OrphanProofRequirement {
     /// Effect-bearing child registered durably at spawn: proof = verified
     /// reaping of the Conversation's registry entries (absence is proof).
     RegisteredLocalProcessTree,
-    /// Gateway process registered only when self-spawned: proof requires
-    /// entries to have existed AND all to be reaped with identity
-    /// verification; registry absence is ambiguous and never proves.
-    RegisteredGatewayAuthority,
 }
 
 /// Outcome of one terminal-proof evaluation.

@@ -3,7 +3,7 @@
 <div align="center">
 
 <a href="https://www.nomifun.com">
-  <img src="docs/images/readme-00-agent-collaboration-hero.png" alt="NomiFun Agent 协作、角色沉淀与执行图" width="100%">
+  <img src="docs/images/readme/zh/workspace.png" alt="当前 NomiFun Desktop 工作台" width="100%">
 </a>
 
 <h3>一项毫无保留、<em>本地优先</em>的超级 AI 工作站。</h3>
@@ -36,6 +36,7 @@
   <a href="docs/README.zh.md">📖 文档</a>&nbsp;·&nbsp;
   <a href="#-快速开始">🚀 快速开始</a>&nbsp;·&nbsp;
   <a href="https://github.com/nomifun/nomifun-desktop/releases">📦 下载</a>&nbsp;·&nbsp;
+  <a href="https://gitee.com/nomifun/nomifun-desktop">🇨🇳 Gitee 源码</a>&nbsp;·&nbsp;
   <a href="https://pan.baidu.com/s/5GPonoJNrwJ7GciBSDgXLaA">百度网盘</a>&nbsp;·&nbsp;
   <a href="#-联系我们--社区">💬 社区</a>
 </p>
@@ -52,6 +53,47 @@
 **NomiFun** 满足你对 AI 工作站的全部想象 —— 而且一切由你做主。一套 React 前端 + 一套 Rust 后端，为你带来会成长的桌面伙伴、无人值守的自动化平台、统一知识库、原生的 computer / browser use，以及任何智能体都能驱动的开放能力总线。无需云账号、无遥测、无订阅。除了**你自己配置**的大模型调用，你的数据绝不离开本机。
 
 > 产品名是 **NomiFun**；小写 `nomifun` 仅用于代码标识符、crate 名、环境变量与仓库路径。
+
+---
+
+## NomiFun 开源产品家族
+
+NomiFun 由四个相互关联的开源项目组成。**Desktop 是本地数据、模型、Agent、任务与
+工具中枢**；Mobile 和小智机器人接入你在 Desktop 中显式开放的能力，Net Infra 则提供
+可选的自托管跨网中继。Desktop 还承载
+Agent 小程序，让 Agent 创建的应用继续复用同一套本地运行时与受治理能力，而不是沦为
+一个割裂的演示页面。
+
+| 项目 | 定位 | 文档与入口 |
+|---|---|---|
+| **NomiFun Desktop**（本仓库；[GitHub](https://github.com/nomifun/nomifun-desktop) · [Gitee](https://gitee.com/nomifun/nomifun-desktop)） | 数据、模型、Agent、任务、Skill、知识库、小程序、WebUI、REST 与 MCP 的本地事实源和执行中枢 | [下载](https://github.com/nomifun/nomifun-desktop/releases) · [Desktop 文档](https://www.nomifun.com/zh/docs/) · [WebUI 远程访问](docs/guides/webui-remote-access.zh.md) |
+| NomiFun Mobile（[GitHub](https://github.com/nomifun/nomifun-mobile) · [Gitee](https://gitee.com/nomifun/nomifun-mobile)） | 直接复用 Desktop 会话、任务、需求、伙伴与管理能力的 Android / iOS / H5 客户端 | [Mobile 文档](https://github.com/nomifun/nomifun-mobile#readme) · 在 Desktop 开启**远程与开放 → WebUI 访问**后扫描一次性二维码 |
+| NomiFun 小智云台（[GitHub](https://github.com/nomifun/nomifun-xiaozhi-yuntai) · [Gitee](https://gitee.com/nomifun/nomifun-xiaozhi-yuntai)） | 为伙伴提供语音、运动、屏幕和设备侧多模态交互的 ESP32-S3 机器人与云台 | [小智文档](https://github.com/nomifun/nomifun-xiaozhi-yuntai#readme) · [Desktop 接入指南](docs/guides/xiaozhi-robot.zh.md) |
+| NomiFun Net Infra（[GitHub](https://github.com/nomifun/nomifun-net-infra) · [Gitee](https://gitee.com/nomifun/nomifun-net-infra)） | 自托管的 NomiRelay 网络中继，把 NAT 后的 Desktop 或其他 HTTP/WebSocket/TCP/UDP 服务提供给跨网络手机与 IoT 设备 | [产品页](https://www.nomifun.com/zh/products/net-infra/) · [门户接入文档](https://www.nomifun.com/zh/docs/guides/net-infra/) · [中继文档](https://github.com/nomifun/nomifun-net-infra/tree/main/docs/integration) |
+
+### 四个项目如何接入
+
+1. 运行 Desktop，配置需要的模型和伙伴；Desktop 保留主数据集并实际执行任务。
+2. Mobile 在 Desktop 的**远程与开放 → WebUI 访问**页面开启监听，然后扫描短时效、
+   一次性的二维码。局域网内 Mobile **直连 Desktop，不经过 NomiFun 云中转**；手机是
+   已认证客户端，Desktop 是权威服务器，所以无需把模型密钥和持久数据复制到手机。
+3. 小智云台刷入固件后，在伙伴的**远程控制 → 机器人连接**页面完成绑定。
+4. 需要跨网络访问时，自行部署 NomiRelay 与 `nfagent`，再让 Mobile 连接 Relay 的
+   业务入口。Mobile 不持有中继管理员凭据，Desktop 仍然是业务数据与执行权威端。
+
+请仅在可信网络中开启远程接口。认证、局域网暴露和部署边界以相应指南为准。
+
+### 一个本地中枢，多种交互界面
+
+这不是几个恰好使用同一 Logo 的独立客户端。Desktop 保存持久状态并执行模型、Agent、
+需求、工具、知识库、伙伴记忆和 Skill；Mobile 是局域网直连的移动控制界面；小智是
+语音与运动硬件界面；小程序则是同一 Desktop 安装创建并托管的软件交互界面；Net Infra
+是可选网络承载层，而不是另一套业务后端。它们共享
+一张受治理的能力图，而不是各自创建云账号、凭据和用户数据副本。
+
+信任边界、通信模型、架构创新与产品里程碑详见
+[《NomiFun 产品生态架构》](docs/architecture/product-ecosystem.zh.md)；English:
+[`product-ecosystem.md`](docs/architecture/product-ecosystem.md)。
 
 ---
 
@@ -96,32 +138,40 @@
 </p>
 
 <p>
-  <img src="docs/images/readme-01-workbench-overview.png" alt="NomiFun Agent 协作与执行图" width="100%">
-  <br/><sub><b>Agent 协作：一条会话、可复用角色与实时执行图</b></sub>
+  <img src="docs/images/readme/zh/workspace.png" alt="当前 NomiFun Desktop 工作台" width="100%">
+  <br/><sub><b>统一工作台 · 会话、Agent、任务、工具与连接设备集中管理</b></sub>
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/readme-05-companions.png" alt="桌面伙伴总览"><br/><sub><b>桌面伙伴 · 记忆与成长</b></sub></td>
-    <td width="50%"><img src="docs/images/readme-07-requirements.png" alt="需求平台列表"><br/><sub><b>需求平台 · AutoWork 入口</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/zh/models.png" alt="NomiFun 多模型管理"><br/><sub><b>多模型管理 · 按任务路由与免费模型</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/zh/companions.png" alt="NomiFun 桌面伙伴"><br/><sub><b>桌面伙伴 · 人格、记忆、模型与远程控制</b></sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/images/readme-06-knowledge.png" alt="知识库列表"><br/><sub><b>知识库 · 本地领域知识</b></sub></td>
-    <td width="50%"><img src="docs/images/readme-02-terminal-create.png" alt="新建智能体终端"><br/><sub><b>终端 · 能力开放给 Agent CLI</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/readme-03-presets.png" alt="设定与 Skill 能力库"><br/><sub><b>设定 & Skill · 可复用能力模板</b></sub></td>
-    <td width="50%"><img src="docs/images/readme-04-model-agents.png" alt="模型与 Agent 管理"><br/><sub><b>模型 & Agent · 统一管理与接入</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/zh/skills.png" alt="当前 NomiFun Skill 中心"><br/><sub><b>Skill 中心 · 可复用、受治理的 Agent 能力</b></sub></td>
+    <td width="50%"><img src="docs/images/readme/zh/creative-workshop.png" alt="NomiFun 创意工坊 Beta"><br/><sub><b>创意工坊 · 持久化多模态创作画布（Beta）</b></sub></td>
   </tr>
 </table>
 
-<sub>均为 2026-07-01 从当前运行中的 NomiFun 桌面应用截取，并保留 2560px 宽度版本。完整截图清单与采集方式见 <a href="docs/images/SCREENSHOTS.md">截图 manifest</a>。</sub>
+<sub>已同步为 NomiFun Portal 中当前的产品截图。完整截图清单、来源与使用范围见 <a href="docs/images/SCREENSHOTS.md">截图 manifest</a>。</sub>
 
 </div>
 
 ---
 
 ## 🚀 功能亮点
+
+NomiFun Desktop 已经从 Agent 聊天客户端发展为本地优先、可扩展的 AI 工作空间。下面
+这些产品界面共享同一套会话、模型、记忆、工具、权限与执行运行时：
+
+| 产品能力 | 带来的价值 |
+|---|---|
+| **多 Agent 执行集群** | 按依赖规划任务，委派给专用 Agent，并行调度执行，同时提供实时状态、真实会话、审批、重试与恢复。 |
+| **Agent 小程序** | 把普通 Agent 会话变成可预览、可发布的本地 Web 工具，同时保留可编辑工作副本与稳定的发布快照。 |
+| **创意工坊（Beta）** | 用持久化可视画布与素材库组织由模型驱动的图片、文本、视频和语音创作。 |
+| **按任务路由的多模型控制面** | 可扩展管理聊天、实时、语音、视觉、媒体生成、Embedding 与 Rerank 模型，并支持任务级路由与故障切换。 |
+| **NomiFun 免费模型** | 内置托管供应商，无需先手动新建供应商，即可启用、刷新目录、健康检查并开箱使用。 |
+| **手机、机器人与开放接入** | Mobile 直连 Desktop，小智机器人绑定伙伴，并通过 WebUI、REST、MCP、IM 渠道和 NomiRelay 安全开放能力。 |
 
 ### 🐾 桌面伙伴 —— 越用越懂你
 
@@ -145,14 +195,34 @@
 ASR、TTS、会话和工具协同。接入入口就在每个伙伴的**远程控制 → 机器人连接**：
 复制 OTA 地址，输入机器人显示的 6 位激活码，即可把实体设备绑定到该伙伴。
 
-### 🧠 Agent 协作
+### 🧩 Agent 小程序 —— 把一次会话变成可复用工具
 
-从一条普通 Agent 会话开始。当任务确实值得并行时，同一套 Agent 能力会委派部分工作，并展示实时执行图。
+在普通 Agent 会话中创建小程序，在同一工作区预览，并显式发布稳定快照到本地小程序
+库。Desktop 会把已发布版本与可编辑工作副本分开管理，因此后续迭代不会悄悄改变用户
+正在启动的版本。每次修改仍然依附于一条正常、可审计的会话，而不是藏在小程序里的
+第二套聊天系统；最终的小程序可以继续复用同一套本地 Agent、数据、模型和受治理工具。
 
-- **产品只保留一个概念。** 你只需配置 Agent 和协作策略；委派工作始终留在同一个 Conversation 与唯一的 `AgentExecution` 聚合中。
-- **每个步骤都能启动前配置。** 被委派的 Agent 真正启动前，可单独改模型、补一段预置要求；已完成步骤也能带着这套配置重试。
-- **执行前先给你过目。** 开启计划审批后，协作会在规划完成时暂停，让你先审核和调整执行图，再开始工作。
-- **真实 Agent 会话。** 点击任一步骤，就能查看该 Agent 的真实会话；随时回到主会话继续指导整体工作。
+### 🎨 创意工坊 —— 持久化画布上的多模态创作 *（Beta）*
+
+创意工坊把持久化可视画布与可复用素材库放在一起。你可以组合图片、文本、视频、生成器、
+循环、对比、输出与分组节点来搭建创作流程，不再让每次提示词都散落在独立会话里。根据
+已配置模型的能力，工坊可以执行文生图、图生图、局部重绘、文生视频、图生视频、文本生成
+与语音合成，生成结果会留在画布上，方便对比和继续加工。
+
+> **Beta 提示：** 创意工坊已经包含在当前版本中，但画布模型和工作流格式仍在演进。
+> 请保留原始素材，不要把单个工坊项目当作唯一归档副本。
+
+### 🧠 多 Agent 执行集群 —— 规划、调度与监督
+
+从一条普通 Agent 会话开始。当任务需要专业分工或并行执行时，NomiFun 会创建一个与原始
+Conversation 关联的持久化 `AgentExecution` 聚合，规划依赖图，把就绪步骤调度给被委派的
+Agent；主 Agent 始终是整次执行的控制点。
+
+- **依赖感知调度。** 相互独立的步骤可以并行；被依赖阻塞的步骤会等待前置结果，不会拿着不完整上下文抢跑。
+- **逐步骤启动前控制。** 被委派 Agent 启动前可单独改模型、补充预置要求；完成或失败步骤可以沿用配置重试。
+- **执行前先审批。** 开启计划审批后，系统会在规划完成时暂停并把执行图放回会话，让你调整后再开始。
+- **实时状态与真实会话。** 跟踪每个步骤的状态，打开该 Agent 的真实会话，再返回主会话继续监督整个集群。
+- **恢复属于执行本身。** 持久化状态支持重试与重启恢复，不会把集群任务降级成一次性后台消息。
 
 ### 🤖 智能值守 —— 需求平台 + AutoWork + IDMM
 
@@ -194,7 +264,7 @@ ASR、TTS、会话和工具协同。接入入口就在每个伙伴的**远程控
 自研、**进程内 Rust** 实现 —— 不依赖 Playwright、不依赖 Node、不依赖第三方自动化守护进程。能力更强、速度更快、token 更省，提供细粒度控制，且完全开源供你增强。
 
 - **Computer use** —— 无障碍树 + Set-of-Marks 叠层 + OCR，引导模型操作真实 UI 元素而非猜像素。macOS（AXUIElement + Vision OCR）与 Windows（UI Automation）已完整，Linux（AT-SPI2）为部分支持。
-- **Browser use** —— 由应用主进程中的 `BrowserSessionHub` 统一管理 Chromium Host 与可寻址 Browser Lane；内置 Agent、ACP/Codex、Gateway、远程 Agent 和并行 AgentExecution attempt 都进入同一平台，不再各自启动私有浏览器。
+- **Browser use** —— 由应用主进程中的 `BrowserSessionHub` 统一管理 Chromium Host 与可寻址 Browser Lane；内置 Agent、Gateway 和并行 AgentExecution attempt 都进入同一平台，不再各自启动私有浏览器。
 - **只做浏览器状态与生命周期管理。** 右侧 **Browser** 页面展示会话、runtime、Lane、Tab、URL、身份模式、容量、队列位置、压力、资源估算和错误；用户可对 running Primary Lane 显式“前台打开”，但页面不嵌入预览，也不提供页面输入或接管控件。
 - **共享实时登录身份。** 普通交互式 Lane 使用 NomiFun 管理的稳定 Primary profile，并实时共享登录状态；公开抓取使用不携带 Primary cookies/站点存储的匿名身份，显式隔离任务使用独立身份。NomiFun 不读取用户真实 Chrome / Edge profile。
 - **并发有界且可观察。** 不同 Lane 可真正并行，同一 Lane 严格串行；容量不足时显示队列位置、压力原因和建议并发，而不是用不可见的全局锁假装浏览器已就绪。
@@ -214,19 +284,30 @@ NomiFun 的每一项能力都经由单一、强类型的能力注册表对外开
 - **REST + OpenAPI** 位于 `/v1/tools`，支持流式，并自动生成 `/v1/openapi.json`。
 - 在总线上新增一项能力，会自动同时出现在 MCP **与** REST 上 —— 不漂移。
 
-### 🧩 自带智能体，也能接入你的
+### 🧩 一个内置智能体，任意模型
 
 > 指南：[`docs/guides/model-routing.zh.md`](docs/guides/model-routing.zh.md)
 
-- **内置 `nomi` 智能体** —— 无需额外安装。支持 **26+ 模型供应商/预设**（OpenAI、Anthropic、Gemini + Vertex AI、AWS Bedrock、DeepSeek、OpenRouter、Moonshot/Kimi、通义千问/Dashscope、智谱/GLM、MiniMax、SiliconFlow、xAI、火山/豆包 等），覆盖 **4 种线缆协议**，并支持 **New API** 聚合网关。
-- **经 ACP 直连约 19 个外部智能体** —— Claude Code、Codex、Gemini、Qwen、Kimi、Cursor、Copilot、Goose、OpenCode、Droid 等，NomiFun 为它们提供模型*以及*自家的原生能力（computer/browser/knowledge/gateway，经注入的 MCP 桥）。
-- **处处可用** —— 这些原生能力对内置智能体、ACP 智能体、聊天界面**以及**终端一律可用。
+- **内置 `nomi` 智能体** —— 无需额外安装，也是唯一的会话引擎。支持 **26+ 模型供应商/预设**（OpenAI、Anthropic、Gemini + Vertex AI、AWS Bedrock、DeepSeek、OpenRouter、Moonshot/Kimi、通义千问/Dashscope、智谱/GLM、MiniMax、SiliconFlow、xAI、火山/豆包 等），覆盖 **4 种线缆协议**，并支持 **New API** 聚合网关。
+- **只有一条代码路径** —— 每个会话跑的都是同一个引擎，因此不论你选哪个模型，能力、工具策略、审批与故障转移的行为完全一致。
+- **想用 Claude Code、Codex 或 Gemini CLI？** 请用**终端模式** —— 真实的应用内 PTY 会话，NomiFun 的能力经各 CLI 自己的原生配置注入。见 [`docs/guides/terminal.zh.md`](docs/guides/terminal.zh.md)。
+- **处处可用** —— 这些原生能力对内置智能体、聊天界面**以及**终端一律可用。
 - **多模态失败会优雅降级。** 如果当前模型/供应商不接受图片输入，NomiFun 会自动剔除图片、在同一会话里重试，并给出一条可见提示，而不是直接把整段会话打断。
 - **每模型上下文窗口可单独校准。** 当上游平台默认值不准、没报全，或你想精细控制路由与长上下文预算时，可以按模型单独覆写上下文窗口上限。
 
-### 🔌 大模型供应商快捷入口
+### 🔌 多模型控制面 —— 供应商、能力与免费模型
 
-NomiFun 不绑定任何一家模型厂商。你可以按地区、价格、额度、模型能力和数据政策选择供应商，注册后把 API Key 填到 NomiFun 的 **模型 & Agent** 页面即可使用。以下均为第三方服务，费用、可用地区、速率限制与数据处理规则以各家官方说明为准。
+NomiFun 把供应商凭据与模型能力分开管理。你可以持续扩展自己的供应商目录，并把模型
+分别用于聊天、实时交互、ASR、TTS、视觉、图片生成/编辑、视频生成、Embedding 与
+Rerank。路由会感知任务类型，支持逐模型上下文窗口与故障切换，也不会假设不同供应商
+共用同一套 URL、协议或鉴权方式。
+
+**NomiFun 免费模型**通过内置托管供应商提供。无需先新建供应商或填写自己的 API Key，
+即可启用服务、刷新模型目录、执行健康检查并激活可用模型，真正做到开箱即用。它们属于
+在线第三方推理服务，可用性、限额和数据处理方式可能变化；发送敏感内容前请阅读产品内提示。
+
+对于自有供应商，可以按地区、价格、额度、能力和数据政策选择，并在 **模型 & Agent**
+页面填写凭据。下列均为第三方服务，费用、可用地区、速率限制与数据处理规则由各家控制。
 
 | 供应商 | 快速入口 | 推荐关注点 |
 |---|---|---|
@@ -243,17 +324,21 @@ NomiFun 不绑定任何一家模型厂商。你可以按地区、价格、额度
 | <img src="https://www.google.com/s2/favicons?sz=64&domain=openai.com" alt="OpenAI logo" width="20" height="20"> **GPT / OpenAI** | [GPT 模型](https://platform.openai.com/docs/models) · [API Key](https://platform.openai.com/api-keys) | GPT 模型、OpenAI API、Agent 工作流、代码与通用任务 |
 | <img src="https://www.google.com/s2/favicons?sz=64&domain=aistudio.google.com" alt="Gemini logo" width="20" height="20"> **Gemini / Google AI** | [API Key](https://aistudio.google.com/app/apikey) | Gemini 系列、多模态、超长上下文与 Google AI Studio |
 
-### 💻 终端模式
+### 💻 终端模式 —— 第三方 agent CLI 的落脚处
 
 > 指南：[`docs/guides/terminal.zh.md`](docs/guides/terminal.zh.md)
 
-在应用内 PTY 会话里运行各种 agent CLI（或独立的 `nomi` CLI）。NomiFun 会把原生能力 —— 知识检索、需求完成、生命周期 hooks —— 经各 CLI *自己的*原生配置注入进去，从而保留完整保真度与 OAuth。
+在应用内 PTY 会话里运行各种 agent CLI（或独立的 `nomi` CLI）。**Claude Code、Codex、Gemini CLI** 就是这样与 NomiFun 配合使用的：真实的伪终端，CLI 自己的登录与 OAuth，自己的审批提示，没有任何一处被重新实现。NomiFun 会把原生能力 —— 知识检索、需求完成、生命周期 hooks —— 经各 CLI *自己的*原生配置注入进去，从而保留完整保真度。AutoWork 也能逐回合驱动这样的终端。
 
-### 📱 WebUI 远程操控 —— 一扫即用
+### 📱 NomiFun Mobile —— 直连你的 Desktop
 
 > 指南：[`docs/guides/webui-remote-access.zh.md`](docs/guides/webui-remote-access.zh.md)
+> · 应用：[nomifun-mobile](https://github.com/nomifun/nomifun-mobile)
 
-不用任何社交平台。一键**扫码配对**，就能让手机或平板经局域网连上电脑（一次性令牌，实时走 WebSocket），让你窝在沙发上也能远程操控你的工作站。
+局域网内无需社交平台，也无需 NomiFun 云中转。一键**扫码配对**会给手机签发短时效、
+一次性的登录凭证，让 Mobile 直连 Desktop 进程内的认证监听器。Mobile 随即实时使用
+Desktop 中同一套会话、任务、需求、伙伴、模型和工具；Desktop 始终是数据与执行权威端。
+手机只是经过认证的连接客户端，因此不需要复制一套数据库，也不需要再保存一份模型密钥。
 
 ### ⚙️ config one，use anywhere
 
@@ -272,6 +357,10 @@ NomiFun 不绑定任何一家模型厂商。你可以按地区、价格、额度
 ## 🏗️ 架构
 
 一套 React 前端、一套 Rust 后端，**两种宿主模式** —— 同一套后端在两者中均为进程内运行。
+
+在产品家族层面，Desktop 同时也是 Mobile、小智、小程序和伙伴 IM 渠道的中枢。完整
+通信、安全与创新模型见
+[`docs/architecture/product-ecosystem.zh.md`](docs/architecture/product-ecosystem.zh.md)。
 
 | | `nomifun-desktop` | `nomifun-web` |
 |---|---|---|
@@ -339,7 +428,7 @@ bun run build:ui && bun run serve:web
 
 官方镜像已发布到 Docker Hub：
 [`nomifun/nomifun-web`](https://hub.docker.com/repository/docker/nomifun/nomifun-web)。
-下面示例使用已发布的 `v0.3.4` tag；后续有新版本时，可按 Docker Hub 页面替换。
+下面示例使用稳定滚动标签 `latest`。如需可复现部署，请固定明确版本或镜像 digest。
 
 ```bash
 # 拉取并运行官方镜像。
@@ -348,7 +437,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8787:8787 \
   -v nomifun-data:/data \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 # 然后打开 http://<服务器IP>:8787 并创建首位管理员
 ```
 
@@ -362,7 +451,7 @@ docker run -d \
   -v nomifun-data:/data \
   -e NOMIFUN_ADMIN_USERNAME=admin \
   -e NOMIFUN_ADMIN_PASSWORD='change-me-to-something-strong' \
-  nomifun/nomifun-web:v0.3.4
+  nomifun/nomifun-web:latest
 ```
 
 Docker Compose 也可以直接使用官方镜像：
@@ -370,7 +459,7 @@ Docker Compose 也可以直接使用官方镜像：
 ```yaml
 services:
   nomifun:
-    image: nomifun/nomifun-web:v0.3.4
+    image: nomifun/nomifun-web:latest
     restart: unless-stopped
     ports:
       - "8787:8787"
@@ -393,7 +482,7 @@ docker compose up -d --build
 # 然后打开 http://<服务器IP>:8787  —  配合自带的 Caddyfile 启用 TLS
 
 # 已有 ui/dist 和 target/release/nomifun-web 时的快路径：
-bun run docker:prebuilt -- --tag nomifun/nomifun-web:v0.3.4 --build-missing --sudo
+bun run docker:prebuilt -- --tag nomifun/nomifun-web:latest --build-missing --sudo
 ```
 
 详见 [`docs/getting-started/installation.zh.md`](docs/getting-started/installation.zh.md) 与 [`docs/guides/web-server-deployment.zh.md`](docs/guides/web-server-deployment.zh.md)。
@@ -407,7 +496,7 @@ bun install        # 安装依赖（一次性）
 bun run dev        # 桌面应用开发（热重载）
 bun run dev:web    # web 宿主 + Vite 开发
 bun run build:ui   # 构建 SPA
-bun run check      # 前端 typecheck + i18n + 主题 + 脚本登记 门禁
+bun run check      # 前端 typecheck + i18n + 主题 + 脚本登记检查
 bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 ```
 
@@ -441,7 +530,6 @@ bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 | **运行（组装好的应用）** | |
 | `bun run serve:web` | 启动 Web 服务器，托管已构建的前端 |
 | **测试** | |
-| `bun run test:git-attribution` | Validate the repository-local human-only Git attribution policy. |
 | `bun run test` | 运行全部 Rust 测试（含 doctest） |
 | `bun run test:fast` | 用 nextest 快速跑 Rust 测试（日常） |
 | `bun run test:crate` | 运行单个 Rust crate：bun run test:crate <crate> [cargo 参数] |
@@ -449,11 +537,11 @@ bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 | `bun run test:desktop` | 运行桌面壳测试，不监听或打包 ui/dist 资源 |
 | `bun run test:browser` | 运行 browser-use 门控的 Rust 测试（browser-platform 全量 + gateway/ai-agent/nomi-agent/app 开启 --features browser-use；crate/core 车道会静默跳过这些） |
 | `bun run test:ui` | 运行前端单元测试（bun test，收集 ui/src 下全部 *.test.ts/tsx） |
-| **静态检查 / 门禁** | |
+| **静态检查** | |
 | `bun run check:process-runtime-boundary` | Enforce the supervised process runtime boundary and exact hand-off allowlist. |
 | `bun run check:browser-platform-boundary` | Enforce the single BrowserSessionHub ownership boundary and reject private browser launch paths. |
 | `bun run check:agent-vocabulary` | Enforce AgentExecution as the only active collaboration aggregate and permit only exact migration fences. |
-| `bun run check` | 聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 死 CSS 工具类 + 进程运行时边界 + Agent 词汇边界 + 脚本登记 |
+| `bun run check` | 聚合静态检查：typecheck + i18n + 主题契约 + 图标导入 + 死 CSS 工具类 + 进程运行时边界 + Agent 词汇边界 + 脚本登记 |
 | `bun run typecheck` | 前端 TypeScript 类型检查（tsc --noEmit） |
 | `bun run check:i18n` | 校验 i18n 类型与 locale 键是否一致 |
 | `bun run check:theme` | 校验预设 CSS 主题契约 |
@@ -462,7 +550,6 @@ bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 | **代码生成** | |
 | `bun run gen:i18n` | 由 locale 重新生成 i18n 类型声明 |
 | **维护 / 工具** | |
-| `bun run setup:git-hooks` | Enable this repository's human-only Git attribution hooks without changing global Git config. |
 | `bun run clean` | 深度回收构建空间（debug 产物 + flycheck + 旧安装包） |
 | `bun run seed:dev` | 用生产数据目录播种 dev 数据目录 |
 | `bun run bump` | 统一改版本号：根 Cargo.toml(真源) + package.json + ui + Cargo.lock，可选 --tag 提交并打 tag |
@@ -534,13 +621,14 @@ NomiFun **完全开源、毫无保留**。个人与企业都可以在它之上�
 
 ## 📬 联系我们 / 社区
 
-我们很想听到你的声音。最快的方式是 GitHub；下列社交渠道均为官方。
+以下联系信息由 NomiFun 开源产品家族统一使用。对于可复现的问题与功能建议，优先使用
+GitHub Issues。
 
 | 渠道 | 入口 |
 |---|---|
 | 🌐 **官网** | [www.nomifun.com](https://www.nomifun.com) |
-| 🐙 **GitHub** | [nomifun/nomifun-desktop](https://github.com/nomifun/nomifun-desktop) · [Issues](https://github.com/nomifun/nomifun-desktop/issues) · [Releases](https://github.com/nomifun/nomifun-desktop/releases) |
-| ✉️ **邮箱** | `hello@nomifun.com` <sub>（占位 · 待确认）</sub> |
+| 🐙 **问题反馈** | [github.com/nomifun/nomifun-desktop/issues](https://github.com/nomifun/nomifun-desktop/issues) |
+| 📮 **联系页** | [www.nomifun.com/contact](https://www.nomifun.com/contact) |
 | 📕 **小红书** | [NomiFun](https://xhslink.com/m/4x6ti8n6cA1) |
 | 📺 **哔哩哔哩** | [NomiFun](https://b23.tv/0UhgKDh) · [演示视频](https://www.bilibili.com/video/BV1kwKZ6UE5X/) |
 | 🎵 **抖音** | [NomiFun](https://v.douyin.com/MDT5QVdYaJk/) |
@@ -553,7 +641,7 @@ NomiFun **完全开源、毫无保留**。个人与企业都可以在它之上�
 <div align="center">
 <table>
   <tr>
-    <td align="center"><img src="docs/images/contact/wechat-group-qr.jpg" alt="微信群二维码" width="220"><br/><sub><b>微信群</b></sub></td>
+    <td align="center"><img src="docs/assets/nomifun-wechat-group.jpg" alt="NomiFun 微信交流群二维码" width="220"><br/><sub><b>NomiFun 微信交流群</b></sub></td>
     <td align="center"><img src="docs/images/contact/qq-group-qr.png" alt="QQ 群二维码" width="220"><br/><sub><b>QQ 群</b></sub></td>
   </tr>
 </table>

@@ -1,4 +1,3 @@
-pub mod acp_session;
 pub mod agent_metadata;
 pub mod agent_execution;
 pub mod agent_execution_template;
@@ -10,6 +9,7 @@ pub mod conversation;
 pub mod creation_task;
 pub mod cron;
 pub mod customer_service;
+pub mod customer_service_search;
 pub mod idmm_intervention;
 pub mod companion_token;
 pub mod knowledge;
@@ -19,13 +19,12 @@ pub mod oauth_token;
 pub mod provider;
 pub mod provider_connection;
 pub mod provider_model;
+pub mod provider_model_capability;
 pub mod preset;
-pub mod remote_agent;
 pub mod requirement;
 mod settings;
 pub mod skill_tag;
 pub mod ssh_host;
-mod sqlite_acp_session;
 mod sqlite_agent_metadata;
 mod sqlite_agent_execution;
 mod sqlite_agent_execution_template;
@@ -44,9 +43,9 @@ mod sqlite_oauth_token;
 mod sqlite_provider;
 mod sqlite_provider_connection;
 mod sqlite_provider_model;
+mod sqlite_provider_model_capability;
 mod sqlite_miniapp;
 mod sqlite_preset;
-mod sqlite_remote_agent;
 mod sqlite_requirement;
 mod sqlite_settings;
 mod sqlite_skill_tag;
@@ -62,16 +61,16 @@ mod user;
 pub mod webhook;
 pub mod workshop;
 
-pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
 pub use agent_execution::*;
 pub use agent_execution_template::*;
 pub use attachment::IAttachmentRepository;
 pub use channel::{
     ChannelInboundClaim, IChannelRepository, PENDING_PROMPT_EXPIRY_MS,
-    PENDING_PROMPT_QUEUE_LIMIT, PendingPromptEnqueue, SettleChannelInboundReceiptParams,
+    PENDING_PROMPT_QUEUE_LIMIT, PairingApprovalOutcome, PendingPromptEnqueue,
+    SettleChannelInboundReceiptParams,
 };
-pub use client_preference::IClientPreferenceRepository;
+pub use client_preference::{IClientPreferenceRepository, KNOWLEDGE_RETRIEVAL_KEY};
 pub(crate) use client_preference::{
     provider_preference_delete_action, ProviderPreferenceDeleteAction,
 };
@@ -93,15 +92,14 @@ pub use oauth_token::IOAuthTokenRepository;
 pub use provider::IProviderRepository;
 pub use provider_connection::IProviderConnectionRepository;
 pub use provider_model::IProviderModelRepository;
+pub use provider_model_capability::IProviderModelCapabilityRepository;
 pub use preset::{IPresetRepository, IPresetStateRepository, IPresetTagRepository};
-pub use remote_agent::IRemoteAgentRepository;
 pub use requirement::{
     IRequirementRepository, ListRequirementsParams, RequirementClaim,
     RequirementClaimResolution,
 };
 pub use settings::ISettingsRepository;
 pub use skill_tag::ISkillTagRepository;
-pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
 pub use sqlite_agent_execution::SqliteAgentExecutionRepository;
 pub use sqlite_agent_execution_template::SqliteAgentExecutionTemplateRepository;
@@ -120,9 +118,9 @@ pub use sqlite_oauth_token::SqliteOAuthTokenRepository;
 pub use sqlite_provider::SqliteProviderRepository;
 pub use sqlite_provider_connection::SqliteProviderConnectionRepository;
 pub use sqlite_provider_model::SqliteProviderModelRepository;
+pub use sqlite_provider_model_capability::SqliteProviderModelCapabilityRepository;
 pub use sqlite_miniapp::SqliteMiniAppRepository;
 pub use sqlite_preset::{SqlitePresetRepository, SqlitePresetStateRepository, SqlitePresetTagRepository};
-pub use sqlite_remote_agent::SqliteRemoteAgentRepository;
 pub use sqlite_requirement::SqliteRequirementRepository;
 pub use sqlite_settings::SqliteSettingsRepository;
 pub use sqlite_skill_tag::SqliteSkillTagRepository;
