@@ -23,7 +23,7 @@ pub const MAX_ATTEMPTS: u32 = 3;
 pub const LEASE_MS: i64 = 60_000;
 
 const TASK_COLUMNS: &str = "task_id, job_id, parent_task_id, url, url_fingerprint, host, depth, \
-     priority, status, attempt_count, claim_generation, owner_node_id, claimed_at, \
+     redirect_hops, priority, status, attempt_count, claim_generation, owner_node_id, claimed_at, \
      lease_expires_at, http_status, content_hash, etag, last_modified, error_code, \
      error_detail, completed_at, created_at, updated_at";
 
@@ -53,6 +53,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> Result<CrawlTask, CrawlError> {
         url_fingerprint: row.try_get("url_fingerprint")?,
         host: row.try_get("host")?,
         depth: row.try_get::<i64, _>("depth")? as u32,
+        redirect_hops: row.try_get::<i64, _>("redirect_hops")? as u32,
         priority: row.try_get("priority")?,
         status,
         attempt_count: row.try_get::<i64, _>("attempt_count")? as u32,
@@ -87,8 +88,8 @@ pub async fn enqueue(
     let result = sqlx::query(
         "INSERT OR IGNORE INTO crawl_tasks \
          (task_id, job_id, parent_task_id, url, url_fingerprint, host, depth, priority, \
-          status, attempt_count, claim_generation, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)",
+          redirect_hops, status, attempt_count, claim_generation, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)",
     )
     .bind(task_id.as_str())
     .bind(job_id.as_str())
@@ -98,6 +99,7 @@ pub async fn enqueue(
     .bind(&url.host)
     .bind(url.depth as i64)
     .bind(priority)
+    .bind(url.redirect_hops as i64)
     .bind(now)
     .bind(now)
     .execute(pool)
@@ -197,7 +199,7 @@ pub async fn submit(
     let mut tx = pool.begin().await?;
 
     let current = sqlx::query(
-        "SELECT job_id, attempt_count FROM crawl_tasks \
+        "SELECT job_id, attempt_count, priority FROM crawl_tasks \
          WHERE task_id = ?1 AND claim_token = ?2 AND status = 'in_progress'",
     )
     .bind(task_id.as_str())
@@ -208,6 +210,7 @@ pub async fn submit(
 
     let job_id: String = current.try_get("job_id")?;
     let attempt_count: i64 = current.try_get("attempt_count")?;
+    let priority: i64 = current.try_get("priority")?;
 
     match outcome {
         TaskOutcome::Fetched {
@@ -238,8 +241,8 @@ pub async fn submit(
                 sqlx::query(
                     "INSERT OR IGNORE INTO crawl_tasks \
                      (task_id, job_id, parent_task_id, url, url_fingerprint, host, depth, \
-                      priority, status, attempt_count, claim_generation, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending', 0, 0, ?, ?)",
+                      redirect_hops, priority, status, attempt_count, claim_generation, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 0, 0, ?, ?)",
                 )
                 .bind(child_id.as_str())
                 .bind(&job_id)
@@ -248,6 +251,46 @@ pub async fn submit(
                 .bind(&url.fingerprint)
                 .bind(&url.host)
                 .bind(url.depth as i64)
+                .bind(url.redirect_hops as i64)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        TaskOutcome::Redirected { http_status, target } => {
+            settle(
+                &mut tx,
+                task_id,
+                claim_token,
+                "done",
+                now,
+                Some(http_status),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+            if remaining_budget(&mut tx, &job_id, max_urls).await? > 0 {
+                let target_id = CrawlTaskId::new();
+                sqlx::query(
+                    "INSERT OR IGNORE INTO crawl_tasks \
+                     (task_id, job_id, parent_task_id, url, url_fingerprint, host, depth, \
+                      redirect_hops, priority, status, attempt_count, claim_generation, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)",
+                )
+                .bind(target_id.as_str())
+                .bind(&job_id)
+                .bind(task_id.as_str())
+                .bind(&target.url)
+                .bind(&target.fingerprint)
+                .bind(&target.host)
+                .bind(target.depth as i64)
+                .bind(target.redirect_hops as i64)
+                .bind(priority)
                 .bind(now)
                 .bind(now)
                 .execute(&mut *tx)
@@ -561,6 +604,7 @@ mod tests {
             fingerprint: format!("{:064x}", u128::from(n) + host.len() as u128 * 1_000_000),
             host: host.to_string(),
             depth: 0,
+            redirect_hops: 0,
         }
     }
 
@@ -702,6 +746,46 @@ mod tests {
 
         let p = progress(db.pool(), &job).await.unwrap();
         assert_eq!((p.done, p.pending), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn redirect_submit_requeues_the_target_under_its_own_host_gate() {
+        let db = init_database_memory().await.unwrap();
+        let job = seed_job(db.pool(), 100).await;
+        let mut source = url(1, "source.test");
+        source.depth = 2;
+        enqueue(db.pool(), &job, None, &source, 7).await.unwrap();
+        let claimed = claim_next(db.pool(), &job, "n1", 1, LEASE_MS).await.unwrap().unwrap();
+
+        let mut target = url(2, "target.test");
+        target.depth = source.depth;
+        target.redirect_hops = 1;
+        submit(
+            db.pool(),
+            &claimed.task.task_id,
+            &claimed.claim_token,
+            TaskOutcome::Redirected { http_status: 302, target: target.clone() },
+            100,
+        )
+        .await
+        .unwrap();
+
+        let source_task = get_task(db.pool(), &claimed.task.task_id).await.unwrap();
+        assert_eq!(source_task.status, TaskStatus::Done);
+        assert_eq!(source_task.http_status, Some(302));
+
+        let redirected = claim_next(db.pool(), &job, "n2", 1, LEASE_MS).await.unwrap().unwrap();
+        assert_eq!(redirected.task.host, "target.test");
+        assert_eq!(redirected.task.depth, source.depth);
+        assert_eq!(redirected.task.redirect_hops, 1);
+        assert_eq!(redirected.task.priority, 7);
+        assert_eq!(redirected.task.parent_task_id.as_ref(), Some(&claimed.task.task_id));
+
+        enqueue(db.pool(), &job, None, &url(3, "target.test"), 0).await.unwrap();
+        assert!(
+            claim_next(db.pool(), &job, "n3", 1, LEASE_MS).await.unwrap().is_none(),
+            "redirect target must consume target.test's concurrency slot"
+        );
     }
 
     #[tokio::test]

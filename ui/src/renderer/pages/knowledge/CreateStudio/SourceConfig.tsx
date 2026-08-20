@@ -355,24 +355,27 @@ const SourceConfig: React.FC<SourceConfigProps> = ({ sourceType, value, onChange
         </div>
         )}
 
-        {/* Browser render switch */}
-        <div className='flex items-center gap-10px'>
-          <Switch
-            size='small'
-            checked={value.browserRender ?? false}
-            onChange={(checked) => update({ browserRender: checked })}
-          />
-          <span className='text-12px text-[var(--color-text-2)]'>
-            {t('knowledge.studio.webBrowserRenderLabel', {
-              defaultValue: '用真实浏览器渲染后抓取',
-            })}
-          </span>
-          <span className='text-11px text-[var(--color-text-3)]'>
-            {t('knowledge.studio.webBrowserRenderNote', {
-              defaultValue: '适合 JS 渲染的单页应用',
-            })}
-          </span>
-        </div>
+        {/* Browser rendering is available to non-crawler URL sources only. The
+            crawler rejects render_mode=browser until its browser stage ships. */}
+        {urlMode !== 'site' && (
+          <div className='flex items-center gap-10px'>
+            <Switch
+              size='small'
+              checked={value.browserRender ?? false}
+              onChange={(checked) => update({ browserRender: checked })}
+            />
+            <span className='text-12px text-[var(--color-text-2)]'>
+              {t('knowledge.studio.webBrowserRenderLabel', {
+                defaultValue: '用真实浏览器渲染后抓取',
+              })}
+            </span>
+            <span className='text-11px text-[var(--color-text-3)]'>
+              {t('knowledge.studio.webBrowserRenderNote', {
+                defaultValue: '适合 JS 渲染的单页应用',
+              })}
+            </span>
+          </div>
+        )}
       </div>
     );
   }

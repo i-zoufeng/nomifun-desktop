@@ -1,14 +1,12 @@
 //! Where crawled pages land.
 //!
-//! Default target is the knowledge base, through `write_document` — the same
-//! canonical direct-write path used by the current knowledge write-back model.
+//! Default target is the knowledge base, through its managed-document replace
+//! path. Crawled pages are complete snapshots, not append-only chat updates.
 
 use std::sync::Arc;
 
 use nomifun_common::{CrawlJobId, KnowledgeBaseId};
-use nomifun_knowledge::service::{
-    KnowledgeService, WriteMode, WritePolicy, WriteRequest, WriteSurface, WriteTargetSpec,
-};
+use nomifun_knowledge::service::{KnowledgeService, ManagedDocumentWriteRequest};
 use nomifun_knowledge::source_url::slug_for_url;
 use url::Url;
 
@@ -35,6 +33,9 @@ fn id_suffix(job_id: &CrawlJobId) -> &str {
 #[derive(Debug, Clone)]
 pub struct IngestPage {
     pub url: String,
+    pub url_fingerprint: String,
+    pub claim_generation: i64,
+    pub content_hash: String,
     pub title: Option<String>,
     pub markdown: String,
 }
@@ -75,41 +76,78 @@ impl CrawlSinkWriter for KnowledgeSink {
         };
         let kb_id = KnowledgeBaseId::parse(raw_kb_id)
             .map_err(|e| CrawlError::UrlRejected(format!("invalid knowledge base id: {e}")))?;
-        let rel_path = document_path(&job.job_id, &job.name, &page.url);
-        let request = WriteRequest {
-            spec: WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path },
-            content: render_document(page),
-            policy: WritePolicy {
-                mode: WriteMode::Direct,
-                allow_create: true,
-                surface: WriteSurface::RegularChat,
-            },
-            bound_kb_ids: vec![kb_id],
+        let rel_path = document_path(
+            &job.job_id,
+            &job.name,
+            &page.url,
+            &page.url_fingerprint,
+        );
+        let document_key = format!("{}:{}", job.job_id, page.url_fingerprint);
+        let request = ManagedDocumentWriteRequest {
+            kb_id,
+            rel_path,
+            namespace: CRAWL_REL_DIR.into(),
+            producer: "nomifun-crawl".into(),
+            document_key,
+            generation: page.claim_generation,
+            content: render_document(&job.job_id, page),
         };
-        let outcome = self.service.write_document(request).await?;
+        let outcome = self.service.replace_managed_document(request).await?;
         Ok(Some(IngestReceipt { rel_path: outcome.final_rel_path }))
     }
 }
 
-/// `crawl/{job}-{id8}/{page}.md`. The id suffix is what actually separates two
-/// crawls of the same site — the name slug alone collides whenever two jobs
-/// share a name, or differ only past the slug's length cap.
-pub fn document_path(job_id: &CrawlJobId, job_name: &str, url: &str) -> String {
-    let page = Url::parse(url)
+/// `crawl/{job}-{id8}/{readable-url}-{full-fingerprint}.md`.
+///
+/// The readable prefix is only decoration. The full normalized-URL
+/// fingerprint is the identity, so query strings, ports and long common path
+/// prefixes cannot collapse onto one file.
+pub fn document_path(
+    job_id: &CrawlJobId,
+    job_name: &str,
+    url: &str,
+    url_fingerprint: &str,
+) -> String {
+    let readable = Url::parse(url)
         .map(|u| slug_for_url(&u))
         .unwrap_or_else(|_| "page".to_string());
-    format!("{CRAWL_REL_DIR}/{}-{}/{page}.md", slugify(job_name), id_suffix(job_id))
+    let readable = readable.chars().take(48).collect::<String>();
+    let readable = readable.trim_matches('-');
+    let readable = if readable.is_empty() { "page" } else { readable };
+    format!(
+        "{CRAWL_REL_DIR}/{}-{}/{readable}-{url_fingerprint}.md",
+        slugify(job_name),
+        id_suffix(job_id)
+    )
 }
 
 /// Front matter carries provenance so readers can tell where the text came
 /// from without opening the crawl UI.
-fn render_document(page: &IngestPage) -> String {
+fn render_document(job_id: &CrawlJobId, page: &IngestPage) -> String {
     let title = page.title.clone().unwrap_or_else(|| page.url.clone());
     format!(
-        "---\ntitle: {}\nsource_url: {}\nsource: nomifun-crawl\n---\n\n{}\n",
+        concat!(
+            "---\n",
+            "title: {}\n",
+            "source_url: {}\n",
+            "source: nomifun-crawl\n",
+            "managed_by: nomifun-crawl\n",
+            "managed_key: {}:{}\n",
+            "managed_generation: {}\n",
+            "crawl_job_id: {}\n",
+            "url_fingerprint: {}\n",
+            "content_hash: {}\n",
+            "---\n\n{}\n"
+        ),
         yaml_scalar(&title),
         yaml_scalar(&page.url),
-        page.markdown.trim()
+        job_id,
+        page.url_fingerprint,
+        page.claim_generation,
+        job_id,
+        page.url_fingerprint,
+        page.content_hash,
+        page.markdown.trim(),
     )
 }
 
@@ -141,21 +179,48 @@ fn slugify(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frontier::{fingerprint, normalize};
+
+    fn fingerprint_for(url: &str) -> String {
+        fingerprint(&normalize(url).unwrap())
+    }
+
+    fn page(url: &str) -> IngestPage {
+        IngestPage {
+            url: url.into(),
+            url_fingerprint: fingerprint_for(url),
+            claim_generation: 3,
+            content_hash: "c".repeat(64),
+            title: None,
+            markdown: "body".into(),
+        }
+    }
 
     #[test]
     fn path_groups_by_job_and_slugs_the_url() {
         let job_id = CrawlJobId::new();
-        let path = document_path(&job_id, "My Site Crawl", "https://example.com/docs/intro");
+        let url = "https://example.com/docs/intro";
+        let path = document_path(&job_id, "My Site Crawl", url, &fingerprint_for(url));
         assert!(path.starts_with(&format!("crawl/my-site-crawl-{}/", id_suffix(&job_id))), "{path}");
         assert!(path.ends_with(".md"), "{path}");
+        assert!(path.contains(&fingerprint_for(url)), "{path}");
     }
 
     #[test]
-    fn distinct_urls_get_distinct_paths() {
+    fn url_variants_that_used_to_share_a_slug_get_distinct_paths() {
         let job_id = CrawlJobId::new();
-        let a = document_path(&job_id, "j", "https://example.com/a");
-        let b = document_path(&job_id, "j", "https://example.com/b");
-        assert_ne!(a, b);
+        for (a, b) in [
+            ("https://example.com/page?a=1", "https://example.com/page?a=2"),
+            ("https://example.com:8443/page", "https://example.com:9443/page"),
+            ("http://example.com/page", "https://example.com/page"),
+            ("https://example.com/a+b", "https://example.com/a-b"),
+        ] {
+            assert_ne!(
+                document_path(&job_id, "j", a, &fingerprint_for(a)),
+                document_path(&job_id, "j", b, &fingerprint_for(b)),
+                "{a} and {b} must not collide"
+            );
+        }
     }
 
     /// The whole point of grouping by job: without the id suffix two jobs
@@ -165,45 +230,46 @@ mod tests {
     #[test]
     fn same_named_jobs_do_not_share_a_directory() {
         let url = "https://example.com/a";
-        let a = document_path(&CrawlJobId::new(), "Docs", url);
-        let b = document_path(&CrawlJobId::new(), "Docs", url);
+        let url_fingerprint = fingerprint_for(url);
+        let a = document_path(&CrawlJobId::new(), "Docs", url, &url_fingerprint);
+        let b = document_path(&CrawlJobId::new(), "Docs", url, &url_fingerprint);
         assert_ne!(a, b);
     }
 
     #[test]
     fn unparseable_url_still_yields_a_path() {
         let job_id = CrawlJobId::new();
+        let url_fingerprint = "a".repeat(64);
         assert_eq!(
-            document_path(&job_id, "j", "not a url"),
-            format!("crawl/j-{}/page.md", id_suffix(&job_id))
+            document_path(&job_id, "j", "not a url", &url_fingerprint),
+            format!("crawl/j-{}/page-{url_fingerprint}.md", id_suffix(&job_id))
         );
     }
 
     #[test]
     fn job_name_of_only_symbols_falls_back() {
         let job_id = CrawlJobId::new();
-        let path = document_path(&job_id, "!!!", "https://e.com/x");
+        let url = "https://e.com/x";
+        let path = document_path(&job_id, "!!!", url, &fingerprint_for(url));
         assert_eq!(path.split('/').nth(1), Some(format!("job-{}", id_suffix(&job_id)).as_str()));
     }
 
     #[test]
     fn front_matter_escapes_quotes_and_newlines() {
-        let doc = render_document(&IngestPage {
-            url: "https://e.com/x".into(),
-            title: Some("A \"quoted\"\ntitle".into()),
-            markdown: "body".into(),
-        });
+        let job_id = CrawlJobId::new();
+        let mut page = page("https://e.com/x");
+        page.title = Some("A \"quoted\"\ntitle".into());
+        let doc = render_document(&job_id, &page);
         assert!(doc.contains(r#"title: "A \"quoted\" title""#), "{doc}");
         assert!(doc.contains("source_url: \"https://e.com/x\""));
+        assert!(doc.contains("managed_by: nomifun-crawl"), "{doc}");
+        assert!(doc.contains(&format!("managed_key: {job_id}:{}", page.url_fingerprint)), "{doc}");
+        assert!(doc.contains("managed_generation: 3"), "{doc}");
     }
 
     #[test]
     fn missing_title_falls_back_to_the_url() {
-        let doc = render_document(&IngestPage {
-            url: "https://e.com/x".into(),
-            title: None,
-            markdown: "body".into(),
-        });
+        let doc = render_document(&CrawlJobId::new(), &page("https://e.com/x"));
         assert!(doc.contains(r#"title: "https://e.com/x""#), "{doc}");
     }
 }

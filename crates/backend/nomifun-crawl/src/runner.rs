@@ -41,6 +41,7 @@ impl Default for RunnerConfig {
 pub struct JobHandle {
     job_id: CrawlJobId,
     cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl JobHandle {
@@ -50,6 +51,13 @@ impl JobHandle {
 
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Wait until the worker pool has fully stopped. Dropping the handle still
+    /// detaches the task, preserving the fire-and-forget behavior for callers
+    /// that do not need lifecycle cleanup.
+    pub async fn wait(self) -> Result<(), tokio::task::JoinError> {
+        self.task.await
     }
 }
 
@@ -63,14 +71,31 @@ pub fn spawn_job(
     config: RunnerConfig,
     cancel: CancellationToken,
 ) -> JobHandle {
-    let handle = JobHandle { job_id: job.job_id.clone(), cancel: cancel.clone() };
-    tokio::spawn(async move {
-        if let Err(err) = run_job(pool, job.clone(), executor, events.clone(), config, cancel).await
-        {
-            warn!(job_id = %job.job_id, error = %err, "crawl job ended with an error");
+    let job_id = job.job_id.clone();
+    let fallback_pool = pool.clone();
+    let fallback_job_id = job_id.clone();
+    let handle_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        if let Err(err) = run_job(pool, job, executor, events, config, cancel).await {
+            warn!(job_id = %fallback_job_id, error = %err, "crawl job ended with an error");
+            let detail = err.to_string();
+            if let Err(status_err) = store::finish_job(
+                &fallback_pool,
+                &fallback_job_id,
+                JobStatus::Failed,
+                Some(&detail),
+            )
+            .await
+            {
+                warn!(
+                    job_id = %fallback_job_id,
+                    error = %status_err,
+                    "failed to persist crawl job failure"
+                );
+            }
         }
     });
-    handle
+    JobHandle { job_id, cancel: handle_cancel, task }
 }
 
 async fn run_job(
@@ -271,6 +296,7 @@ mod tests {
                             host: url.host_str()?.to_string(),
                             url: url.to_string(),
                             depth: 1,
+                            redirect_hops: 0,
                         })
                     })
                     .collect()
@@ -349,6 +375,7 @@ mod tests {
                 host: url.host_str().unwrap().to_string(),
                 url: url.to_string(),
                 depth: 0,
+                redirect_hops: 0,
             };
             claim::enqueue(pool, &job.job_id, None, &d, 0).await.unwrap();
         }

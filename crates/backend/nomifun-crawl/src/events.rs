@@ -47,6 +47,11 @@ impl CrawlEvent {
     pub fn from_outcome(job_id: &CrawlJobId, task: &CrawlTask, outcome: &TaskOutcome) -> Self {
         let (status, http_status, detail) = match outcome {
             TaskOutcome::Fetched { http_status, .. } => ("done", Some(*http_status), None),
+            TaskOutcome::Redirected { http_status, target } => (
+                "redirected",
+                Some(*http_status),
+                Some(format!("redirected to {}", target.url)),
+            ),
             TaskOutcome::Unchanged { http_status } => ("unchanged", Some(*http_status), None),
             TaskOutcome::Skipped { reason } => ("skipped", None, Some(reason.clone())),
             TaskOutcome::Failed { error_code, error_detail, .. } => (

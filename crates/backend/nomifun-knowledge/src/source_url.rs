@@ -59,6 +59,9 @@ pub struct RawPage {
     pub last_modified: Option<String>,
     /// Raw `Retry-After`. Kept verbatim so the caller decides how to read it.
     pub retry_after: Option<String>,
+    /// Raw redirect target for one-hop callers. Fully-following fetches leave
+    /// this empty because their returned response is terminal.
+    pub location: Option<String>,
     pub body: Vec<u8>,
     pub truncated: bool,
 }
@@ -200,13 +203,7 @@ impl HttpFetcher {
     /// distinction — `robots.txt` handling turns on 404-vs-503, and a crawler
     /// records the status either way — cannot recover it from an error string.
     pub async fn fetch_raw(&self, raw_url: &str, validators: &Validators) -> Result<RawPage, AppError> {
-        let mut client = SafeHttpClient::new(self.timeout, self.max_bytes)
-            .max_redirects(MAX_REDIRECTS)
-            .overflow_policy(BodyOverflowPolicy::Truncate)
-            .user_agent(&self.user_agent);
-        if self.allow_private {
-            client = client.allow_private_for_tests();
-        }
+        let client = self.safe_client().max_redirects(MAX_REDIRECTS);
         let response = client
             .get_conditional(
                 raw_url,
@@ -215,6 +212,41 @@ impl HttpFetcher {
             )
             .await
             .map_err(map_safe_http_error)?;
+        Ok(raw_page(response))
+    }
+
+    /// Fetch exactly one response without following redirects. Crawlers use
+    /// this so redirect targets re-enter their frontier policy before the next
+    /// request is made.
+    pub async fn fetch_raw_once(
+        &self,
+        raw_url: &str,
+        validators: &Validators,
+    ) -> Result<RawPage, AppError> {
+        let response = self
+            .safe_client()
+            .get_once_conditional(
+                raw_url,
+                validators.etag.as_deref(),
+                validators.last_modified.as_deref(),
+            )
+            .await
+            .map_err(map_safe_http_error)?;
+        Ok(raw_page(response))
+    }
+
+    fn safe_client(&self) -> SafeHttpClient {
+        let mut client = SafeHttpClient::new(self.timeout, self.max_bytes)
+            .overflow_policy(BodyOverflowPolicy::Truncate)
+            .user_agent(&self.user_agent);
+        if self.allow_private {
+            client = client.allow_private_for_tests();
+        }
+        client
+    }
+}
+
+fn raw_page(response: nomifun_net::egress::SafeHttpResponse) -> RawPage {
         let header = |name: reqwest::header::HeaderName| {
             response
                 .headers
@@ -222,17 +254,17 @@ impl HttpFetcher {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
         };
-        Ok(RawPage {
+        RawPage {
             final_url: response.final_url.to_string(),
             status: response.status.as_u16(),
             content_type: header(reqwest::header::CONTENT_TYPE),
             etag: header(reqwest::header::ETAG),
             last_modified: header(reqwest::header::LAST_MODIFIED),
             retry_after: header(reqwest::header::RETRY_AFTER),
+            location: header(reqwest::header::LOCATION),
             body: response.body,
             truncated: response.truncated,
-        })
-    }
+        }
 }
 
 fn map_safe_http_error(error: SafeHttpError) -> AppError {

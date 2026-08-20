@@ -181,6 +181,8 @@ pub struct CrawlTask {
     pub url_fingerprint: String,
     pub host: String,
     pub depth: u32,
+    /// Number of consecutive HTTP redirects traversed to reach this URL.
+    pub redirect_hops: u32,
     pub priority: i64,
     pub status: TaskStatus,
     pub attempt_count: u32,
@@ -218,6 +220,12 @@ pub enum TaskOutcome {
         /// Newly discovered in-scope URLs, already normalized.
         discovered: Vec<DiscoveredUrl>,
     },
+    /// A policy-approved redirect target that must re-enter the durable
+    /// frontier before it may be fetched.
+    Redirected {
+        http_status: u16,
+        target: DiscoveredUrl,
+    },
     /// Server confirmed the cached copy is current; nothing to re-ingest.
     Unchanged { http_status: u16 },
     /// In-scope but deliberately not ingested (robots, content type, budget).
@@ -236,6 +244,7 @@ pub struct DiscoveredUrl {
     pub fingerprint: String,
     pub host: String,
     pub depth: u32,
+    pub redirect_hops: u32,
 }
 
 /// Live counters for one job, derived from the task rows.

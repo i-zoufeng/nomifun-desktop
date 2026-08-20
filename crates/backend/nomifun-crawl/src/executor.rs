@@ -7,14 +7,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nomifun_knowledge::source_url::Validators;
+use nomifun_knowledge::source_url::{MAX_REDIRECTS, Validators};
 use tracing::debug;
 
 use crate::error::CrawlError;
 use crate::extract;
 use crate::fetcher::CrawlFetcher;
-use crate::frontier::{ScopeMatcher, normalize, plan_discoveries};
-use crate::model::{CrawlJob, CrawlTask, TaskOutcome};
+use crate::frontier::{ScopeMatcher, ScopeVerdict, fingerprint, normalize, plan_discoveries};
+use crate::model::{CrawlJob, CrawlTask, DiscoveredUrl, TaskOutcome};
 use crate::politeness::{Politeness, Verdict};
 use crate::sink::{CrawlSinkWriter, IngestPage};
 
@@ -100,6 +100,60 @@ impl LocalExecutor {
         if fetched.is_not_modified() {
             return Ok(TaskOutcome::Unchanged { http_status: fetched.status });
         }
+        if fetched.is_redirect() {
+            if task.redirect_hops as usize >= MAX_REDIRECTS {
+                return Ok(TaskOutcome::Failed {
+                    error_code: "too_many_redirects".into(),
+                    error_detail: format!(
+                        "redirect limit of {MAX_REDIRECTS} reached for {}",
+                        task.url
+                    ),
+                    retryable: false,
+                });
+            }
+            let Some(location) = fetched.redirect_location.as_deref() else {
+                return Ok(TaskOutcome::Failed {
+                    error_code: "invalid_redirect".into(),
+                    error_detail: format!(
+                        "HTTP {} response did not include a valid Location header",
+                        fetched.status
+                    ),
+                    retryable: false,
+                });
+            };
+            let target = match url.join(location).ok().and_then(|joined| normalize(joined.as_str()).ok()) {
+                Some(target) => target,
+                None => {
+                    return Ok(TaskOutcome::Failed {
+                        error_code: "invalid_redirect".into(),
+                        error_detail: "redirect Location is not a crawlable HTTP(S) URL".into(),
+                        retryable: false,
+                    });
+                }
+            };
+            if let ScopeVerdict::Rejected(reason) = self.matcher.evaluate(&target) {
+                return Ok(TaskOutcome::Skipped {
+                    reason: format!("redirect target rejected by crawl scope: {reason}"),
+                });
+            }
+            let Some(host) = target.host_str() else {
+                return Ok(TaskOutcome::Failed {
+                    error_code: "invalid_redirect".into(),
+                    error_detail: "redirect target has no host".into(),
+                    retryable: false,
+                });
+            };
+            return Ok(TaskOutcome::Redirected {
+                http_status: fetched.status,
+                target: DiscoveredUrl {
+                    url: target.to_string(),
+                    fingerprint: fingerprint(&target),
+                    host: host.to_ascii_lowercase(),
+                    depth: task.depth,
+                    redirect_hops: task.redirect_hops.saturating_add(1),
+                },
+            });
+        }
         if !fetched.is_success() {
             return Ok(TaskOutcome::Failed {
                 error_code: format!("http_{}", fetched.status),
@@ -142,6 +196,9 @@ impl LocalExecutor {
                     job,
                     &IngestPage {
                         url: fetched.final_url.clone(),
+                        url_fingerprint: task.url_fingerprint.clone(),
+                        claim_generation: task.claim_generation,
+                        content_hash: page.content_hash.clone(),
                         title: page.title.clone(),
                         markdown: page.markdown.clone(),
                     },
@@ -221,6 +278,29 @@ mod tests {
         }
     }
 
+    struct DenyAll;
+
+    #[async_trait::async_trait]
+    impl RobotsSource for DenyAll {
+        async fn fetch(&self, _u: &str) -> RobotsFetch {
+            RobotsFetch::Body(b"User-agent: *\nDisallow: /\n".to_vec())
+        }
+    }
+
+    struct MustNotFetch;
+
+    #[async_trait::async_trait]
+    impl CrawlFetcher for MustNotFetch {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _validators: &Validators,
+            _mode: RenderMode,
+        ) -> Result<FetchOutput, CrawlError> {
+            panic!("robots-denied redirect target reached the network fetcher")
+        }
+    }
+
     #[derive(Default)]
     struct RecordingSink(Mutex<Vec<IngestPage>>);
 
@@ -270,6 +350,7 @@ mod tests {
             url_fingerprint: "0".repeat(64),
             host: "example.com".into(),
             depth: 0,
+            redirect_hops: 0,
             priority: 0,
             status: TaskStatus::InProgress,
             attempt_count: 1,
@@ -297,10 +378,18 @@ mod tests {
             etag: Some("\"v1\"".into()),
             last_modified: None,
             retry_after_ms: None,
+            redirect_location: None,
             body: body.into(),
             truncated: false,
             wanted_render: false,
         })
+    }
+
+    fn redirect(location: Option<&str>) -> Result<FetchOutput, CrawlError> {
+        let mut response = ok_html("")?;
+        response.status = 302;
+        response.redirect_location = location.map(str::to_owned);
+        Ok(response)
     }
 
     fn build(
@@ -361,6 +450,80 @@ mod tests {
             TaskOutcome::Unchanged { http_status: 304 }
         ));
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redirect_target_reenters_the_frontier_at_the_same_depth() {
+        let ex = build(
+            vec![redirect(Some("/next"))],
+            Arc::new(RecordingSink::default()),
+        );
+        let mut t = task("https://example.com/p");
+        t.depth = 2;
+        t.redirect_hops = 1;
+
+        match ex.execute(&t, &job()).await {
+            TaskOutcome::Redirected { http_status: 302, target } => {
+                assert_eq!(target.url, "https://example.com/next");
+                assert_eq!(target.host, "example.com");
+                assert_eq!(target.depth, 2);
+                assert_eq!(target.redirect_hops, 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn offsite_redirect_is_rejected_before_it_can_be_fetched() {
+        let ex = build(
+            vec![redirect(Some("https://outside.test/landing"))],
+            Arc::new(RecordingSink::default()),
+        );
+        match ex.execute(&task("https://example.com/p"), &job()).await {
+            TaskOutcome::Skipped { reason } => assert!(reason.contains("off-site"), "{reason}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_task_rechecks_target_robots_before_fetching() {
+        let j = job();
+        let matcher = Arc::new(ScopeMatcher::build(&j.scope, &j.seeds).unwrap());
+        let executor = LocalExecutor::new(
+            Arc::new(MustNotFetch),
+            Arc::new(Politeness::new(Arc::new(DenyAll), "t", true, Duration::ZERO)),
+            Arc::new(RecordingSink::default()),
+            matcher,
+        );
+        let mut redirected = task("https://example.com/redirect-target");
+        redirected.redirect_hops = 1;
+
+        assert!(matches!(
+            executor.execute(&redirected, &j).await,
+            TaskOutcome::Skipped { ref reason } if reason.contains("robots.txt")
+        ));
+    }
+
+    #[tokio::test]
+    async fn redirect_limit_and_missing_location_fail_without_retry() {
+        let ex = build(
+            vec![redirect(Some("/next"))],
+            Arc::new(RecordingSink::default()),
+        );
+        let mut t = task("https://example.com/p");
+        t.redirect_hops = MAX_REDIRECTS as u32;
+        assert!(matches!(
+            ex.execute(&t, &job()).await,
+            TaskOutcome::Failed { ref error_code, retryable: false, .. }
+                if error_code == "too_many_redirects"
+        ));
+
+        let ex = build(vec![redirect(None)], Arc::new(RecordingSink::default()));
+        assert!(matches!(
+            ex.execute(&task("https://example.com/p"), &job()).await,
+            TaskOutcome::Failed { ref error_code, retryable: false, .. }
+                if error_code == "invalid_redirect"
+        ));
     }
 
     #[tokio::test]

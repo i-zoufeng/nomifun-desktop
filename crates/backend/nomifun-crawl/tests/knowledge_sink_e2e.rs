@@ -16,7 +16,7 @@ use nomifun_crawl::model::{
 };
 use nomifun_crawl::politeness::{HttpRobotsSource, Politeness};
 use nomifun_crawl::runner::{RunnerConfig, spawn_job};
-use nomifun_crawl::sink::KnowledgeSink;
+use nomifun_crawl::sink::{CrawlSinkWriter, IngestPage, KnowledgeSink};
 use nomifun_crawl::store;
 use nomifun_db::{SqliteKnowledgeRepository, init_database_memory};
 use nomifun_knowledge::events::KnowledgeEventEmitter;
@@ -152,6 +152,7 @@ async fn run_to_completion(pool: &SqlitePool, job: &CrawlJob, knowledge: Arc<Kno
         host: url.host_str().unwrap().to_ascii_lowercase(),
         url: url.to_string(),
         depth: 0,
+        redirect_hops: 0,
     };
     claim::enqueue(pool, &job.job_id, None, &discovered, 100)
         .await
@@ -320,7 +321,7 @@ async fn crawled_pages_land_in_the_knowledge_base_on_disk() {
             knowledge_base_id: Some(base.knowledge_base_id.to_string()),
         },
     );
-    run_to_completion(db.pool(), &job, knowledge).await;
+    run_to_completion(db.pool(), &job, knowledge.clone()).await;
 
     let files = markdown_files(kb_root.path());
     let rels: Vec<String> = files.iter().map(|p| to_slashes(p)).collect();
@@ -342,9 +343,38 @@ async fn crawled_pages_land_in_the_knowledge_base_on_disk() {
         .find(|b| b.contains("Seed Page"))
         .expect("seed page document");
     assert!(seed_doc.contains("source: nomifun-crawl"), "{seed_doc}");
+    assert!(seed_doc.contains("managed_by: nomifun-crawl"), "{seed_doc}");
     assert!(seed_doc.contains(&format!("source_url: \"{}/\"", server.uri())), "{seed_doc}");
     assert!(seed_doc.contains("readability extractor"), "body text missing: {seed_doc}");
     assert!(bodies.iter().any(|b| b.contains("Second Page")), "second page missing: {rels:?}");
+
+    // A later claim publishes a whole replacement. Replaying the older claim
+    // afterwards must neither append its page nor overwrite the newer one.
+    let normalized_seed = frontier::normalize(&format!("{}/", server.uri())).unwrap();
+    let seed_fingerprint = frontier::fingerprint(&normalized_seed);
+    let sink = KnowledgeSink::new(knowledge.clone());
+    let replacement = IngestPage {
+        url: normalized_seed.to_string(),
+        url_fingerprint: seed_fingerprint.clone(),
+        claim_generation: 2,
+        content_hash: "2".repeat(64),
+        title: Some("Seed Page Updated".into()),
+        markdown: "# Seed Page Updated\n\nNEW SNAPSHOT ONLY".into(),
+    };
+    let receipt = sink.write(&job, &replacement).await.unwrap().unwrap();
+    let stale = IngestPage {
+        claim_generation: 1,
+        content_hash: "1".repeat(64),
+        markdown: "# Seed Page Stale\n\nSTALE SNAPSHOT".into(),
+        ..replacement.clone()
+    };
+    sink.write(&job, &stale).await.unwrap();
+
+    let replaced = std::fs::read_to_string(kb_root.path().join(receipt.rel_path)).unwrap();
+    assert!(replaced.contains("NEW SNAPSHOT ONLY"), "{replaced}");
+    assert!(!replaced.contains("readability extractor"), "old full page was appended: {replaced}");
+    assert!(!replaced.contains("STALE SNAPSHOT"), "stale worker overwrote the page: {replaced}");
+    assert_eq!(replaced.matches("---").count(), 2, "front matter was appended: {replaced}");
 
     let progress = claim::progress(db.pool(), &job.job_id).await.unwrap();
     assert_eq!(progress.done, 2, "both tasks should be done: {progress:?}");

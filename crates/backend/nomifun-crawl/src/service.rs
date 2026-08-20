@@ -1,8 +1,10 @@
 //! Crawl job lifecycle: create, start, pause, cancel, inspect.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use nomifun_api_types::WebSocketMessage;
 use nomifun_common::{AppError, CrawlJobId, TimestampMs, UserId};
@@ -199,11 +201,72 @@ impl CrawlEventSink for RealtimeEvents {
     }
 }
 
+#[derive(Clone)]
+struct RunningJob {
+    run_id: u64,
+    cancel: CancellationToken,
+}
+
+struct RunLease {
+    job_id: String,
+    run_id: u64,
+    cancel: CancellationToken,
+}
+
+#[derive(Default)]
+struct RunningJobs {
+    entries: DashMap<String, RunningJob>,
+    next_run_id: AtomicU64,
+}
+
+impl RunningJobs {
+    fn reserve(&self, job_id: &CrawlJobId) -> Result<RunLease, CrawlError> {
+        let key = job_id.to_string();
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
+
+        match self.entries.entry(key.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(RunningJob { run_id, cancel: cancel.clone() });
+                Ok(RunLease { job_id: key, run_id, cancel })
+            }
+            Entry::Occupied(_) => Err(CrawlError::App(AppError::Conflict(format!(
+                "crawl job {job_id} is already running"
+            )))),
+        }
+    }
+
+    /// Release only the run that acquired this lease. This prevents a delayed
+    /// completion from deleting a newer run registered under the same job ID.
+    fn release(&self, lease: &RunLease) {
+        self.entries.remove_if(lease.job_id.as_str(), |_, running| {
+            running.run_id == lease.run_id
+        });
+    }
+
+    fn cancel(&self, job_id: &CrawlJobId) -> bool {
+        let token = self.entries.get(job_id.as_str()).map(|running| running.cancel.clone());
+        match token {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn remove_and_cancel(&self, job_id: &CrawlJobId) {
+        if let Some((_, running)) = self.entries.remove(job_id.as_str()) {
+            running.cancel.cancel();
+        }
+    }
+}
+
 pub struct CrawlService {
     pool: SqlitePool,
     knowledge: Arc<KnowledgeService>,
     events: Arc<dyn CrawlEventSink>,
-    running: DashMap<String, CancellationToken>,
+    running: Arc<RunningJobs>,
 }
 
 impl CrawlService {
@@ -212,7 +275,7 @@ impl CrawlService {
         knowledge: Arc<KnowledgeService>,
         events: Arc<dyn CrawlEventSink>,
     ) -> Self {
-        Self { pool, knowledge, events, running: DashMap::new() }
+        Self { pool, knowledge, events, running: Arc::new(RunningJobs::default()) }
     }
 
     pub async fn create(&self, user_id: &UserId, req: NewJob) -> Result<JobView, CrawlError> {
@@ -286,55 +349,84 @@ impl CrawlService {
     /// Seed the frontier (idempotent) and start the worker pool.
     pub async fn start(&self, user_id: &UserId, job_id: &CrawlJobId) -> Result<JobView, CrawlError> {
         let job = self.owned_job(user_id, job_id).await?;
-        if self.running.contains_key(job_id.as_str()) {
-            return Err(CrawlError::App(AppError::Conflict(format!(
-                "crawl job {job_id} is already running"
-            ))));
+        let lease = self.running.reserve(job_id)?;
+        let mut marked_running = false;
+
+        let prepared = async {
+            for seed in &job.seeds {
+                let url = frontier::normalize(seed)?;
+                let Some(host) = url.host_str() else { continue };
+                let discovered = DiscoveredUrl {
+                    fingerprint: frontier::fingerprint(&url),
+                    host: host.to_ascii_lowercase(),
+                    url: url.to_string(),
+                    depth: 0,
+                    redirect_hops: 0,
+                };
+                // Seeds outrank discovered links so a restart re-crawls them first.
+                claim::enqueue(&self.pool, job_id, None, &discovered, 100).await?;
+            }
+
+            let user_agent =
+                job.user_agent.clone().unwrap_or_else(|| CRAWLER_USER_AGENT.to_string());
+            let matcher = Arc::new(ScopeMatcher::build(&job.scope, &job.seeds)?);
+            let politeness = Arc::new(Politeness::new(
+                Arc::new(HttpRobotsSource::new(HttpFetcher::new().user_agent(&user_agent))),
+                user_agent.clone(),
+                job.respect_robots,
+                Duration::from_millis(job.delay_ms),
+            ));
+            let executor = Arc::new(LocalExecutor::new(
+                Arc::new(HttpCrawlFetcher::new(&user_agent)),
+                politeness,
+                Arc::new(KnowledgeSink::new(self.knowledge.clone())),
+                matcher,
+            ));
+
+            store::start_job(&self.pool, job_id).await?;
+            marked_running = true;
+            let job = store::get_job(&self.pool, job_id).await?;
+            let progress = claim::progress(&self.pool, job_id).await?;
+            Ok::<_, CrawlError>((job, executor, progress))
         }
+        .await;
 
-        for seed in &job.seeds {
-            let url = frontier::normalize(seed)?;
-            let Some(host) = url.host_str() else { continue };
-            let discovered = DiscoveredUrl {
-                fingerprint: frontier::fingerprint(&url),
-                host: host.to_ascii_lowercase(),
-                url: url.to_string(),
-                depth: 0,
-            };
-            // Seeds outrank discovered links so a restart re-crawls them first.
-            claim::enqueue(&self.pool, job_id, None, &discovered, 100).await?;
-        }
+        let (job, executor, progress) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.running.release(&lease);
+                if marked_running {
+                    let detail = err.to_string();
+                    if let Err(status_err) =
+                        store::finish_job(&self.pool, job_id, JobStatus::Failed, Some(&detail)).await
+                    {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %status_err,
+                            "failed to persist crawl startup failure"
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
 
-        store::start_job(&self.pool, job_id).await?;
-        let job = store::get_job(&self.pool, job_id).await?;
-
-        let user_agent = job.user_agent.clone().unwrap_or_else(|| CRAWLER_USER_AGENT.to_string());
-        let matcher = Arc::new(ScopeMatcher::build(&job.scope, &job.seeds)?);
-        let politeness = Arc::new(Politeness::new(
-            Arc::new(HttpRobotsSource::new(HttpFetcher::new().user_agent(&user_agent))),
-            user_agent.clone(),
-            job.respect_robots,
-            Duration::from_millis(job.delay_ms),
-        ));
-        let executor = Arc::new(LocalExecutor::new(
-            Arc::new(HttpCrawlFetcher::new(&user_agent)),
-            politeness,
-            Arc::new(KnowledgeSink::new(self.knowledge.clone())),
-            matcher,
-        ));
-
-        let cancel = CancellationToken::new();
-        self.running.insert(job_id.to_string(), cancel.clone());
-        runner::spawn_job(
+        let handle = runner::spawn_job(
             self.pool.clone(),
             job.clone(),
             executor,
             self.events.clone(),
             RunnerConfig::default(),
-            cancel,
+            lease.cancel.clone(),
         );
+        let running = self.running.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle.wait().await {
+                tracing::warn!(job_id = %lease.job_id, error = %err, "crawl runner task failed");
+            }
+            running.release(&lease);
+        });
 
-        let progress = claim::progress(&self.pool, job_id).await?;
         Ok(JobView::new(job, progress))
     }
 
@@ -342,21 +434,16 @@ impl CrawlService {
     /// leases lapse and they return to `pending`.
     pub async fn cancel(&self, user_id: &UserId, job_id: &CrawlJobId) -> Result<(), CrawlError> {
         self.owned_job(user_id, job_id).await?;
-        match self.running.remove(job_id.as_str()) {
-            Some((_, token)) => {
-                token.cancel();
-                Ok(())
-            }
+        match self.running.cancel(job_id) {
+            true => Ok(()),
             // Not running: park the row so the UI stops showing it as active.
-            None => store::set_status(&self.pool, job_id, JobStatus::Cancelled).await,
+            false => store::set_status(&self.pool, job_id, JobStatus::Cancelled).await,
         }
     }
 
     pub async fn delete(&self, user_id: &UserId, job_id: &CrawlJobId) -> Result<(), CrawlError> {
         self.owned_job(user_id, job_id).await?;
-        if let Some((_, token)) = self.running.remove(job_id.as_str()) {
-            token.cancel();
-        }
+        self.running.remove_and_cancel(job_id);
         store::delete_job(&self.pool, job_id).await
     }
 
@@ -382,5 +469,92 @@ impl CrawlService {
             return Err(CrawlError::JobNotFound(job_id.to_string()));
         }
         Ok(job)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn natural_completion_release_makes_job_restartable() {
+        let running = RunningJobs::default();
+        let job_id = CrawlJobId::new();
+
+        let first = running.reserve(&job_id).expect("first run reserves the job");
+        running.release(&first);
+
+        let second = running.reserve(&job_id).expect("finished job can start again");
+        running.release(&second);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservations_allow_exactly_one_start() {
+        const CALLERS: usize = 16;
+
+        let running = Arc::new(RunningJobs::default());
+        let job_id = CrawlJobId::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut tasks = Vec::with_capacity(CALLERS);
+
+        for _ in 0..CALLERS {
+            let running = running.clone();
+            let job_id = job_id.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                running.reserve(&job_id)
+            }));
+        }
+
+        let mut winner = None;
+        let mut conflicts = 0;
+        for task in tasks {
+            match task.await.expect("reservation task joins") {
+                Ok(lease) => {
+                    assert!(winner.replace(lease).is_none(), "only one caller may reserve the job");
+                }
+                Err(CrawlError::App(AppError::Conflict(_))) => conflicts += 1,
+                Err(err) => panic!("unexpected reservation error: {err}"),
+            }
+        }
+
+        assert_eq!(conflicts, CALLERS - 1);
+        running.release(&winner.expect("one caller wins the reservation"));
+    }
+
+    #[test]
+    fn cancellation_keeps_job_reserved_until_runner_stops() {
+        let running = RunningJobs::default();
+        let job_id = CrawlJobId::new();
+        let lease = running.reserve(&job_id).expect("run reserves the job");
+
+        assert!(running.cancel(&job_id));
+        assert!(lease.cancel.is_cancelled());
+        assert!(matches!(
+            running.reserve(&job_id),
+            Err(CrawlError::App(AppError::Conflict(_)))
+        ));
+
+        running.release(&lease);
+        let restarted = running.reserve(&job_id).expect("job restarts after runner exits");
+        running.release(&restarted);
+    }
+
+    #[test]
+    fn delayed_cleanup_cannot_remove_a_newer_run() {
+        let running = RunningJobs::default();
+        let job_id = CrawlJobId::new();
+        let old = running.reserve(&job_id).expect("old run reserves the job");
+        running.remove_and_cancel(&job_id);
+        let new = running.reserve(&job_id).expect("new run reserves the removed slot");
+
+        running.release(&old);
+        assert!(matches!(
+            running.reserve(&job_id),
+            Err(CrawlError::App(AppError::Conflict(_)))
+        ));
+
+        running.release(&new);
     }
 }

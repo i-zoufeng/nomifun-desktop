@@ -259,7 +259,10 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
             scope: { same_site: sourceConfigValue.siteSameSite ?? true },
             max_depth: sourceConfigValue.siteMaxDepth ?? SITE_DEFAULT_MAX_DEPTH,
             max_urls: sourceConfigValue.siteMaxUrls ?? SITE_DEFAULT_MAX_URLS,
-            render_mode: sourceConfigValue.browserRender ? 'browser' : 'auto',
+            // The crawler's Browser stage is not implemented yet. Keep this
+            // defensive even though SourceConfig hides the switch in site mode,
+            // because browserRender may remain true after switching modes.
+            render_mode: 'auto',
             sink: { knowledge_base_id: created.knowledge_base_id },
           });
           await ipcBridge.crawl.startJob.invoke({ job_id: job.job_id });

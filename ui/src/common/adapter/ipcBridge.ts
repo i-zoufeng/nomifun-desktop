@@ -192,6 +192,8 @@ import {
   parseCompanionSessionWindowId,
   parseCompanionSkillId,
   parseConversationId,
+  parseCrawlJobId,
+  parseCrawlTaskId,
   parseCronJobId,
   parseCronJobRunId,
   parseExecutionAttemptId,
@@ -6419,7 +6421,7 @@ export interface ICrawlScope {
 }
 
 export interface ICrawlSink {
-  knowledge_base_id?: string;
+  knowledge_base_id?: KnowledgeBaseId;
 }
 
 export interface ICrawlProgress {
@@ -6478,38 +6480,72 @@ export interface ICreateCrawlJobParams {
   sink?: Partial<ICrawlSink>;
 }
 
+const fromApiCrawlSink = (sink: ICrawlSink): ICrawlSink => ({
+  ...sink,
+  knowledge_base_id:
+    sink.knowledge_base_id == null
+      ? undefined
+      : parseKnowledgeBaseId(sink.knowledge_base_id),
+});
+
+const fromApiCrawlJob = (job: ICrawlJob): ICrawlJob => ({
+  ...job,
+  job_id: parseCrawlJobId(job.job_id),
+  sink: fromApiCrawlSink(job.sink),
+});
+
+const fromApiCrawlTask = (task: ICrawlTask): ICrawlTask => ({
+  ...task,
+  task_id: parseCrawlTaskId(task.task_id),
+});
+
 export const crawl = {
-  listJobs: httpGet<ICrawlJob[], void>('/api/crawl/jobs'),
-  createJob: httpPost<ICrawlJob, ICreateCrawlJobParams>('/api/crawl/jobs'),
-  getJob: httpGet<ICrawlJob, { job_id: CrawlJobId }>((p) => `/api/crawl/jobs/${p.job_id}`),
+  listJobs: withResponseMap(
+    httpGet<ICrawlJob[], void>('/api/crawl/jobs'),
+    (jobs) => jobs.map(fromApiCrawlJob)
+  ),
+  createJob: withResponseMap(
+    httpPost<ICrawlJob, ICreateCrawlJobParams>('/api/crawl/jobs'),
+    fromApiCrawlJob
+  ),
+  getJob: withResponseMap(
+    httpGet<ICrawlJob, { job_id: CrawlJobId }>((p) => `/api/crawl/jobs/${p.job_id}`),
+    fromApiCrawlJob
+  ),
   deleteJob: httpDelete<void, { job_id: CrawlJobId }>((p) => `/api/crawl/jobs/${p.job_id}`),
-  startJob: httpPost<ICrawlJob, { job_id: CrawlJobId }>((p) => `/api/crawl/jobs/${p.job_id}/start`),
+  startJob: withResponseMap(
+    httpPost<ICrawlJob, { job_id: CrawlJobId }>((p) => `/api/crawl/jobs/${p.job_id}/start`),
+    fromApiCrawlJob
+  ),
   cancelJob: httpPost<void, { job_id: CrawlJobId }>((p) => `/api/crawl/jobs/${p.job_id}/cancel`),
   /** Requeue every parked task, clearing the attempt budget. */
   retryFailed: httpPost<number, { job_id: CrawlJobId }>(
     (p) => `/api/crawl/jobs/${p.job_id}/retry-failed`
   ),
-  listTasks: httpGet<ICrawlTask[], { job_id: CrawlJobId; status?: string; limit?: number }>(
-    (p) => {
-      const query = new URLSearchParams();
-      if (p.status) query.set('status', p.status);
-      if (p.limit) query.set('limit', String(p.limit));
-      const suffix = query.toString();
-      return `/api/crawl/jobs/${p.job_id}/tasks${suffix ? `?${suffix}` : ''}`;
-    }
+  listTasks: withResponseMap(
+    httpGet<ICrawlTask[], { job_id: CrawlJobId; status?: string; limit?: number }>(
+      (p) => {
+        const query = new URLSearchParams();
+        if (p.status) query.set('status', p.status);
+        if (p.limit) query.set('limit', String(p.limit));
+        const suffix = query.toString();
+        return `/api/crawl/jobs/${p.job_id}/tasks${suffix ? `?${suffix}` : ''}`;
+      }
+    ),
+    (tasks) => tasks.map(fromApiCrawlTask)
   ),
 };
 
 export interface ICrawlProgressEvent {
   kind: 'progress';
-  job_id: string;
+  job_id: CrawlJobId;
   progress: ICrawlProgress;
 }
 
 export interface ICrawlTaskEvent {
   kind: 'task';
-  job_id: string;
-  task_id: string;
+  job_id: CrawlJobId;
+  task_id: CrawlTaskId;
   url: string;
   status: string;
   http_status?: number;
@@ -6518,13 +6554,23 @@ export interface ICrawlTaskEvent {
 
 export interface ICrawlFinishedEvent {
   kind: 'finished';
-  job_id: string;
+  job_id: CrawlJobId;
   status: CrawlJobStatus;
   progress: ICrawlProgress;
 }
 
 export const crawlEvents = {
-  progress: wsEmitter<ICrawlProgressEvent>('crawl.progress'),
-  task: wsEmitter<ICrawlTaskEvent>('crawl.task'),
-  finished: wsEmitter<ICrawlFinishedEvent>('crawl.finished'),
+  progress: wsMappedEmitter<ICrawlProgressEvent>('crawl.progress', (event) => ({
+    ...event,
+    job_id: parseCrawlJobId(event.job_id),
+  })),
+  task: wsMappedEmitter<ICrawlTaskEvent>('crawl.task', (event) => ({
+    ...event,
+    job_id: parseCrawlJobId(event.job_id),
+    task_id: parseCrawlTaskId(event.task_id),
+  })),
+  finished: wsMappedEmitter<ICrawlFinishedEvent>('crawl.finished', (event) => ({
+    ...event,
+    job_id: parseCrawlJobId(event.job_id),
+  })),
 };

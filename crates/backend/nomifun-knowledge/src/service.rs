@@ -376,6 +376,43 @@ pub struct WriteOutcome {
     pub op: WriteOp,
 }
 
+/// A whole-document publication owned by a trusted background producer.
+///
+/// This is deliberately separate from [`WriteRequest`]: conversational
+/// write-back is append-only, while a crawler or sync process needs to replace
+/// its own snapshot without ever replacing a user-authored document.
+#[derive(Debug, Clone)]
+pub struct ManagedDocumentWriteRequest {
+    pub kb_id: KnowledgeBaseId,
+    pub rel_path: String,
+    pub namespace: String,
+    pub producer: String,
+    pub document_key: String,
+    pub generation: i64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedDocumentWriteDisposition {
+    Created,
+    Replaced,
+    Unchanged,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDocumentWriteOutcome {
+    pub final_rel_path: String,
+    pub disposition: ManagedDocumentWriteDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedDocumentHeader {
+    producer: String,
+    document_key: String,
+    generation: i64,
+}
+
 /// Inputs for the turn-final write-back trigger. Whether the trigger fires at
 /// all is decided by the caller from [`WritebackEagerness`] — a `manual` binding
 /// never reaches here, so no provider call is spent on it. Once here, eagerness
@@ -1569,6 +1606,115 @@ impl KnowledgeService {
             content,
         )
             .await
+    }
+
+    /// Atomically publish a complete document owned by a background producer.
+    ///
+    /// Existing content is replaceable only when its front matter declares
+    /// the same producer and document key. A lower generation is a stale
+    /// worker and becomes a no-op. User-authored and differently-owned files
+    /// are never overwritten.
+    pub async fn replace_managed_document(
+        &self,
+        req: ManagedDocumentWriteRequest,
+    ) -> Result<ManagedDocumentWriteOutcome, AppError> {
+        validate_managed_document_request(&req)?;
+        let requested_header = managed_document_header(&req.content)?.ok_or_else(|| {
+            AppError::BadRequest(
+                "managed document content must begin with ownership front matter".into(),
+            )
+        })?;
+        if requested_header.producer != req.producer
+            || requested_header.document_key != req.document_key
+            || requested_header.generation != req.generation
+        {
+            return Err(AppError::BadRequest(
+                "managed document ownership front matter does not match the write request".into(),
+            ));
+        }
+
+        let id = req.kb_id.as_str();
+        let row = self.require_base(id).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let resolved = resolve_portable_md_path(root.clone(), req.rel_path.clone()).await?;
+        let lock_path = portable_turn_writeback_lock_path(&deconfuse_rel_path(&resolved.rel_path));
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&req.kb_id, &lock_path)
+            .await?;
+        let resolved = resolve_portable_md_path(root.clone(), resolved.rel_path).await?;
+
+        if !resolved.exists {
+            self.write_file_if_absent(
+                id,
+                &resolved.rel_path,
+                &resolved.rel_path,
+                &req.content,
+            )
+            .await?;
+            return Ok(ManagedDocumentWriteOutcome {
+                final_rel_path: resolved.rel_path,
+                disposition: ManagedDocumentWriteDisposition::Created,
+            });
+        }
+
+        let path = safe_md_path_bounded(root, resolved.rel_path.clone()).await?;
+        let current = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(&path),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Timeout(format!(
+                "managed document read timed out: {}",
+                resolved.rel_path
+            ))
+        })?
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read managed document {}: {error}",
+                resolved.rel_path
+            ))
+        })?;
+        let current_header = managed_document_header(&current)?.ok_or_else(|| {
+            AppError::Conflict(format!(
+                "refusing to replace unmanaged knowledge document: {}",
+                resolved.rel_path
+            ))
+        })?;
+        if current_header.producer != req.producer
+            || current_header.document_key != req.document_key
+        {
+            return Err(AppError::Conflict(format!(
+                "refusing to replace knowledge document owned by another producer: {}",
+                resolved.rel_path
+            )));
+        }
+        if current_header.generation > req.generation {
+            return Ok(ManagedDocumentWriteOutcome {
+                final_rel_path: resolved.rel_path,
+                disposition: ManagedDocumentWriteDisposition::Stale,
+            });
+        }
+        if current == req.content {
+            return Ok(ManagedDocumentWriteOutcome {
+                final_rel_path: resolved.rel_path,
+                disposition: ManagedDocumentWriteDisposition::Unchanged,
+            });
+        }
+
+        self.write_file_if_unchanged(
+            id,
+            &resolved.rel_path,
+            &resolved.rel_path,
+            &current,
+            &req.content,
+        )
+        .await?;
+        Ok(ManagedDocumentWriteOutcome {
+            final_rel_path: resolved.rel_path,
+            disposition: ManagedDocumentWriteDisposition::Replaced,
+        })
     }
 
     /// Create a markdown file only when no portable path alias exists.
@@ -6006,6 +6152,93 @@ fn validate_write_request(req: &WriteRequest) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_managed_document_request(
+    req: &ManagedDocumentWriteRequest,
+) -> Result<(), AppError> {
+    validate_canonical_write_target(&req.rel_path)?;
+    if req.content.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "refusing to write empty managed knowledge content".into(),
+        ));
+    }
+    if req.generation < 0 {
+        return Err(AppError::BadRequest(
+            "managed document generation cannot be negative".into(),
+        ));
+    }
+    for (label, value) in [
+        ("namespace", req.namespace.as_str()),
+        ("producer", req.producer.as_str()),
+        ("document key", req.document_key.as_str()),
+    ] {
+        if value.is_empty()
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+        {
+            return Err(AppError::BadRequest(format!(
+                "managed document {label} contains unsupported characters"
+            )));
+        }
+    }
+    if req.namespace.contains([':', '.']) {
+        return Err(AppError::BadRequest(
+            "managed document namespace must be one safe path component".into(),
+        ));
+    }
+    let Some(first_component) = req.rel_path.split('/').next() else {
+        return Err(AppError::BadRequest(
+            "managed document path must be inside its namespace".into(),
+        ));
+    };
+    if portable_path_component_identity(first_component)
+        != portable_path_component_identity(&req.namespace)
+    {
+        return Err(AppError::Forbidden(format!(
+            "managed document path must be inside the {} namespace",
+            req.namespace
+        )));
+    }
+    Ok(())
+}
+
+fn managed_document_header(content: &str) -> Result<Option<ManagedDocumentHeader>, AppError> {
+    let normalized = content.replace("\r\n", "\n");
+    let Some(front_matter) = normalized
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n").map(|(header, _)| header))
+    else {
+        return Ok(None);
+    };
+
+    let value = |name: &str| {
+        front_matter
+            .lines()
+            .find_map(|line| line.strip_prefix(name).map(str::trim))
+    };
+    let Some(producer) = value("managed_by:") else {
+        return Ok(None);
+    };
+    let document_key = value("managed_key:").ok_or_else(|| {
+        AppError::Conflict("managed document is missing managed_key front matter".into())
+    })?;
+    let generation = value("managed_generation:")
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "managed document is missing managed_generation front matter".into(),
+            )
+        })?
+        .parse::<i64>()
+        .map_err(|_| {
+            AppError::Conflict("managed document has an invalid managed_generation".into())
+        })?;
+    Ok(Some(ManagedDocumentHeader {
+        producer: producer.to_owned(),
+        document_key: document_key.to_owned(),
+        generation,
+    }))
+}
+
 async fn safe_md_path_bounded(
     root: PathBuf,
     rel_path: String,
@@ -10359,6 +10592,88 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["existing.md"], "atomic temp sibling leaked: {names:?}");
+    }
+
+    fn managed_test_content(key: &str, generation: i64, body: &str) -> String {
+        format!(
+            "---\nmanaged_by: nomifun-crawl\nmanaged_key: {key}\nmanaged_generation: {generation}\n---\n\n{body}\n"
+        )
+    }
+
+    fn managed_test_request(
+        kb_id: &KnowledgeBaseId,
+        key: &str,
+        generation: i64,
+        body: &str,
+    ) -> ManagedDocumentWriteRequest {
+        ManagedDocumentWriteRequest {
+            kb_id: kb_id.clone(),
+            rel_path: "crawl/job/page-fingerprint.md".into(),
+            namespace: "crawl".into(),
+            producer: "nomifun-crawl".into(),
+            document_key: key.into(),
+            generation,
+            content: managed_test_content(key, generation, body),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_document_replaces_whole_snapshot_and_fences_stale_workers() {
+        let (service, kb_id, _dir) = test_service_with_file("seed.md", "seed").await;
+        let service = Arc::new(service);
+        let key = "0190f5fe-7c00-7a00-8000-000000000093:abcdef";
+        let older = managed_test_request(&kb_id, key, 2, "OLD FULL PAGE");
+        let newer = managed_test_request(&kb_id, key, 3, "NEW FULL PAGE");
+
+        let (older_result, newer_result) = tokio::join!(
+            service.replace_managed_document(older.clone()),
+            service.replace_managed_document(newer.clone())
+        );
+        older_result.unwrap();
+        newer_result.unwrap();
+
+        let body = service
+            .read_file(&kb_id, &newer.rel_path)
+            .await
+            .unwrap()
+            .content;
+        assert_eq!(body, newer.content, "the newest full snapshot must win");
+        assert!(!body.contains("OLD FULL PAGE"), "old full page was appended: {body}");
+        assert_eq!(body.matches("---").count(), 2, "front matter was duplicated: {body}");
+
+        let retry = service.replace_managed_document(newer.clone()).await.unwrap();
+        assert_eq!(retry.disposition, ManagedDocumentWriteDisposition::Unchanged);
+        let stale = service.replace_managed_document(older).await.unwrap();
+        assert_eq!(stale.disposition, ManagedDocumentWriteDisposition::Stale);
+        assert_eq!(
+            service
+                .read_file(&kb_id, &newer.rel_path)
+                .await
+                .unwrap()
+                .content,
+            newer.content
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_document_never_replaces_an_unmanaged_file() {
+        let (service, kb_id, _dir) = test_service_with_file("seed.md", "seed").await;
+        let request = managed_test_request(&kb_id, "job:fingerprint", 1, "crawler body");
+        service
+            .write_file(&kb_id, &request.rel_path, "user-authored body")
+            .await
+            .unwrap();
+
+        let error = service.replace_managed_document(request.clone()).await.unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error}");
+        assert_eq!(
+            service
+                .read_file(&kb_id, &request.rel_path)
+                .await
+                .unwrap()
+                .content,
+            "user-authored body"
+        );
     }
 
     #[cfg(unix)]

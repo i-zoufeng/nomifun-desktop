@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, LOCATION};
+use reqwest::StatusCode;
 use url::{Host, Url};
 
 /// Why an untrusted outbound request was rejected or failed.
@@ -121,6 +122,21 @@ impl SafeHttpClient {
         self.get_conditional(raw_url, None, None).await
     }
 
+    /// Perform exactly one conditional GET without following redirects.
+    ///
+    /// Policy-aware callers such as crawlers use this primitive so every
+    /// redirect target can re-enter their own scope, robots and scheduling
+    /// boundaries before another socket is opened.
+    pub async fn get_once_conditional(
+        &self,
+        raw_url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<SafeHttpResponse, SafeHttpError> {
+        let url = parse_untrusted_url(raw_url)?;
+        self.get_once_url(&url, etag, last_modified).await
+    }
+
     /// Perform a conditional GET while preserving the same SSRF and redirect
     /// protections as [`Self::get`]. Validators are safe to forward across
     /// redirects because they are cache metadata, not authorization secrets.
@@ -136,7 +152,7 @@ impl SafeHttpClient {
             let response = self.send(&url, &addrs, etag, last_modified).await?;
             let status = response.status();
 
-            if status.is_redirection() {
+            if is_followable_redirect(status) {
                 if hop == self.max_redirects {
                     return Err(SafeHttpError::new(
                         SafeHttpErrorKind::TooManyRedirects,
@@ -168,33 +184,53 @@ impl SafeHttpClient {
                 url = validate_url(url)?;
                 continue;
             }
-
-            if self.overflow == BodyOverflowPolicy::Reject
-                && response
-                    .content_length()
-                    .is_some_and(|length| length > self.max_body_bytes as u64)
-            {
-                return Err(SafeHttpError::new(
-                    SafeHttpErrorKind::BodyTooLarge,
-                    format!(
-                        "response body exceeds the {} byte limit for {url}",
-                        self.max_body_bytes,
-                        url = redacted_url(&url)
-                    ),
-                ));
-            }
-
-            let headers = response.headers().clone();
-            let (body, truncated) = self.read_body(response, &url).await?;
-            return Ok(SafeHttpResponse {
-                final_url: url,
-                status,
-                headers,
-                body,
-                truncated,
-            });
+            return self.finish_response(response, &url).await;
         }
         unreachable!("redirect loop always returns or advances within the bounded range")
+    }
+
+    async fn get_once_url(
+        &self,
+        url: &Url,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<SafeHttpResponse, SafeHttpError> {
+        let addrs = resolve_validated(url, self.allow_private).await?;
+        let response = self.send(url, &addrs, etag, last_modified).await?;
+        self.finish_response(response, url).await
+    }
+
+    async fn finish_response(
+        &self,
+        response: reqwest::Response,
+        url: &Url,
+    ) -> Result<SafeHttpResponse, SafeHttpError> {
+        let status = response.status();
+
+        if self.overflow == BodyOverflowPolicy::Reject
+            && response
+                .content_length()
+                .is_some_and(|length| length > self.max_body_bytes as u64)
+        {
+            return Err(SafeHttpError::new(
+                SafeHttpErrorKind::BodyTooLarge,
+                format!(
+                    "response body exceeds the {} byte limit for {url}",
+                    self.max_body_bytes,
+                    url = redacted_url(url)
+                ),
+            ));
+        }
+
+        let headers = response.headers().clone();
+        let (body, truncated) = self.read_body(response, url).await?;
+        Ok(SafeHttpResponse {
+            final_url: url.clone(),
+            status,
+            headers,
+            body,
+            truncated,
+        })
     }
 
     async fn send(
@@ -293,6 +329,19 @@ impl SafeHttpClient {
         }
         Ok((body, false))
     }
+}
+
+/// Only status codes defined as automatic redirects are followed. In
+/// particular, 304 is a cache validation result and must reach the caller.
+pub fn is_followable_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
 }
 
 /// Parse an untrusted URL before any DNS or network operation.
@@ -522,6 +571,62 @@ mod tests {
         let displayed = redacted_url(&url);
         assert_eq!(displayed, "https://cdn.example.com/a.png");
         assert!(!displayed.contains("secret"));
+    }
+
+    #[test]
+    fn only_actual_redirect_statuses_are_followed() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            assert!(is_followable_redirect(status), "{status}");
+        }
+        for status in [
+            StatusCode::MULTIPLE_CHOICES,
+            StatusCode::NOT_MODIFIED,
+            StatusCode::USE_PROXY,
+            StatusCode::from_u16(306).unwrap(),
+        ] {
+            assert!(!is_followable_redirect(status), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn not_modified_reaches_the_conditional_caller() {
+        let (url, server) = one_response(
+            b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let response = SafeHttpClient::new(Duration::from_secs(1), 32)
+            .allow_private_for_tests()
+            .get_conditional(&url, Some("\"v1\""), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+        assert!(response.body.is_empty());
+        assert!(server.await.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn one_hop_request_returns_redirect_without_following_it() {
+        let (url, server) = one_response(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let response = SafeHttpClient::new(Duration::from_secs(1), 32)
+            .allow_private_for_tests()
+            .get_once_conditional(&url, None, None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::FOUND);
+        assert_eq!(
+            response.headers.get(LOCATION).and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:1/next")
+        );
+        assert!(server.await.unwrap() > 0);
     }
 
     #[tokio::test]

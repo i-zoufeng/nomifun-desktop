@@ -210,6 +210,7 @@ pub fn plan_discoveries(
             fingerprint: fp,
             host: host.to_ascii_lowercase(),
             depth: child_depth,
+            redirect_hops: 0,
         });
     }
     out

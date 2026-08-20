@@ -57,6 +57,12 @@ describe('CreateStudio form visual design', () => {
     expect(sourceConfigSource.includes('peer-checked:after:translate-x-16px')).toBe(false);
   });
 
+  test('does not offer or submit the unsupported browser renderer for site crawls', () => {
+    expect(sourceConfigSource.includes("{urlMode !== 'site' && (\n          <div className='flex items-center gap-10px'>")).toBe(true);
+    expect(studioSource.includes("render_mode: 'auto',")).toBe(true);
+    expect(studioSource.includes("render_mode: sourceConfigValue.browserRender ? 'browser' : 'auto',")).toBe(false);
+  });
+
   test('keeps tag chips and the inline tag input visually consistent with the new form controls', () => {
     expect(tagPickerSource.includes('knowledge-studio-tag-chip')).toBe(true);
     expect(tagPickerSource.includes('knowledge-studio-tag-chip-active')).toBe(true);

@@ -1,8 +1,9 @@
 //! Page retrieval for the crawler.
 //!
 //! Static pages ride `nomifun-knowledge`'s SSRF-guarded [`HttpFetcher`] — the
-//! guard (pre-connect address validation, address pinning, per-hop redirect
-//! re-validation) is not reimplemented here. Browser rendering arrives in
+//! guard (pre-connect address validation and address pinning) is not
+//! reimplemented here. Redirects are returned one hop at a time so the durable
+//! frontier can apply scope and per-host policy before following. Browser rendering arrives in
 //! stage B via `BrowserSessionHub`; this crate never launches a browser.
 
 use nomifun_common::AppError;
@@ -24,6 +25,7 @@ pub struct FetchOutput {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub retry_after_ms: Option<i64>,
+    pub redirect_location: Option<String>,
     pub body: String,
     pub truncated: bool,
     /// Set when `Auto` would have escalated to a browser but stage A cannot.
@@ -38,6 +40,10 @@ impl FetchOutput {
 
     pub fn is_not_modified(&self) -> bool {
         self.status == 304
+    }
+
+    pub fn is_redirect(&self) -> bool {
+        matches!(self.status, 301 | 302 | 303 | 307 | 308)
     }
 
     pub fn is_html(&self) -> bool {
@@ -90,7 +96,7 @@ impl CrawlFetcher for HttpCrawlFetcher {
             )));
         }
 
-        let raw = self.inner.fetch_raw(url, validators).await?;
+        let raw = self.inner.fetch_raw_once(url, validators).await?;
         let body = raw.body_text();
         let wanted_render = mode == RenderMode::Auto && looks_unrendered(&body);
 
@@ -101,6 +107,7 @@ impl CrawlFetcher for HttpCrawlFetcher {
             etag: raw.etag,
             last_modified: raw.last_modified,
             retry_after_ms: raw.retry_after.as_deref().and_then(parse_retry_after),
+            redirect_location: raw.location,
             body,
             truncated: raw.truncated,
             wanted_render,
@@ -229,6 +236,7 @@ mod tests {
             etag: None,
             last_modified: None,
             retry_after_ms: None,
+            redirect_location: None,
             body: String::new(),
             truncated: false,
             wanted_render: false,
@@ -262,5 +270,69 @@ mod tests {
 
         assert_eq!(out.status, 429);
         assert_eq!(out.retry_after_ms, Some(42_000));
+    }
+
+    #[tokio::test]
+    async fn conditional_not_modified_reaches_the_crawler() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"v1\""))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpCrawlFetcher::from_fetcher(
+            nomifun_knowledge::source_url::HttpFetcher::new().allow_private_for_tests(),
+        );
+        let out = fetcher
+            .fetch(
+                &server.uri(),
+                &Validators { etag: Some("\"v1\"".into()), last_modified: None },
+                RenderMode::Http,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, 304);
+        assert!(out.is_not_modified());
+        assert!(out.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn redirect_is_returned_without_requesting_the_target() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/target"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/target"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpCrawlFetcher::from_fetcher(
+            nomifun_knowledge::source_url::HttpFetcher::new().allow_private_for_tests(),
+        );
+        let out = fetcher
+            .fetch(
+                &format!("{}/start", server.uri()),
+                &Validators::default(),
+                RenderMode::Http,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_redirect());
+        assert_eq!(out.redirect_location.as_deref(), Some("/target"));
     }
 }
